@@ -10,6 +10,7 @@ Install node.js (comes with npm)
 
 Then from inside repository directory:
     npm install
+    node src/genChars.js
     gulp
 
 This should build the project into the dist/ directory.
@@ -29,6 +30,7 @@ Right and left-hand positions indicate the horizontal boundaries of the glyph re
 
 ## TODO
 
+- Write gulp task to run genChars for you. Too lazy at the moment.
 - Write script to build modules for all glyphs/specific sets
 - Move craptastic glyph browser facility into its own repo...Also clean it up, its terrible
 - Write script to convert svg files into glyphs in JSON format
