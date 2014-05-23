@@ -23,9 +23,9 @@ templateFiles = ["./templates/**/*.jade",
 buildPath     = "./dist";
 templatePath  = "./dist";
 
-gulp.task('default', ['compile', 'test:unit', 'server'], function() {});
+gulp.task('default', ['compile', 'test:unit'], function() {});
 
-gulp.task('compile', ['compile:server', 'compile:lib', 'compile:client', 'copy:srcToClient', 'buildTemplates'], function() {
+gulp.task('compile', ['compile:server'], function() {
 });
 
 gulp.task('compile:server', function(){
@@ -36,17 +36,6 @@ gulp.task('compile:server', function(){
 
 gulp.task('compile:lib', function() {
   // Build vendored JS not managed via npm, bower etc.
-});
-
-gulp.task('copy:srcToClient', function() {
-  // Copy any files from src that are also needed on the client
-  var filesToCopy = [
-    "./src/hershey.js"
-  ];
-
-  gulp.src(filesToCopy)
-    .pipe(browserify({insertGlobals: true}))
-    .pipe(gulp.dest(buildPath + "/js"));
 });
 
 gulp.task('compile:client', function() {
@@ -77,4 +66,15 @@ gulp.task('server', function() {
     .on('change', ['compile', 'test:unit'])
     .on('restart', function () {
     });
+});
+
+gulp.task('copy:srcToClient', function() {
+  // Copy any files from src that are also needed on the client
+  var filesToCopy = [
+    "./src/hershey.js"
+  ];
+
+  gulp.src(filesToCopy)
+    .pipe(browserify({insertGlobals: true}))
+    .pipe(gulp.dest(buildPath + "/js"));
 });
