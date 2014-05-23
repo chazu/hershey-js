@@ -1,7 +1,7 @@
 var _ = require('lodash');
 var fs = require('fs');
 
-var util = require("./src/util.js");
+var util = require("./util.js");
 var fileData = fs.readFileSync("./data/hershey.dat", {
   "encoding": "ascii"});
 
