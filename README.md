@@ -9,6 +9,7 @@ We're using gulp, bower, and browserify. Here's how to compile the module:
 Install node.js (comes with npm)
 
 Then from inside repository directory:
+
     npm install
     node src/genChars.js
     gulp
