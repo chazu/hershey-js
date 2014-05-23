@@ -1,0 +1,28 @@
+{
+  "name": "hershey",
+  "version": "0.0.0",
+  "description": "hershey fonts in javascript",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "fonts",
+    "vector"
+  ],
+  "author": "Chazu",
+  "license": "MIT",
+  "devDependencies": {
+    "express": "^4.3.0",
+    "gulp-bower-files": "^0.2.3",
+    "gulp-browserify": "^0.5.0",
+    "gulp-concat": "^2.2.0",
+    "gulp-jasmine": "^0.2.0",
+    "gulp-nodemon": "^1.0.3",
+    "gulp-rename": "^1.2.0",
+    "gulp-sass": "^0.7.1",
+    "gulp-uglify": "^0.3.0",
+    "gulp-util": "^2.2.14",
+    "lodash": "^2.4.1"
+  }
+}
