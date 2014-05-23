@@ -21,8 +21,23 @@
     "gulp-nodemon": "^1.0.3",
     "gulp-rename": "^1.2.0",
     "gulp-sass": "^0.7.1",
+    "gulp-shell": "^0.2.5",
     "gulp-uglify": "^0.3.0",
     "gulp-util": "^2.2.14",
     "lodash": "^2.4.1"
-  }
+  },
+  "dependencies": {
+    "lodash": "^2.4.1"
+  },
+  "directories": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:chazu/hershey-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chazu/hershey-js/issues"
+  },
+  "homepage": "https://github.com/chazu/hershey-js"
 }
