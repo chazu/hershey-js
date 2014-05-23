@@ -10,6 +10,7 @@ var nodemon    = require('gulp-nodemon');
 var sass       = require('gulp-sass');
 var rename     = require('gulp-rename');
 var jade       = require('gulp-jade');
+var shell      = require('gulp-shell');
 
 serverFiles   = ["./src/**/*.js",
                  "./src/**/*.json"];
@@ -23,9 +24,13 @@ templateFiles = ["./templates/**/*.jade",
 buildPath     = "./dist";
 templatePath  = "./dist";
 
-gulp.task('default', ['compile', 'test:unit'], function() {});
+gulp.task('default', ['compile', 'buildGlyphs','test:unit'], function() {});
 
 gulp.task('compile', ['compile:server'], function() {
+});
+
+gulp.task('buildGlyphs', function() {
+  shell("node ./src/genChars.js");
 });
 
 gulp.task('compile:server', function(){
