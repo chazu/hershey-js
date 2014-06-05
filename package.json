@@ -2,7 +2,7 @@
   "name": "hershey",
   "version": "0.0.0",
   "description": "hershey fonts in javascript",
-  "main": "index.js",
+  "main": "dist/hershey.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -13,6 +13,8 @@
   "author": "Chazu",
   "license": "MIT",
   "devDependencies": {
+    "comma-separated-values": "^3.1.2",
+    "csv-parse": "0.0.3",
     "express": "^4.3.0",
     "gulp-bower-files": "^0.2.3",
     "gulp-browserify": "^0.5.0",

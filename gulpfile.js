@@ -12,74 +12,30 @@ var rename     = require('gulp-rename');
 var jade       = require('gulp-jade');
 var shell      = require('gulp-shell');
 
-serverFiles   = ["./src/**/*.js",
-                 "./src/**/*.json"];
+files   = ["./src/hershey.js",
+                 "./src/glyphs.json"];
 
-clientFiles   = ["./client/**/*.js",
-                 "./client/**/*.json"];
+buildPath     = "./dist/";
 
-templateFiles = ["./templates/**/*.jade",
-                 "./templates/**/*.html"];
-
-buildPath     = "./dist";
-templatePath  = "./dist";
-
-gulp.task('default', ['compile', 'buildGlyphs','test:unit'], function() {});
-
-gulp.task('compile', ['compile:server'], function() {
-});
+gulp.task('default', ['buildGlyphs', 'compile', 'test:unit'], function() {});
 
 gulp.task('buildGlyphs', function() {
   shell("node ./src/genChars.js");
-});
-
-gulp.task('compile:server', function(){
-  // compile server-side JS and so on...
-  gulp.src(serverFiles)
-    .pipe(gulp.dest(buildPath));
 });
 
 gulp.task('compile:lib', function() {
   // Build vendored JS not managed via npm, bower etc.
 });
 
-gulp.task('compile:client', function() {
-  // Compile non-vendor client-side JS
-  gulp.src(clientFiles)
+gulp.task('compile', function() {
+  // Compile non-vendor JS
+  gulp.src(files)
     .pipe(browserify({insertGlobals: true}))
-    .pipe(gulp.dest(buildPath + "/js"));
-
-  bower()
-    .pipe(gulp.dest(buildPath + "/js"));
+    .pipe(concat("hershey.js"))
+    .pipe(gulp.dest(buildPath));
 });
 
 gulp.task('test:unit', function () {
   gulp.src('./test/**/*.js')
     .pipe(jasmine());
-});
-
-gulp.task('buildTemplates', function(){
-  gulp.src(templateFiles)
-  // .pipe(jade())
-  .pipe(gulp.dest(templatePath));
-});
-
-gulp.task('server', function() {
-  nodemon({ script: './dist/server.js',
-            ext: 'html js json scss css jade',
-            ignore: ['ignore.js'] })
-    .on('change', ['compile', 'test:unit'])
-    .on('restart', function () {
-    });
-});
-
-gulp.task('copy:srcToClient', function() {
-  // Copy any files from src that are also needed on the client
-  var filesToCopy = [
-    "./src/hershey.js"
-  ];
-
-  gulp.src(filesToCopy)
-    .pipe(browserify({insertGlobals: true}))
-    .pipe(gulp.dest(buildPath + "/js"));
 });
