@@ -20,7 +20,7 @@ module.exports = {
     var offsetX = 0;
     var vertices = [];
     for (i=0; i < upcased.length - 1; i+=1) {
-      var currentGlyph = Hershey.glyph(string[i]);
+      var currentGlyph = this.glyph(string[i]);
       for (j=0; j < currentGlyph.vertices.length - 1; j+=1) {
         vertices.push({
           "x": currentGlyph.vertices[i] + offsetX,
