@@ -12,30 +12,25 @@ var rename     = require('gulp-rename');
 var jade       = require('gulp-jade');
 var shell      = require('gulp-shell');
 
-files   = ["./src/hershey.js",
-                 "./src/glyphs.json"];
-
-buildPath     = "./dist/";
+buildPath     = "./dist";
 
 gulp.task('default', ['buildGlyphs', 'compile', 'test:unit'], function() {});
 
 gulp.task('buildGlyphs', function() {
   shell("node ./src/genChars.js");
-});
 
-gulp.task('compile:lib', function() {
-  // Build vendored JS not managed via npm, bower etc.
+  gulp.src('./src/glyphs.json')
+    .pipe(gulp.dest('./dist'));
 });
 
 gulp.task('compile', function() {
   // Compile non-vendor JS
-  gulp.src(files)
-    .pipe(browserify({insertGlobals: true}))
-    .pipe(concat("hershey.js"))
+  gulp.src("./src/hershey.js")
+  //.pipe(browserify())
     .pipe(gulp.dest(buildPath));
 });
 
 gulp.task('test:unit', function () {
-  gulp.src('./test/**/*.js')
+  gulp.src('./test/*.js')
     .pipe(jasmine());
 });

@@ -29,6 +29,7 @@
     "lodash": "^2.4.1"
   },
   "dependencies": {
+    "clone": "^0.1.16",
     "lodash": "^2.4.1"
   },
   "directories": {

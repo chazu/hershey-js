@@ -3,7 +3,7 @@ String.prototype.hersheyAtChar = function (n) {
   return this.charCodeAt(0) - relativeTo;
 };
 
-var _ = require('lodash');
+var _ = require("underscore");
 
 var util = {};
 
