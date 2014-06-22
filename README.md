@@ -31,6 +31,10 @@ Right and left-hand positions indicate the horizontal boundaries of the glyph re
 
 ## TODO
 
+- Add all files of hershey data - individual sets in addition to whole thing
+- Expand mapping csv
+- Allow loading of specific character sets
+
 - Write gulp task to run genChars for you. Too lazy at the moment.
 - Write script to build modules for all glyphs/specific sets
 - Move craptastic glyph browser facility into its own repo...Also clean it up, its terrible
