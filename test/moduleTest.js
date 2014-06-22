@@ -15,6 +15,28 @@ describe('hershey module', function() {
   });
 
   describe("function stringVertices", function() {
-    expect(Hershey.stringVertices("A")["vertices"]).toBeDefined();
+    it('should return an object with key "vertices"', function() {
+      expect(Hershey.stringVertices("A")["vertices"]).toBeDefined();
+    });
+
+    describe("should return union of vertices for glyphs passed in", function() {
+      var aVertexCount = Hershey.glyph("A").vertices.length;
+      var bVertexCount = Hershey.glyph("B").vertices.length;
+
+      var cVertexCount = aVertexCount + bVertexCount + 2; // Plus 2 spaces;
+
+      expect(Hershey.stringVertices("AB").vertices.length).toEqual(cVertexCount);
+    });
+
+    describe("should return width of total string", function() {
+
+      var aWidth = Hershey.glyph("A").width;
+      var bWidth = Hershey.glyph("B").width;
+
+      var combinedWidth = aWidth + 1 + bWidth; // Extra 1 for space
+
+      expect(typeof Hershey.stringVertices("AB").width).toEqual("number");
+      expect(Hershey.stringVertices("AB").width).toEqual(combinedWidth);
+    });
   });
 });
