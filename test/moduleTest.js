@@ -33,8 +33,9 @@ describe('hershey module', function() {
       var aWidth = Hershey.glyph("A").width;
       var bWidth = Hershey.glyph("B").width;
 
-      var combinedWidth = aWidth + 1 + bWidth; // Extra 1 for space
+      var combinedWidth = aWidth + bWidth + 2; // Extra 2 for space
 
+      expect(Hershey.stringVertices("AB").width).toBeDefined();
       expect(typeof Hershey.stringVertices("AB").width).toEqual("number");
       expect(Hershey.stringVertices("AB").width).toEqual(combinedWidth);
     });
