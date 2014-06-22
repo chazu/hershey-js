@@ -38,6 +38,13 @@ _.chain(lines).each(function(line) {
     mapped = {"mapTo": null}
   }
 
+  var yPoints = _.map(vertices, function(item) {
+      return item["y"];
+    });
+  var maxGlyphHeight =  _.max(yPoints);
+
+  var minGlyphHeight = _.min(yPoints);
+
   result.push({
     "id": id,
     "mappedTo": mapped["mapTo"],
@@ -45,7 +52,8 @@ _.chain(lines).each(function(line) {
     "leftHandPosition": leftHandPosition,
     "rightHandPosition": rightHandPosition,
     "vertices": vertices,
-    "width": Math.abs(leftHandPosition) + rightHandPosition
+    "width": Math.abs(leftHandPosition) + rightHandPosition,
+    "height": maxGlyphHeight - minGlyphHeight
   });
 });
 
