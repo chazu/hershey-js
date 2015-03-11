@@ -1,15 +1,13 @@
 var CSV = require('comma-separated-values');
 var _ = require('lodash');
 var fs = require('fs');
-
 var util = require("./util.js");
+
 var fileData = fs.readFileSync("./data/hershey.dat", {
   "encoding": "ascii"});
 
 var mappingData = fs.readFileSync("./data/charMapping.csv", {
   "encoding": "ascii"});
-
-
 
 var parsedMapping = new CSV(mappingData, { header: true }).parse();
 var lines = fileData.split("\n");
@@ -39,10 +37,9 @@ _.chain(lines).each(function(line) {
   }
 
   var yPoints = _.map(vertices, function(item) {
-      return item["y"];
-    });
+    return item["y"];
+  });
   var maxGlyphHeight =  _.max(yPoints);
-
   var minGlyphHeight = _.min(yPoints);
 
   result.push({
@@ -59,3 +56,55 @@ _.chain(lines).each(function(line) {
 
 resultString = JSON.stringify(result, null, 2);
 fs.writeFileSync('./src/glyphs.json', resultString);
+
+// Generate character set data
+var hmpFileNames = _.filter(fs.readdirSync('./data'), function(x) {
+  return x.match(/\.hmp$/);
+});
+
+var hmpFiles = _.map(hmpFileNames, function(x) {
+  var setName = x.match(/^(.+)\W/)[1];
+  return {"name": setName, "data": fs.readFileSync("./data/" + x, 'utf-8')};
+});
+
+_.each(hmpFiles, function(x) {
+  x.data = x.data.replace(/\s{2,}/g, " ");
+  x.data = x.data.replace(/\n/g, " ");
+  x.data = x.data.split(" ");
+  _.remove(x.data, function(x) {
+    return x == "";
+  });
+});
+
+// Now handle ranges in the parsed data...
+
+hmpFiles = _.map(hmpFiles, function(x) {
+  var newData = _.map(x.data, function(y) {
+
+    var matchData = y.match(/^(\d+)-(\d+)$/)
+
+    if (matchData) {
+      console.log("!!!!!!!!!");
+      console.log(matchData);
+      var range = [];
+      for (i=matchData[1];i <= matchData[2]; i++) {
+        range.push(i);
+      }
+      return range;
+    } else {
+      return parseInt(y);
+    }
+  });
+
+  return {"name": x.name, "data": newData};
+});
+
+hmpFiles = _.map(hmpFiles, function(x) {
+  return {"name": x.name, "data": _.flatten(x.data)};
+});
+
+console.log(hmpFiles);
+
+fs.writeFileSync('./src/rawSetData.json', JSON.stringify(hmpFiles));
+
+

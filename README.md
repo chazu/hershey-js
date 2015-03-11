@@ -19,7 +19,12 @@ This should build the project into the dist/ directory.
 
 ## Usage
 
+
+
+
     var Hershey = require('hershey');
+    vertices = Hershey.string("Hello World", 10) // 10 is scale
+
     var aGlyph = Hershey.glyphById(10); // Strings also work
     console.log(aGlyph.vertices);          => [{"x": -3, "y" -5},...];
     console.log(aGlyph.vertexCount);       => 9;
@@ -31,13 +36,16 @@ Right and left-hand positions indicate the horizontal boundaries of the glyph re
 
 ## TODO
 
-- Add all files of hershey data - individual sets in addition to whole thing
+
+- Add all char sets to genChars
 - Expand mapping csv
 - Allow loading of specific character sets
 
+- Improve test coverage
+
 - Write gulp task to run genChars for you. Too lazy at the moment.
 - Write script to build modules for all glyphs/specific sets
-- Move craptastic glyph browser facility into its own repo...Also clean it up, its terrible
+
 - Write script to convert svg files into glyphs in JSON format
 - Write script to convert original dataset into form more suitable for use with C++/OpenGL (???)
 
