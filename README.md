@@ -18,10 +18,6 @@ This should build the project into the dist/ directory.
 
 
 ## Usage
-
-
-
-
     var Hershey = require('hershey');
     vertices = Hershey.string("Hello World", 10) // 10 is scale
 
@@ -32,7 +28,6 @@ This should build the project into the dist/ directory.
     console.log(aGlyph.rightHandPosition); => 5;
 
 Right and left-hand positions indicate the horizontal boundaries of the glyph relative to it's local coordinate system, and are specified in the original data set.
-
 
 ## TODO
 

@@ -90,7 +90,6 @@ describe('hershey module', function() {
   });
 
   describe("function stringData", function() {
-
     // Key structure
     it('should return an object with key "vertices"', function() {
       expect(Hershey.stringData("A")["vertices"]).toBeDefined();
