@@ -1,4 +1,8614 @@
-[
+(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+(function (global){
+/*!
+ * The buffer module from node.js, for the browser.
+ *
+ * @author   Feross Aboukhadijeh <feross@feross.org> <http://feross.org>
+ * @license  MIT
+ */
+/* eslint-disable no-proto */
+
+'use strict'
+
+var base64 = require('base64-js')
+var ieee754 = require('ieee754')
+var isArray = require('isarray')
+
+exports.Buffer = Buffer
+exports.SlowBuffer = SlowBuffer
+exports.INSPECT_MAX_BYTES = 50
+Buffer.poolSize = 8192 // not used by this implementation
+
+var rootParent = {}
+
+/**
+ * If `Buffer.TYPED_ARRAY_SUPPORT`:
+ *   === true    Use Uint8Array implementation (fastest)
+ *   === false   Use Object implementation (most compatible, even IE6)
+ *
+ * Browsers that support typed arrays are IE 10+, Firefox 4+, Chrome 7+, Safari 5.1+,
+ * Opera 11.6+, iOS 4.2+.
+ *
+ * Due to various browser bugs, sometimes the Object implementation will be used even
+ * when the browser supports typed arrays.
+ *
+ * Note:
+ *
+ *   - Firefox 4-29 lacks support for adding new properties to `Uint8Array` instances,
+ *     See: https://bugzilla.mozilla.org/show_bug.cgi?id=695438.
+ *
+ *   - Chrome 9-10 is missing the `TypedArray.prototype.subarray` function.
+ *
+ *   - IE10 has a broken `TypedArray.prototype.subarray` function which returns arrays of
+ *     incorrect length in some situations.
+
+ * We detect these buggy browsers and set `Buffer.TYPED_ARRAY_SUPPORT` to `false` so they
+ * get the Object implementation, which is slower but behaves correctly.
+ */
+Buffer.TYPED_ARRAY_SUPPORT = global.TYPED_ARRAY_SUPPORT !== undefined
+  ? global.TYPED_ARRAY_SUPPORT
+  : typedArraySupport()
+
+function typedArraySupport () {
+  try {
+    var arr = new Uint8Array(1)
+    arr.foo = function () { return 42 }
+    return arr.foo() === 42 && // typed array instances can be augmented
+        typeof arr.subarray === 'function' && // chrome 9-10 lack `subarray`
+        arr.subarray(1, 1).byteLength === 0 // ie10 has broken `subarray`
+  } catch (e) {
+    return false
+  }
+}
+
+function kMaxLength () {
+  return Buffer.TYPED_ARRAY_SUPPORT
+    ? 0x7fffffff
+    : 0x3fffffff
+}
+
+/**
+ * The Buffer constructor returns instances of `Uint8Array` that have their
+ * prototype changed to `Buffer.prototype`. Furthermore, `Buffer` is a subclass of
+ * `Uint8Array`, so the returned instances will have all the node `Buffer` methods
+ * and the `Uint8Array` methods. Square bracket notation works as expected -- it
+ * returns a single octet.
+ *
+ * The `Uint8Array` prototype remains unmodified.
+ */
+function Buffer (arg) {
+  if (!(this instanceof Buffer)) {
+    // Avoid going through an ArgumentsAdaptorTrampoline in the common case.
+    if (arguments.length > 1) return new Buffer(arg, arguments[1])
+    return new Buffer(arg)
+  }
+
+  if (!Buffer.TYPED_ARRAY_SUPPORT) {
+    this.length = 0
+    this.parent = undefined
+  }
+
+  // Common case.
+  if (typeof arg === 'number') {
+    return fromNumber(this, arg)
+  }
+
+  // Slightly less common case.
+  if (typeof arg === 'string') {
+    return fromString(this, arg, arguments.length > 1 ? arguments[1] : 'utf8')
+  }
+
+  // Unusual.
+  return fromObject(this, arg)
+}
+
+// TODO: Legacy, not needed anymore. Remove in next major version.
+Buffer._augment = function (arr) {
+  arr.__proto__ = Buffer.prototype
+  return arr
+}
+
+function fromNumber (that, length) {
+  that = allocate(that, length < 0 ? 0 : checked(length) | 0)
+  if (!Buffer.TYPED_ARRAY_SUPPORT) {
+    for (var i = 0; i < length; i++) {
+      that[i] = 0
+    }
+  }
+  return that
+}
+
+function fromString (that, string, encoding) {
+  if (typeof encoding !== 'string' || encoding === '') encoding = 'utf8'
+
+  // Assumption: byteLength() return value is always < kMaxLength.
+  var length = byteLength(string, encoding) | 0
+  that = allocate(that, length)
+
+  that.write(string, encoding)
+  return that
+}
+
+function fromObject (that, object) {
+  if (Buffer.isBuffer(object)) return fromBuffer(that, object)
+
+  if (isArray(object)) return fromArray(that, object)
+
+  if (object == null) {
+    throw new TypeError('must start with number, buffer, array or string')
+  }
+
+  if (typeof ArrayBuffer !== 'undefined') {
+    if (object.buffer instanceof ArrayBuffer) {
+      return fromTypedArray(that, object)
+    }
+    if (object instanceof ArrayBuffer) {
+      return fromArrayBuffer(that, object)
+    }
+  }
+
+  if (object.length) return fromArrayLike(that, object)
+
+  return fromJsonObject(that, object)
+}
+
+function fromBuffer (that, buffer) {
+  var length = checked(buffer.length) | 0
+  that = allocate(that, length)
+  buffer.copy(that, 0, 0, length)
+  return that
+}
+
+function fromArray (that, array) {
+  var length = checked(array.length) | 0
+  that = allocate(that, length)
+  for (var i = 0; i < length; i += 1) {
+    that[i] = array[i] & 255
+  }
+  return that
+}
+
+// Duplicate of fromArray() to keep fromArray() monomorphic.
+function fromTypedArray (that, array) {
+  var length = checked(array.length) | 0
+  that = allocate(that, length)
+  // Truncating the elements is probably not what people expect from typed
+  // arrays with BYTES_PER_ELEMENT > 1 but it's compatible with the behavior
+  // of the old Buffer constructor.
+  for (var i = 0; i < length; i += 1) {
+    that[i] = array[i] & 255
+  }
+  return that
+}
+
+function fromArrayBuffer (that, array) {
+  array.byteLength // this throws if `array` is not a valid ArrayBuffer
+
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    // Return an augmented `Uint8Array` instance, for best performance
+    that = new Uint8Array(array)
+    that.__proto__ = Buffer.prototype
+  } else {
+    // Fallback: Return an object instance of the Buffer class
+    that = fromTypedArray(that, new Uint8Array(array))
+  }
+  return that
+}
+
+function fromArrayLike (that, array) {
+  var length = checked(array.length) | 0
+  that = allocate(that, length)
+  for (var i = 0; i < length; i += 1) {
+    that[i] = array[i] & 255
+  }
+  return that
+}
+
+// Deserialize { type: 'Buffer', data: [1,2,3,...] } into a Buffer object.
+// Returns a zero-length buffer for inputs that don't conform to the spec.
+function fromJsonObject (that, object) {
+  var array
+  var length = 0
+
+  if (object.type === 'Buffer' && isArray(object.data)) {
+    array = object.data
+    length = checked(array.length) | 0
+  }
+  that = allocate(that, length)
+
+  for (var i = 0; i < length; i += 1) {
+    that[i] = array[i] & 255
+  }
+  return that
+}
+
+if (Buffer.TYPED_ARRAY_SUPPORT) {
+  Buffer.prototype.__proto__ = Uint8Array.prototype
+  Buffer.__proto__ = Uint8Array
+} else {
+  // pre-set for values that may exist in the future
+  Buffer.prototype.length = undefined
+  Buffer.prototype.parent = undefined
+}
+
+function allocate (that, length) {
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    // Return an augmented `Uint8Array` instance, for best performance
+    that = new Uint8Array(length)
+    that.__proto__ = Buffer.prototype
+  } else {
+    // Fallback: Return an object instance of the Buffer class
+    that.length = length
+  }
+
+  var fromPool = length !== 0 && length <= Buffer.poolSize >>> 1
+  if (fromPool) that.parent = rootParent
+
+  return that
+}
+
+function checked (length) {
+  // Note: cannot use `length < kMaxLength` here because that fails when
+  // length is NaN (which is otherwise coerced to zero.)
+  if (length >= kMaxLength()) {
+    throw new RangeError('Attempt to allocate Buffer larger than maximum ' +
+                         'size: 0x' + kMaxLength().toString(16) + ' bytes')
+  }
+  return length | 0
+}
+
+function SlowBuffer (subject, encoding) {
+  if (!(this instanceof SlowBuffer)) return new SlowBuffer(subject, encoding)
+
+  var buf = new Buffer(subject, encoding)
+  delete buf.parent
+  return buf
+}
+
+Buffer.isBuffer = function isBuffer (b) {
+  return !!(b != null && b._isBuffer)
+}
+
+Buffer.compare = function compare (a, b) {
+  if (!Buffer.isBuffer(a) || !Buffer.isBuffer(b)) {
+    throw new TypeError('Arguments must be Buffers')
+  }
+
+  if (a === b) return 0
+
+  var x = a.length
+  var y = b.length
+
+  var i = 0
+  var len = Math.min(x, y)
+  while (i < len) {
+    if (a[i] !== b[i]) break
+
+    ++i
+  }
+
+  if (i !== len) {
+    x = a[i]
+    y = b[i]
+  }
+
+  if (x < y) return -1
+  if (y < x) return 1
+  return 0
+}
+
+Buffer.isEncoding = function isEncoding (encoding) {
+  switch (String(encoding).toLowerCase()) {
+    case 'hex':
+    case 'utf8':
+    case 'utf-8':
+    case 'ascii':
+    case 'binary':
+    case 'base64':
+    case 'raw':
+    case 'ucs2':
+    case 'ucs-2':
+    case 'utf16le':
+    case 'utf-16le':
+      return true
+    default:
+      return false
+  }
+}
+
+Buffer.concat = function concat (list, length) {
+  if (!isArray(list)) throw new TypeError('list argument must be an Array of Buffers.')
+
+  if (list.length === 0) {
+    return new Buffer(0)
+  }
+
+  var i
+  if (length === undefined) {
+    length = 0
+    for (i = 0; i < list.length; i++) {
+      length += list[i].length
+    }
+  }
+
+  var buf = new Buffer(length)
+  var pos = 0
+  for (i = 0; i < list.length; i++) {
+    var item = list[i]
+    item.copy(buf, pos)
+    pos += item.length
+  }
+  return buf
+}
+
+function byteLength (string, encoding) {
+  if (typeof string !== 'string') string = '' + string
+
+  var len = string.length
+  if (len === 0) return 0
+
+  // Use a for loop to avoid recursion
+  var loweredCase = false
+  for (;;) {
+    switch (encoding) {
+      case 'ascii':
+      case 'binary':
+      // Deprecated
+      case 'raw':
+      case 'raws':
+        return len
+      case 'utf8':
+      case 'utf-8':
+        return utf8ToBytes(string).length
+      case 'ucs2':
+      case 'ucs-2':
+      case 'utf16le':
+      case 'utf-16le':
+        return len * 2
+      case 'hex':
+        return len >>> 1
+      case 'base64':
+        return base64ToBytes(string).length
+      default:
+        if (loweredCase) return utf8ToBytes(string).length // assume utf8
+        encoding = ('' + encoding).toLowerCase()
+        loweredCase = true
+    }
+  }
+}
+Buffer.byteLength = byteLength
+
+function slowToString (encoding, start, end) {
+  var loweredCase = false
+
+  start = start | 0
+  end = end === undefined || end === Infinity ? this.length : end | 0
+
+  if (!encoding) encoding = 'utf8'
+  if (start < 0) start = 0
+  if (end > this.length) end = this.length
+  if (end <= start) return ''
+
+  while (true) {
+    switch (encoding) {
+      case 'hex':
+        return hexSlice(this, start, end)
+
+      case 'utf8':
+      case 'utf-8':
+        return utf8Slice(this, start, end)
+
+      case 'ascii':
+        return asciiSlice(this, start, end)
+
+      case 'binary':
+        return binarySlice(this, start, end)
+
+      case 'base64':
+        return base64Slice(this, start, end)
+
+      case 'ucs2':
+      case 'ucs-2':
+      case 'utf16le':
+      case 'utf-16le':
+        return utf16leSlice(this, start, end)
+
+      default:
+        if (loweredCase) throw new TypeError('Unknown encoding: ' + encoding)
+        encoding = (encoding + '').toLowerCase()
+        loweredCase = true
+    }
+  }
+}
+
+// The property is used by `Buffer.isBuffer` and `is-buffer` (in Safari 5-7) to detect
+// Buffer instances.
+Buffer.prototype._isBuffer = true
+
+Buffer.prototype.toString = function toString () {
+  var length = this.length | 0
+  if (length === 0) return ''
+  if (arguments.length === 0) return utf8Slice(this, 0, length)
+  return slowToString.apply(this, arguments)
+}
+
+Buffer.prototype.equals = function equals (b) {
+  if (!Buffer.isBuffer(b)) throw new TypeError('Argument must be a Buffer')
+  if (this === b) return true
+  return Buffer.compare(this, b) === 0
+}
+
+Buffer.prototype.inspect = function inspect () {
+  var str = ''
+  var max = exports.INSPECT_MAX_BYTES
+  if (this.length > 0) {
+    str = this.toString('hex', 0, max).match(/.{2}/g).join(' ')
+    if (this.length > max) str += ' ... '
+  }
+  return '<Buffer ' + str + '>'
+}
+
+Buffer.prototype.compare = function compare (b) {
+  if (!Buffer.isBuffer(b)) throw new TypeError('Argument must be a Buffer')
+  if (this === b) return 0
+  return Buffer.compare(this, b)
+}
+
+Buffer.prototype.indexOf = function indexOf (val, byteOffset) {
+  if (byteOffset > 0x7fffffff) byteOffset = 0x7fffffff
+  else if (byteOffset < -0x80000000) byteOffset = -0x80000000
+  byteOffset >>= 0
+
+  if (this.length === 0) return -1
+  if (byteOffset >= this.length) return -1
+
+  // Negative offsets start from the end of the buffer
+  if (byteOffset < 0) byteOffset = Math.max(this.length + byteOffset, 0)
+
+  if (typeof val === 'string') {
+    if (val.length === 0) return -1 // special case: looking for empty string always fails
+    return String.prototype.indexOf.call(this, val, byteOffset)
+  }
+  if (Buffer.isBuffer(val)) {
+    return arrayIndexOf(this, val, byteOffset)
+  }
+  if (typeof val === 'number') {
+    if (Buffer.TYPED_ARRAY_SUPPORT && Uint8Array.prototype.indexOf === 'function') {
+      return Uint8Array.prototype.indexOf.call(this, val, byteOffset)
+    }
+    return arrayIndexOf(this, [ val ], byteOffset)
+  }
+
+  function arrayIndexOf (arr, val, byteOffset) {
+    var foundIndex = -1
+    for (var i = 0; byteOffset + i < arr.length; i++) {
+      if (arr[byteOffset + i] === val[foundIndex === -1 ? 0 : i - foundIndex]) {
+        if (foundIndex === -1) foundIndex = i
+        if (i - foundIndex + 1 === val.length) return byteOffset + foundIndex
+      } else {
+        foundIndex = -1
+      }
+    }
+    return -1
+  }
+
+  throw new TypeError('val must be string, number or Buffer')
+}
+
+function hexWrite (buf, string, offset, length) {
+  offset = Number(offset) || 0
+  var remaining = buf.length - offset
+  if (!length) {
+    length = remaining
+  } else {
+    length = Number(length)
+    if (length > remaining) {
+      length = remaining
+    }
+  }
+
+  // must be an even number of digits
+  var strLen = string.length
+  if (strLen % 2 !== 0) throw new Error('Invalid hex string')
+
+  if (length > strLen / 2) {
+    length = strLen / 2
+  }
+  for (var i = 0; i < length; i++) {
+    var parsed = parseInt(string.substr(i * 2, 2), 16)
+    if (isNaN(parsed)) throw new Error('Invalid hex string')
+    buf[offset + i] = parsed
+  }
+  return i
+}
+
+function utf8Write (buf, string, offset, length) {
+  return blitBuffer(utf8ToBytes(string, buf.length - offset), buf, offset, length)
+}
+
+function asciiWrite (buf, string, offset, length) {
+  return blitBuffer(asciiToBytes(string), buf, offset, length)
+}
+
+function binaryWrite (buf, string, offset, length) {
+  return asciiWrite(buf, string, offset, length)
+}
+
+function base64Write (buf, string, offset, length) {
+  return blitBuffer(base64ToBytes(string), buf, offset, length)
+}
+
+function ucs2Write (buf, string, offset, length) {
+  return blitBuffer(utf16leToBytes(string, buf.length - offset), buf, offset, length)
+}
+
+Buffer.prototype.write = function write (string, offset, length, encoding) {
+  // Buffer#write(string)
+  if (offset === undefined) {
+    encoding = 'utf8'
+    length = this.length
+    offset = 0
+  // Buffer#write(string, encoding)
+  } else if (length === undefined && typeof offset === 'string') {
+    encoding = offset
+    length = this.length
+    offset = 0
+  // Buffer#write(string, offset[, length][, encoding])
+  } else if (isFinite(offset)) {
+    offset = offset | 0
+    if (isFinite(length)) {
+      length = length | 0
+      if (encoding === undefined) encoding = 'utf8'
+    } else {
+      encoding = length
+      length = undefined
+    }
+  // legacy write(string, encoding, offset, length) - remove in v0.13
+  } else {
+    var swap = encoding
+    encoding = offset
+    offset = length | 0
+    length = swap
+  }
+
+  var remaining = this.length - offset
+  if (length === undefined || length > remaining) length = remaining
+
+  if ((string.length > 0 && (length < 0 || offset < 0)) || offset > this.length) {
+    throw new RangeError('attempt to write outside buffer bounds')
+  }
+
+  if (!encoding) encoding = 'utf8'
+
+  var loweredCase = false
+  for (;;) {
+    switch (encoding) {
+      case 'hex':
+        return hexWrite(this, string, offset, length)
+
+      case 'utf8':
+      case 'utf-8':
+        return utf8Write(this, string, offset, length)
+
+      case 'ascii':
+        return asciiWrite(this, string, offset, length)
+
+      case 'binary':
+        return binaryWrite(this, string, offset, length)
+
+      case 'base64':
+        // Warning: maxLength not taken into account in base64Write
+        return base64Write(this, string, offset, length)
+
+      case 'ucs2':
+      case 'ucs-2':
+      case 'utf16le':
+      case 'utf-16le':
+        return ucs2Write(this, string, offset, length)
+
+      default:
+        if (loweredCase) throw new TypeError('Unknown encoding: ' + encoding)
+        encoding = ('' + encoding).toLowerCase()
+        loweredCase = true
+    }
+  }
+}
+
+Buffer.prototype.toJSON = function toJSON () {
+  return {
+    type: 'Buffer',
+    data: Array.prototype.slice.call(this._arr || this, 0)
+  }
+}
+
+function base64Slice (buf, start, end) {
+  if (start === 0 && end === buf.length) {
+    return base64.fromByteArray(buf)
+  } else {
+    return base64.fromByteArray(buf.slice(start, end))
+  }
+}
+
+function utf8Slice (buf, start, end) {
+  end = Math.min(buf.length, end)
+  var res = []
+
+  var i = start
+  while (i < end) {
+    var firstByte = buf[i]
+    var codePoint = null
+    var bytesPerSequence = (firstByte > 0xEF) ? 4
+      : (firstByte > 0xDF) ? 3
+      : (firstByte > 0xBF) ? 2
+      : 1
+
+    if (i + bytesPerSequence <= end) {
+      var secondByte, thirdByte, fourthByte, tempCodePoint
+
+      switch (bytesPerSequence) {
+        case 1:
+          if (firstByte < 0x80) {
+            codePoint = firstByte
+          }
+          break
+        case 2:
+          secondByte = buf[i + 1]
+          if ((secondByte & 0xC0) === 0x80) {
+            tempCodePoint = (firstByte & 0x1F) << 0x6 | (secondByte & 0x3F)
+            if (tempCodePoint > 0x7F) {
+              codePoint = tempCodePoint
+            }
+          }
+          break
+        case 3:
+          secondByte = buf[i + 1]
+          thirdByte = buf[i + 2]
+          if ((secondByte & 0xC0) === 0x80 && (thirdByte & 0xC0) === 0x80) {
+            tempCodePoint = (firstByte & 0xF) << 0xC | (secondByte & 0x3F) << 0x6 | (thirdByte & 0x3F)
+            if (tempCodePoint > 0x7FF && (tempCodePoint < 0xD800 || tempCodePoint > 0xDFFF)) {
+              codePoint = tempCodePoint
+            }
+          }
+          break
+        case 4:
+          secondByte = buf[i + 1]
+          thirdByte = buf[i + 2]
+          fourthByte = buf[i + 3]
+          if ((secondByte & 0xC0) === 0x80 && (thirdByte & 0xC0) === 0x80 && (fourthByte & 0xC0) === 0x80) {
+            tempCodePoint = (firstByte & 0xF) << 0x12 | (secondByte & 0x3F) << 0xC | (thirdByte & 0x3F) << 0x6 | (fourthByte & 0x3F)
+            if (tempCodePoint > 0xFFFF && tempCodePoint < 0x110000) {
+              codePoint = tempCodePoint
+            }
+          }
+      }
+    }
+
+    if (codePoint === null) {
+      // we did not generate a valid codePoint so insert a
+      // replacement char (U+FFFD) and advance only 1 byte
+      codePoint = 0xFFFD
+      bytesPerSequence = 1
+    } else if (codePoint > 0xFFFF) {
+      // encode to utf16 (surrogate pair dance)
+      codePoint -= 0x10000
+      res.push(codePoint >>> 10 & 0x3FF | 0xD800)
+      codePoint = 0xDC00 | codePoint & 0x3FF
+    }
+
+    res.push(codePoint)
+    i += bytesPerSequence
+  }
+
+  return decodeCodePointsArray(res)
+}
+
+// Based on http://stackoverflow.com/a/22747272/680742, the browser with
+// the lowest limit is Chrome, with 0x10000 args.
+// We go 1 magnitude less, for safety
+var MAX_ARGUMENTS_LENGTH = 0x1000
+
+function decodeCodePointsArray (codePoints) {
+  var len = codePoints.length
+  if (len <= MAX_ARGUMENTS_LENGTH) {
+    return String.fromCharCode.apply(String, codePoints) // avoid extra slice()
+  }
+
+  // Decode in chunks to avoid "call stack size exceeded".
+  var res = ''
+  var i = 0
+  while (i < len) {
+    res += String.fromCharCode.apply(
+      String,
+      codePoints.slice(i, i += MAX_ARGUMENTS_LENGTH)
+    )
+  }
+  return res
+}
+
+function asciiSlice (buf, start, end) {
+  var ret = ''
+  end = Math.min(buf.length, end)
+
+  for (var i = start; i < end; i++) {
+    ret += String.fromCharCode(buf[i] & 0x7F)
+  }
+  return ret
+}
+
+function binarySlice (buf, start, end) {
+  var ret = ''
+  end = Math.min(buf.length, end)
+
+  for (var i = start; i < end; i++) {
+    ret += String.fromCharCode(buf[i])
+  }
+  return ret
+}
+
+function hexSlice (buf, start, end) {
+  var len = buf.length
+
+  if (!start || start < 0) start = 0
+  if (!end || end < 0 || end > len) end = len
+
+  var out = ''
+  for (var i = start; i < end; i++) {
+    out += toHex(buf[i])
+  }
+  return out
+}
+
+function utf16leSlice (buf, start, end) {
+  var bytes = buf.slice(start, end)
+  var res = ''
+  for (var i = 0; i < bytes.length; i += 2) {
+    res += String.fromCharCode(bytes[i] + bytes[i + 1] * 256)
+  }
+  return res
+}
+
+Buffer.prototype.slice = function slice (start, end) {
+  var len = this.length
+  start = ~~start
+  end = end === undefined ? len : ~~end
+
+  if (start < 0) {
+    start += len
+    if (start < 0) start = 0
+  } else if (start > len) {
+    start = len
+  }
+
+  if (end < 0) {
+    end += len
+    if (end < 0) end = 0
+  } else if (end > len) {
+    end = len
+  }
+
+  if (end < start) end = start
+
+  var newBuf
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    newBuf = this.subarray(start, end)
+    newBuf.__proto__ = Buffer.prototype
+  } else {
+    var sliceLen = end - start
+    newBuf = new Buffer(sliceLen, undefined)
+    for (var i = 0; i < sliceLen; i++) {
+      newBuf[i] = this[i + start]
+    }
+  }
+
+  if (newBuf.length) newBuf.parent = this.parent || this
+
+  return newBuf
+}
+
+/*
+ * Need to make sure that buffer isn't trying to write out of bounds.
+ */
+function checkOffset (offset, ext, length) {
+  if ((offset % 1) !== 0 || offset < 0) throw new RangeError('offset is not uint')
+  if (offset + ext > length) throw new RangeError('Trying to access beyond buffer length')
+}
+
+Buffer.prototype.readUIntLE = function readUIntLE (offset, byteLength, noAssert) {
+  offset = offset | 0
+  byteLength = byteLength | 0
+  if (!noAssert) checkOffset(offset, byteLength, this.length)
+
+  var val = this[offset]
+  var mul = 1
+  var i = 0
+  while (++i < byteLength && (mul *= 0x100)) {
+    val += this[offset + i] * mul
+  }
+
+  return val
+}
+
+Buffer.prototype.readUIntBE = function readUIntBE (offset, byteLength, noAssert) {
+  offset = offset | 0
+  byteLength = byteLength | 0
+  if (!noAssert) {
+    checkOffset(offset, byteLength, this.length)
+  }
+
+  var val = this[offset + --byteLength]
+  var mul = 1
+  while (byteLength > 0 && (mul *= 0x100)) {
+    val += this[offset + --byteLength] * mul
+  }
+
+  return val
+}
+
+Buffer.prototype.readUInt8 = function readUInt8 (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 1, this.length)
+  return this[offset]
+}
+
+Buffer.prototype.readUInt16LE = function readUInt16LE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 2, this.length)
+  return this[offset] | (this[offset + 1] << 8)
+}
+
+Buffer.prototype.readUInt16BE = function readUInt16BE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 2, this.length)
+  return (this[offset] << 8) | this[offset + 1]
+}
+
+Buffer.prototype.readUInt32LE = function readUInt32LE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 4, this.length)
+
+  return ((this[offset]) |
+      (this[offset + 1] << 8) |
+      (this[offset + 2] << 16)) +
+      (this[offset + 3] * 0x1000000)
+}
+
+Buffer.prototype.readUInt32BE = function readUInt32BE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 4, this.length)
+
+  return (this[offset] * 0x1000000) +
+    ((this[offset + 1] << 16) |
+    (this[offset + 2] << 8) |
+    this[offset + 3])
+}
+
+Buffer.prototype.readIntLE = function readIntLE (offset, byteLength, noAssert) {
+  offset = offset | 0
+  byteLength = byteLength | 0
+  if (!noAssert) checkOffset(offset, byteLength, this.length)
+
+  var val = this[offset]
+  var mul = 1
+  var i = 0
+  while (++i < byteLength && (mul *= 0x100)) {
+    val += this[offset + i] * mul
+  }
+  mul *= 0x80
+
+  if (val >= mul) val -= Math.pow(2, 8 * byteLength)
+
+  return val
+}
+
+Buffer.prototype.readIntBE = function readIntBE (offset, byteLength, noAssert) {
+  offset = offset | 0
+  byteLength = byteLength | 0
+  if (!noAssert) checkOffset(offset, byteLength, this.length)
+
+  var i = byteLength
+  var mul = 1
+  var val = this[offset + --i]
+  while (i > 0 && (mul *= 0x100)) {
+    val += this[offset + --i] * mul
+  }
+  mul *= 0x80
+
+  if (val >= mul) val -= Math.pow(2, 8 * byteLength)
+
+  return val
+}
+
+Buffer.prototype.readInt8 = function readInt8 (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 1, this.length)
+  if (!(this[offset] & 0x80)) return (this[offset])
+  return ((0xff - this[offset] + 1) * -1)
+}
+
+Buffer.prototype.readInt16LE = function readInt16LE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 2, this.length)
+  var val = this[offset] | (this[offset + 1] << 8)
+  return (val & 0x8000) ? val | 0xFFFF0000 : val
+}
+
+Buffer.prototype.readInt16BE = function readInt16BE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 2, this.length)
+  var val = this[offset + 1] | (this[offset] << 8)
+  return (val & 0x8000) ? val | 0xFFFF0000 : val
+}
+
+Buffer.prototype.readInt32LE = function readInt32LE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 4, this.length)
+
+  return (this[offset]) |
+    (this[offset + 1] << 8) |
+    (this[offset + 2] << 16) |
+    (this[offset + 3] << 24)
+}
+
+Buffer.prototype.readInt32BE = function readInt32BE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 4, this.length)
+
+  return (this[offset] << 24) |
+    (this[offset + 1] << 16) |
+    (this[offset + 2] << 8) |
+    (this[offset + 3])
+}
+
+Buffer.prototype.readFloatLE = function readFloatLE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 4, this.length)
+  return ieee754.read(this, offset, true, 23, 4)
+}
+
+Buffer.prototype.readFloatBE = function readFloatBE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 4, this.length)
+  return ieee754.read(this, offset, false, 23, 4)
+}
+
+Buffer.prototype.readDoubleLE = function readDoubleLE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 8, this.length)
+  return ieee754.read(this, offset, true, 52, 8)
+}
+
+Buffer.prototype.readDoubleBE = function readDoubleBE (offset, noAssert) {
+  if (!noAssert) checkOffset(offset, 8, this.length)
+  return ieee754.read(this, offset, false, 52, 8)
+}
+
+function checkInt (buf, value, offset, ext, max, min) {
+  if (!Buffer.isBuffer(buf)) throw new TypeError('buffer must be a Buffer instance')
+  if (value > max || value < min) throw new RangeError('value is out of bounds')
+  if (offset + ext > buf.length) throw new RangeError('index out of range')
+}
+
+Buffer.prototype.writeUIntLE = function writeUIntLE (value, offset, byteLength, noAssert) {
+  value = +value
+  offset = offset | 0
+  byteLength = byteLength | 0
+  if (!noAssert) checkInt(this, value, offset, byteLength, Math.pow(2, 8 * byteLength), 0)
+
+  var mul = 1
+  var i = 0
+  this[offset] = value & 0xFF
+  while (++i < byteLength && (mul *= 0x100)) {
+    this[offset + i] = (value / mul) & 0xFF
+  }
+
+  return offset + byteLength
+}
+
+Buffer.prototype.writeUIntBE = function writeUIntBE (value, offset, byteLength, noAssert) {
+  value = +value
+  offset = offset | 0
+  byteLength = byteLength | 0
+  if (!noAssert) checkInt(this, value, offset, byteLength, Math.pow(2, 8 * byteLength), 0)
+
+  var i = byteLength - 1
+  var mul = 1
+  this[offset + i] = value & 0xFF
+  while (--i >= 0 && (mul *= 0x100)) {
+    this[offset + i] = (value / mul) & 0xFF
+  }
+
+  return offset + byteLength
+}
+
+Buffer.prototype.writeUInt8 = function writeUInt8 (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 1, 0xff, 0)
+  if (!Buffer.TYPED_ARRAY_SUPPORT) value = Math.floor(value)
+  this[offset] = (value & 0xff)
+  return offset + 1
+}
+
+function objectWriteUInt16 (buf, value, offset, littleEndian) {
+  if (value < 0) value = 0xffff + value + 1
+  for (var i = 0, j = Math.min(buf.length - offset, 2); i < j; i++) {
+    buf[offset + i] = (value & (0xff << (8 * (littleEndian ? i : 1 - i)))) >>>
+      (littleEndian ? i : 1 - i) * 8
+  }
+}
+
+Buffer.prototype.writeUInt16LE = function writeUInt16LE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 2, 0xffff, 0)
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset] = (value & 0xff)
+    this[offset + 1] = (value >>> 8)
+  } else {
+    objectWriteUInt16(this, value, offset, true)
+  }
+  return offset + 2
+}
+
+Buffer.prototype.writeUInt16BE = function writeUInt16BE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 2, 0xffff, 0)
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset] = (value >>> 8)
+    this[offset + 1] = (value & 0xff)
+  } else {
+    objectWriteUInt16(this, value, offset, false)
+  }
+  return offset + 2
+}
+
+function objectWriteUInt32 (buf, value, offset, littleEndian) {
+  if (value < 0) value = 0xffffffff + value + 1
+  for (var i = 0, j = Math.min(buf.length - offset, 4); i < j; i++) {
+    buf[offset + i] = (value >>> (littleEndian ? i : 3 - i) * 8) & 0xff
+  }
+}
+
+Buffer.prototype.writeUInt32LE = function writeUInt32LE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 4, 0xffffffff, 0)
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset + 3] = (value >>> 24)
+    this[offset + 2] = (value >>> 16)
+    this[offset + 1] = (value >>> 8)
+    this[offset] = (value & 0xff)
+  } else {
+    objectWriteUInt32(this, value, offset, true)
+  }
+  return offset + 4
+}
+
+Buffer.prototype.writeUInt32BE = function writeUInt32BE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 4, 0xffffffff, 0)
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset] = (value >>> 24)
+    this[offset + 1] = (value >>> 16)
+    this[offset + 2] = (value >>> 8)
+    this[offset + 3] = (value & 0xff)
+  } else {
+    objectWriteUInt32(this, value, offset, false)
+  }
+  return offset + 4
+}
+
+Buffer.prototype.writeIntLE = function writeIntLE (value, offset, byteLength, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) {
+    var limit = Math.pow(2, 8 * byteLength - 1)
+
+    checkInt(this, value, offset, byteLength, limit - 1, -limit)
+  }
+
+  var i = 0
+  var mul = 1
+  var sub = value < 0 ? 1 : 0
+  this[offset] = value & 0xFF
+  while (++i < byteLength && (mul *= 0x100)) {
+    this[offset + i] = ((value / mul) >> 0) - sub & 0xFF
+  }
+
+  return offset + byteLength
+}
+
+Buffer.prototype.writeIntBE = function writeIntBE (value, offset, byteLength, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) {
+    var limit = Math.pow(2, 8 * byteLength - 1)
+
+    checkInt(this, value, offset, byteLength, limit - 1, -limit)
+  }
+
+  var i = byteLength - 1
+  var mul = 1
+  var sub = value < 0 ? 1 : 0
+  this[offset + i] = value & 0xFF
+  while (--i >= 0 && (mul *= 0x100)) {
+    this[offset + i] = ((value / mul) >> 0) - sub & 0xFF
+  }
+
+  return offset + byteLength
+}
+
+Buffer.prototype.writeInt8 = function writeInt8 (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 1, 0x7f, -0x80)
+  if (!Buffer.TYPED_ARRAY_SUPPORT) value = Math.floor(value)
+  if (value < 0) value = 0xff + value + 1
+  this[offset] = (value & 0xff)
+  return offset + 1
+}
+
+Buffer.prototype.writeInt16LE = function writeInt16LE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 2, 0x7fff, -0x8000)
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset] = (value & 0xff)
+    this[offset + 1] = (value >>> 8)
+  } else {
+    objectWriteUInt16(this, value, offset, true)
+  }
+  return offset + 2
+}
+
+Buffer.prototype.writeInt16BE = function writeInt16BE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 2, 0x7fff, -0x8000)
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset] = (value >>> 8)
+    this[offset + 1] = (value & 0xff)
+  } else {
+    objectWriteUInt16(this, value, offset, false)
+  }
+  return offset + 2
+}
+
+Buffer.prototype.writeInt32LE = function writeInt32LE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 4, 0x7fffffff, -0x80000000)
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset] = (value & 0xff)
+    this[offset + 1] = (value >>> 8)
+    this[offset + 2] = (value >>> 16)
+    this[offset + 3] = (value >>> 24)
+  } else {
+    objectWriteUInt32(this, value, offset, true)
+  }
+  return offset + 4
+}
+
+Buffer.prototype.writeInt32BE = function writeInt32BE (value, offset, noAssert) {
+  value = +value
+  offset = offset | 0
+  if (!noAssert) checkInt(this, value, offset, 4, 0x7fffffff, -0x80000000)
+  if (value < 0) value = 0xffffffff + value + 1
+  if (Buffer.TYPED_ARRAY_SUPPORT) {
+    this[offset] = (value >>> 24)
+    this[offset + 1] = (value >>> 16)
+    this[offset + 2] = (value >>> 8)
+    this[offset + 3] = (value & 0xff)
+  } else {
+    objectWriteUInt32(this, value, offset, false)
+  }
+  return offset + 4
+}
+
+function checkIEEE754 (buf, value, offset, ext, max, min) {
+  if (offset + ext > buf.length) throw new RangeError('index out of range')
+  if (offset < 0) throw new RangeError('index out of range')
+}
+
+function writeFloat (buf, value, offset, littleEndian, noAssert) {
+  if (!noAssert) {
+    checkIEEE754(buf, value, offset, 4, 3.4028234663852886e+38, -3.4028234663852886e+38)
+  }
+  ieee754.write(buf, value, offset, littleEndian, 23, 4)
+  return offset + 4
+}
+
+Buffer.prototype.writeFloatLE = function writeFloatLE (value, offset, noAssert) {
+  return writeFloat(this, value, offset, true, noAssert)
+}
+
+Buffer.prototype.writeFloatBE = function writeFloatBE (value, offset, noAssert) {
+  return writeFloat(this, value, offset, false, noAssert)
+}
+
+function writeDouble (buf, value, offset, littleEndian, noAssert) {
+  if (!noAssert) {
+    checkIEEE754(buf, value, offset, 8, 1.7976931348623157E+308, -1.7976931348623157E+308)
+  }
+  ieee754.write(buf, value, offset, littleEndian, 52, 8)
+  return offset + 8
+}
+
+Buffer.prototype.writeDoubleLE = function writeDoubleLE (value, offset, noAssert) {
+  return writeDouble(this, value, offset, true, noAssert)
+}
+
+Buffer.prototype.writeDoubleBE = function writeDoubleBE (value, offset, noAssert) {
+  return writeDouble(this, value, offset, false, noAssert)
+}
+
+// copy(targetBuffer, targetStart=0, sourceStart=0, sourceEnd=buffer.length)
+Buffer.prototype.copy = function copy (target, targetStart, start, end) {
+  if (!start) start = 0
+  if (!end && end !== 0) end = this.length
+  if (targetStart >= target.length) targetStart = target.length
+  if (!targetStart) targetStart = 0
+  if (end > 0 && end < start) end = start
+
+  // Copy 0 bytes; we're done
+  if (end === start) return 0
+  if (target.length === 0 || this.length === 0) return 0
+
+  // Fatal error conditions
+  if (targetStart < 0) {
+    throw new RangeError('targetStart out of bounds')
+  }
+  if (start < 0 || start >= this.length) throw new RangeError('sourceStart out of bounds')
+  if (end < 0) throw new RangeError('sourceEnd out of bounds')
+
+  // Are we oob?
+  if (end > this.length) end = this.length
+  if (target.length - targetStart < end - start) {
+    end = target.length - targetStart + start
+  }
+
+  var len = end - start
+  var i
+
+  if (this === target && start < targetStart && targetStart < end) {
+    // descending copy from end
+    for (i = len - 1; i >= 0; i--) {
+      target[i + targetStart] = this[i + start]
+    }
+  } else if (len < 1000 || !Buffer.TYPED_ARRAY_SUPPORT) {
+    // ascending copy from start
+    for (i = 0; i < len; i++) {
+      target[i + targetStart] = this[i + start]
+    }
+  } else {
+    Uint8Array.prototype.set.call(
+      target,
+      this.subarray(start, start + len),
+      targetStart
+    )
+  }
+
+  return len
+}
+
+// fill(value, start=0, end=buffer.length)
+Buffer.prototype.fill = function fill (value, start, end) {
+  if (!value) value = 0
+  if (!start) start = 0
+  if (!end) end = this.length
+
+  if (end < start) throw new RangeError('end < start')
+
+  // Fill 0 bytes; we're done
+  if (end === start) return
+  if (this.length === 0) return
+
+  if (start < 0 || start >= this.length) throw new RangeError('start out of bounds')
+  if (end < 0 || end > this.length) throw new RangeError('end out of bounds')
+
+  var i
+  if (typeof value === 'number') {
+    for (i = start; i < end; i++) {
+      this[i] = value
+    }
+  } else {
+    var bytes = utf8ToBytes(value.toString())
+    var len = bytes.length
+    for (i = start; i < end; i++) {
+      this[i] = bytes[i % len]
+    }
+  }
+
+  return this
+}
+
+// HELPER FUNCTIONS
+// ================
+
+var INVALID_BASE64_RE = /[^+\/0-9A-Za-z-_]/g
+
+function base64clean (str) {
+  // Node strips out invalid characters like \n and \t from the string, base64-js does not
+  str = stringtrim(str).replace(INVALID_BASE64_RE, '')
+  // Node converts strings with length < 2 to ''
+  if (str.length < 2) return ''
+  // Node allows for non-padded base64 strings (missing trailing ===), base64-js does not
+  while (str.length % 4 !== 0) {
+    str = str + '='
+  }
+  return str
+}
+
+function stringtrim (str) {
+  if (str.trim) return str.trim()
+  return str.replace(/^\s+|\s+$/g, '')
+}
+
+function toHex (n) {
+  if (n < 16) return '0' + n.toString(16)
+  return n.toString(16)
+}
+
+function utf8ToBytes (string, units) {
+  units = units || Infinity
+  var codePoint
+  var length = string.length
+  var leadSurrogate = null
+  var bytes = []
+
+  for (var i = 0; i < length; i++) {
+    codePoint = string.charCodeAt(i)
+
+    // is surrogate component
+    if (codePoint > 0xD7FF && codePoint < 0xE000) {
+      // last char was a lead
+      if (!leadSurrogate) {
+        // no lead yet
+        if (codePoint > 0xDBFF) {
+          // unexpected trail
+          if ((units -= 3) > -1) bytes.push(0xEF, 0xBF, 0xBD)
+          continue
+        } else if (i + 1 === length) {
+          // unpaired lead
+          if ((units -= 3) > -1) bytes.push(0xEF, 0xBF, 0xBD)
+          continue
+        }
+
+        // valid lead
+        leadSurrogate = codePoint
+
+        continue
+      }
+
+      // 2 leads in a row
+      if (codePoint < 0xDC00) {
+        if ((units -= 3) > -1) bytes.push(0xEF, 0xBF, 0xBD)
+        leadSurrogate = codePoint
+        continue
+      }
+
+      // valid surrogate pair
+      codePoint = (leadSurrogate - 0xD800 << 10 | codePoint - 0xDC00) + 0x10000
+    } else if (leadSurrogate) {
+      // valid bmp char, but last char was a lead
+      if ((units -= 3) > -1) bytes.push(0xEF, 0xBF, 0xBD)
+    }
+
+    leadSurrogate = null
+
+    // encode utf8
+    if (codePoint < 0x80) {
+      if ((units -= 1) < 0) break
+      bytes.push(codePoint)
+    } else if (codePoint < 0x800) {
+      if ((units -= 2) < 0) break
+      bytes.push(
+        codePoint >> 0x6 | 0xC0,
+        codePoint & 0x3F | 0x80
+      )
+    } else if (codePoint < 0x10000) {
+      if ((units -= 3) < 0) break
+      bytes.push(
+        codePoint >> 0xC | 0xE0,
+        codePoint >> 0x6 & 0x3F | 0x80,
+        codePoint & 0x3F | 0x80
+      )
+    } else if (codePoint < 0x110000) {
+      if ((units -= 4) < 0) break
+      bytes.push(
+        codePoint >> 0x12 | 0xF0,
+        codePoint >> 0xC & 0x3F | 0x80,
+        codePoint >> 0x6 & 0x3F | 0x80,
+        codePoint & 0x3F | 0x80
+      )
+    } else {
+      throw new Error('Invalid code point')
+    }
+  }
+
+  return bytes
+}
+
+function asciiToBytes (str) {
+  var byteArray = []
+  for (var i = 0; i < str.length; i++) {
+    // Node's code seems to be doing this and not & 0x7F..
+    byteArray.push(str.charCodeAt(i) & 0xFF)
+  }
+  return byteArray
+}
+
+function utf16leToBytes (str, units) {
+  var c, hi, lo
+  var byteArray = []
+  for (var i = 0; i < str.length; i++) {
+    if ((units -= 2) < 0) break
+
+    c = str.charCodeAt(i)
+    hi = c >> 8
+    lo = c % 256
+    byteArray.push(lo)
+    byteArray.push(hi)
+  }
+
+  return byteArray
+}
+
+function base64ToBytes (str) {
+  return base64.toByteArray(base64clean(str))
+}
+
+function blitBuffer (src, dst, offset, length) {
+  for (var i = 0; i < length; i++) {
+    if ((i + offset >= dst.length) || (i >= src.length)) break
+    dst[i + offset] = src[i]
+  }
+  return i
+}
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"base64-js":2,"ieee754":3,"isarray":4}],2:[function(require,module,exports){
+;(function (exports) {
+  'use strict'
+
+  var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+  var Arr = (typeof Uint8Array !== 'undefined')
+    ? Uint8Array
+    : Array
+
+  var PLUS = '+'.charCodeAt(0)
+  var SLASH = '/'.charCodeAt(0)
+  var NUMBER = '0'.charCodeAt(0)
+  var LOWER = 'a'.charCodeAt(0)
+  var UPPER = 'A'.charCodeAt(0)
+  var PLUS_URL_SAFE = '-'.charCodeAt(0)
+  var SLASH_URL_SAFE = '_'.charCodeAt(0)
+
+  function decode (elt) {
+    var code = elt.charCodeAt(0)
+    if (code === PLUS || code === PLUS_URL_SAFE) return 62 // '+'
+    if (code === SLASH || code === SLASH_URL_SAFE) return 63 // '/'
+    if (code < NUMBER) return -1 // no match
+    if (code < NUMBER + 10) return code - NUMBER + 26 + 26
+    if (code < UPPER + 26) return code - UPPER
+    if (code < LOWER + 26) return code - LOWER + 26
+  }
+
+  function b64ToByteArray (b64) {
+    var i, j, l, tmp, placeHolders, arr
+
+    if (b64.length % 4 > 0) {
+      throw new Error('Invalid string. Length must be a multiple of 4')
+    }
+
+    // the number of equal signs (place holders)
+    // if there are two placeholders, than the two characters before it
+    // represent one byte
+    // if there is only one, then the three characters before it represent 2 bytes
+    // this is just a cheap hack to not do indexOf twice
+    var len = b64.length
+    placeHolders = b64.charAt(len - 2) === '=' ? 2 : b64.charAt(len - 1) === '=' ? 1 : 0
+
+    // base64 is 4/3 + up to two characters of the original data
+    arr = new Arr(b64.length * 3 / 4 - placeHolders)
+
+    // if there are placeholders, only get up to the last complete 4 chars
+    l = placeHolders > 0 ? b64.length - 4 : b64.length
+
+    var L = 0
+
+    function push (v) {
+      arr[L++] = v
+    }
+
+    for (i = 0, j = 0; i < l; i += 4, j += 3) {
+      tmp = (decode(b64.charAt(i)) << 18) | (decode(b64.charAt(i + 1)) << 12) | (decode(b64.charAt(i + 2)) << 6) | decode(b64.charAt(i + 3))
+      push((tmp & 0xFF0000) >> 16)
+      push((tmp & 0xFF00) >> 8)
+      push(tmp & 0xFF)
+    }
+
+    if (placeHolders === 2) {
+      tmp = (decode(b64.charAt(i)) << 2) | (decode(b64.charAt(i + 1)) >> 4)
+      push(tmp & 0xFF)
+    } else if (placeHolders === 1) {
+      tmp = (decode(b64.charAt(i)) << 10) | (decode(b64.charAt(i + 1)) << 4) | (decode(b64.charAt(i + 2)) >> 2)
+      push((tmp >> 8) & 0xFF)
+      push(tmp & 0xFF)
+    }
+
+    return arr
+  }
+
+  function uint8ToBase64 (uint8) {
+    var i
+    var extraBytes = uint8.length % 3 // if we have 1 byte left, pad 2 bytes
+    var output = ''
+    var temp, length
+
+    function encode (num) {
+      return lookup.charAt(num)
+    }
+
+    function tripletToBase64 (num) {
+      return encode(num >> 18 & 0x3F) + encode(num >> 12 & 0x3F) + encode(num >> 6 & 0x3F) + encode(num & 0x3F)
+    }
+
+    // go through the array every three bytes, we'll deal with trailing stuff later
+    for (i = 0, length = uint8.length - extraBytes; i < length; i += 3) {
+      temp = (uint8[i] << 16) + (uint8[i + 1] << 8) + (uint8[i + 2])
+      output += tripletToBase64(temp)
+    }
+
+    // pad the end with zeros, but make sure to not forget the extra bytes
+    switch (extraBytes) {
+      case 1:
+        temp = uint8[uint8.length - 1]
+        output += encode(temp >> 2)
+        output += encode((temp << 4) & 0x3F)
+        output += '=='
+        break
+      case 2:
+        temp = (uint8[uint8.length - 2] << 8) + (uint8[uint8.length - 1])
+        output += encode(temp >> 10)
+        output += encode((temp >> 4) & 0x3F)
+        output += encode((temp << 2) & 0x3F)
+        output += '='
+        break
+      default:
+        break
+    }
+
+    return output
+  }
+
+  exports.toByteArray = b64ToByteArray
+  exports.fromByteArray = uint8ToBase64
+}(typeof exports === 'undefined' ? (this.base64js = {}) : exports))
+
+},{}],3:[function(require,module,exports){
+exports.read = function (buffer, offset, isLE, mLen, nBytes) {
+  var e, m
+  var eLen = nBytes * 8 - mLen - 1
+  var eMax = (1 << eLen) - 1
+  var eBias = eMax >> 1
+  var nBits = -7
+  var i = isLE ? (nBytes - 1) : 0
+  var d = isLE ? -1 : 1
+  var s = buffer[offset + i]
+
+  i += d
+
+  e = s & ((1 << (-nBits)) - 1)
+  s >>= (-nBits)
+  nBits += eLen
+  for (; nBits > 0; e = e * 256 + buffer[offset + i], i += d, nBits -= 8) {}
+
+  m = e & ((1 << (-nBits)) - 1)
+  e >>= (-nBits)
+  nBits += mLen
+  for (; nBits > 0; m = m * 256 + buffer[offset + i], i += d, nBits -= 8) {}
+
+  if (e === 0) {
+    e = 1 - eBias
+  } else if (e === eMax) {
+    return m ? NaN : ((s ? -1 : 1) * Infinity)
+  } else {
+    m = m + Math.pow(2, mLen)
+    e = e - eBias
+  }
+  return (s ? -1 : 1) * m * Math.pow(2, e - mLen)
+}
+
+exports.write = function (buffer, value, offset, isLE, mLen, nBytes) {
+  var e, m, c
+  var eLen = nBytes * 8 - mLen - 1
+  var eMax = (1 << eLen) - 1
+  var eBias = eMax >> 1
+  var rt = (mLen === 23 ? Math.pow(2, -24) - Math.pow(2, -77) : 0)
+  var i = isLE ? 0 : (nBytes - 1)
+  var d = isLE ? 1 : -1
+  var s = value < 0 || (value === 0 && 1 / value < 0) ? 1 : 0
+
+  value = Math.abs(value)
+
+  if (isNaN(value) || value === Infinity) {
+    m = isNaN(value) ? 1 : 0
+    e = eMax
+  } else {
+    e = Math.floor(Math.log(value) / Math.LN2)
+    if (value * (c = Math.pow(2, -e)) < 1) {
+      e--
+      c *= 2
+    }
+    if (e + eBias >= 1) {
+      value += rt / c
+    } else {
+      value += rt * Math.pow(2, 1 - eBias)
+    }
+    if (value * c >= 2) {
+      e++
+      c /= 2
+    }
+
+    if (e + eBias >= eMax) {
+      m = 0
+      e = eMax
+    } else if (e + eBias >= 1) {
+      m = (value * c - 1) * Math.pow(2, mLen)
+      e = e + eBias
+    } else {
+      m = value * Math.pow(2, eBias - 1) * Math.pow(2, mLen)
+      e = 0
+    }
+  }
+
+  for (; mLen >= 8; buffer[offset + i] = m & 0xff, i += d, m /= 256, mLen -= 8) {}
+
+  e = (e << mLen) | m
+  eLen += mLen
+  for (; eLen > 0; buffer[offset + i] = e & 0xff, i += d, e /= 256, eLen -= 8) {}
+
+  buffer[offset + i - d] |= s * 128
+}
+
+},{}],4:[function(require,module,exports){
+var toString = {}.toString;
+
+module.exports = Array.isArray || function (arr) {
+  return toString.call(arr) == '[object Array]';
+};
+
+},{}],5:[function(require,module,exports){
+(function (Buffer){
+'use strict';
+
+function objectToString(o) {
+  return Object.prototype.toString.call(o);
+}
+
+// shim for Node's 'util' package
+// DO NOT REMOVE THIS! It is required for compatibility with EnderJS (http://enderjs.com/).
+var util = {
+  isArray: function (ar) {
+    return Array.isArray(ar) || (typeof ar === 'object' && objectToString(ar) === '[object Array]');
+  },
+  isDate: function (d) {
+    return typeof d === 'object' && objectToString(d) === '[object Date]';
+  },
+  isRegExp: function (re) {
+    return typeof re === 'object' && objectToString(re) === '[object RegExp]';
+  },
+  getRegExpFlags: function (re) {
+    var flags = '';
+    re.global && (flags += 'g');
+    re.ignoreCase && (flags += 'i');
+    re.multiline && (flags += 'm');
+    return flags;
+  }
+};
+
+
+if (typeof module === 'object')
+  module.exports = clone;
+
+/**
+ * Clones (copies) an Object using deep copying.
+ *
+ * This function supports circular references by default, but if you are certain
+ * there are no circular references in your object, you can save some CPU time
+ * by calling clone(obj, false).
+ *
+ * Caution: if `circular` is false and `parent` contains circular references,
+ * your program may enter an infinite loop and crash.
+ *
+ * @param `parent` - the object to be cloned
+ * @param `circular` - set to true if the object to be cloned may contain
+ *    circular references. (optional - true by default)
+ * @param `depth` - set to a number if the object is only to be cloned to
+ *    a particular depth. (optional - defaults to Infinity)
+ * @param `prototype` - sets the prototype to be used when cloning an object.
+ *    (optional - defaults to parent prototype).
+*/
+
+function clone(parent, circular, depth, prototype) {
+  // maintain two arrays for circular references, where corresponding parents
+  // and children have the same index
+  var allParents = [];
+  var allChildren = [];
+
+  var useBuffer = typeof Buffer != 'undefined';
+
+  if (typeof circular == 'undefined')
+    circular = true;
+
+  if (typeof depth == 'undefined')
+    depth = Infinity;
+
+  // recurse this function so we don't reset allParents and allChildren
+  function _clone(parent, depth) {
+    // cloning null always returns null
+    if (parent === null)
+      return null;
+
+    if (depth == 0)
+      return parent;
+
+    var child;
+    var proto;
+    if (typeof parent != 'object') {
+      return parent;
+    }
+
+    if (util.isArray(parent)) {
+      child = [];
+    } else if (util.isRegExp(parent)) {
+      child = new RegExp(parent.source, util.getRegExpFlags(parent));
+      if (parent.lastIndex) child.lastIndex = parent.lastIndex;
+    } else if (util.isDate(parent)) {
+      child = new Date(parent.getTime());
+    } else if (useBuffer && Buffer.isBuffer(parent)) {
+      child = new Buffer(parent.length);
+      parent.copy(child);
+      return child;
+    } else {
+      if (typeof prototype == 'undefined') {
+        proto = Object.getPrototypeOf(parent);
+        child = Object.create(proto);
+      }
+      else {
+        child = Object.create(prototype);
+        proto = prototype;
+      }
+    }
+
+    if (circular) {
+      var index = allParents.indexOf(parent);
+
+      if (index != -1) {
+        return allChildren[index];
+      }
+      allParents.push(parent);
+      allChildren.push(child);
+    }
+
+    for (var i in parent) {
+      var attrs;
+      if (proto) {
+        attrs = Object.getOwnPropertyDescriptor(proto, i);
+      }
+      
+      if (attrs && attrs.set == null) {
+        continue;
+      }
+      child[i] = _clone(parent[i], depth - 1);
+    }
+
+    return child;
+  }
+
+  return _clone(parent, depth);
+}
+
+/**
+ * Simple flat clone using prototype, accepts only objects, usefull for property
+ * override on FLAT configuration object (no nested props).
+ *
+ * USE WITH CAUTION! This may not behave as you wish if you do not know how this
+ * works.
+ */
+clone.clonePrototype = function(parent) {
+  if (parent === null)
+    return null;
+
+  var c = function () {};
+  c.prototype = parent;
+  return new c();
+};
+
+}).call(this,require("buffer").Buffer)
+},{"buffer":1}],6:[function(require,module,exports){
+(function (global){
+/**
+ * @license
+ * Lo-Dash 2.4.2 (Custom Build) <https://lodash.com/>
+ * Build: `lodash modern -o ./dist/lodash.js`
+ * Copyright 2012-2013 The Dojo Foundation <http://dojofoundation.org/>
+ * Based on Underscore.js 1.5.2 <http://underscorejs.org/LICENSE>
+ * Copyright 2009-2013 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
+ * Available under MIT license <https://lodash.com/license>
+ */
+;(function() {
+
+  /** Used as a safe reference for `undefined` in pre ES5 environments */
+  var undefined;
+
+  /** Used to pool arrays and objects used internally */
+  var arrayPool = [],
+      objectPool = [];
+
+  /** Used to generate unique IDs */
+  var idCounter = 0;
+
+  /** Used to prefix keys to avoid issues with `__proto__` and properties on `Object.prototype` */
+  var keyPrefix = +new Date + '';
+
+  /** Used as the size when optimizations are enabled for large arrays */
+  var largeArraySize = 75;
+
+  /** Used as the max size of the `arrayPool` and `objectPool` */
+  var maxPoolSize = 40;
+
+  /** Used to detect and test whitespace */
+  var whitespace = (
+    // whitespace
+    ' \t\x0B\f\xA0\ufeff' +
+
+    // line terminators
+    '\n\r\u2028\u2029' +
+
+    // unicode category "Zs" space separators
+    '\u1680\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000'
+  );
+
+  /** Used to match empty string literals in compiled template source */
+  var reEmptyStringLeading = /\b__p \+= '';/g,
+      reEmptyStringMiddle = /\b(__p \+=) '' \+/g,
+      reEmptyStringTrailing = /(__e\(.*?\)|\b__t\)) \+\n'';/g;
+
+  /**
+   * Used to match ES6 template delimiters
+   * http://people.mozilla.org/~jorendorff/es6-draft.html#sec-literals-string-literals
+   */
+  var reEsTemplate = /\$\{([^\\}]*(?:\\.[^\\}]*)*)\}/g;
+
+  /** Used to match regexp flags from their coerced string values */
+  var reFlags = /\w*$/;
+
+  /** Used to detected named functions */
+  var reFuncName = /^\s*function[ \n\r\t]+\w/;
+
+  /** Used to match "interpolate" template delimiters */
+  var reInterpolate = /<%=([\s\S]+?)%>/g;
+
+  /** Used to match leading whitespace and zeros to be removed */
+  var reLeadingSpacesAndZeros = RegExp('^[' + whitespace + ']*0+(?=.$)');
+
+  /** Used to ensure capturing order of template delimiters */
+  var reNoMatch = /($^)/;
+
+  /** Used to detect functions containing a `this` reference */
+  var reThis = /\bthis\b/;
+
+  /** Used to match unescaped characters in compiled string literals */
+  var reUnescapedString = /['\n\r\t\u2028\u2029\\]/g;
+
+  /** Used to assign default `context` object properties */
+  var contextProps = [
+    'Array', 'Boolean', 'Date', 'Function', 'Math', 'Number', 'Object',
+    'RegExp', 'String', '_', 'attachEvent', 'clearTimeout', 'isFinite', 'isNaN',
+    'parseInt', 'setTimeout'
+  ];
+
+  /** Used to make template sourceURLs easier to identify */
+  var templateCounter = 0;
+
+  /** `Object#toString` result shortcuts */
+  var argsClass = '[object Arguments]',
+      arrayClass = '[object Array]',
+      boolClass = '[object Boolean]',
+      dateClass = '[object Date]',
+      funcClass = '[object Function]',
+      numberClass = '[object Number]',
+      objectClass = '[object Object]',
+      regexpClass = '[object RegExp]',
+      stringClass = '[object String]';
+
+  /** Used to identify object classifications that `_.clone` supports */
+  var cloneableClasses = {};
+  cloneableClasses[funcClass] = false;
+  cloneableClasses[argsClass] = cloneableClasses[arrayClass] =
+  cloneableClasses[boolClass] = cloneableClasses[dateClass] =
+  cloneableClasses[numberClass] = cloneableClasses[objectClass] =
+  cloneableClasses[regexpClass] = cloneableClasses[stringClass] = true;
+
+  /** Used as an internal `_.debounce` options object */
+  var debounceOptions = {
+    'leading': false,
+    'maxWait': 0,
+    'trailing': false
+  };
+
+  /** Used as the property descriptor for `__bindData__` */
+  var descriptor = {
+    'configurable': false,
+    'enumerable': false,
+    'value': null,
+    'writable': false
+  };
+
+  /** Used to determine if values are of the language type Object */
+  var objectTypes = {
+    'boolean': false,
+    'function': true,
+    'object': true,
+    'number': false,
+    'string': false,
+    'undefined': false
+  };
+
+  /** Used to escape characters for inclusion in compiled string literals */
+  var stringEscapes = {
+    '\\': '\\',
+    "'": "'",
+    '\n': 'n',
+    '\r': 'r',
+    '\t': 't',
+    '\u2028': 'u2028',
+    '\u2029': 'u2029'
+  };
+
+  /** Used as a reference to the global object */
+  var root = (objectTypes[typeof window] && window) || this;
+
+  /** Detect free variable `exports` */
+  var freeExports = objectTypes[typeof exports] && exports && !exports.nodeType && exports;
+
+  /** Detect free variable `module` */
+  var freeModule = objectTypes[typeof module] && module && !module.nodeType && module;
+
+  /** Detect the popular CommonJS extension `module.exports` */
+  var moduleExports = freeModule && freeModule.exports === freeExports && freeExports;
+
+  /** Detect free variable `global` from Node.js or Browserified code and use it as `root` */
+  var freeGlobal = objectTypes[typeof global] && global;
+  if (freeGlobal && (freeGlobal.global === freeGlobal || freeGlobal.window === freeGlobal)) {
+    root = freeGlobal;
+  }
+
+  /*--------------------------------------------------------------------------*/
+
+  /**
+   * The base implementation of `_.indexOf` without support for binary searches
+   * or `fromIndex` constraints.
+   *
+   * @private
+   * @param {Array} array The array to search.
+   * @param {*} value The value to search for.
+   * @param {number} [fromIndex=0] The index to search from.
+   * @returns {number} Returns the index of the matched value or `-1`.
+   */
+  function baseIndexOf(array, value, fromIndex) {
+    var index = (fromIndex || 0) - 1,
+        length = array ? array.length : 0;
+
+    while (++index < length) {
+      if (array[index] === value) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * An implementation of `_.contains` for cache objects that mimics the return
+   * signature of `_.indexOf` by returning `0` if the value is found, else `-1`.
+   *
+   * @private
+   * @param {Object} cache The cache object to inspect.
+   * @param {*} value The value to search for.
+   * @returns {number} Returns `0` if `value` is found, else `-1`.
+   */
+  function cacheIndexOf(cache, value) {
+    var type = typeof value;
+    cache = cache.cache;
+
+    if (type == 'boolean' || value == null) {
+      return cache[value] ? 0 : -1;
+    }
+    if (type != 'number' && type != 'string') {
+      type = 'object';
+    }
+    var key = type == 'number' ? value : keyPrefix + value;
+    cache = (cache = cache[type]) && cache[key];
+
+    return type == 'object'
+      ? (cache && baseIndexOf(cache, value) > -1 ? 0 : -1)
+      : (cache ? 0 : -1);
+  }
+
+  /**
+   * Adds a given value to the corresponding cache object.
+   *
+   * @private
+   * @param {*} value The value to add to the cache.
+   */
+  function cachePush(value) {
+    var cache = this.cache,
+        type = typeof value;
+
+    if (type == 'boolean' || value == null) {
+      cache[value] = true;
+    } else {
+      if (type != 'number' && type != 'string') {
+        type = 'object';
+      }
+      var key = type == 'number' ? value : keyPrefix + value,
+          typeCache = cache[type] || (cache[type] = {});
+
+      if (type == 'object') {
+        (typeCache[key] || (typeCache[key] = [])).push(value);
+      } else {
+        typeCache[key] = true;
+      }
+    }
+  }
+
+  /**
+   * Used by `_.max` and `_.min` as the default callback when a given
+   * collection is a string value.
+   *
+   * @private
+   * @param {string} value The character to inspect.
+   * @returns {number} Returns the code unit of given character.
+   */
+  function charAtCallback(value) {
+    return value.charCodeAt(0);
+  }
+
+  /**
+   * Used by `sortBy` to compare transformed `collection` elements, stable sorting
+   * them in ascending order.
+   *
+   * @private
+   * @param {Object} a The object to compare to `b`.
+   * @param {Object} b The object to compare to `a`.
+   * @returns {number} Returns the sort order indicator of `1` or `-1`.
+   */
+  function compareAscending(a, b) {
+    var ac = a.criteria,
+        bc = b.criteria,
+        index = -1,
+        length = ac.length;
+
+    while (++index < length) {
+      var value = ac[index],
+          other = bc[index];
+
+      if (value !== other) {
+        if (value > other || typeof value == 'undefined') {
+          return 1;
+        }
+        if (value < other || typeof other == 'undefined') {
+          return -1;
+        }
+      }
+    }
+    // Fixes an `Array#sort` bug in the JS engine embedded in Adobe applications
+    // that causes it, under certain circumstances, to return the same value for
+    // `a` and `b`. See https://github.com/jashkenas/underscore/pull/1247
+    //
+    // This also ensures a stable sort in V8 and other engines.
+    // See http://code.google.com/p/v8/issues/detail?id=90
+    return a.index - b.index;
+  }
+
+  /**
+   * Creates a cache object to optimize linear searches of large arrays.
+   *
+   * @private
+   * @param {Array} [array=[]] The array to search.
+   * @returns {null|Object} Returns the cache object or `null` if caching should not be used.
+   */
+  function createCache(array) {
+    var index = -1,
+        length = array.length,
+        first = array[0],
+        mid = array[(length / 2) | 0],
+        last = array[length - 1];
+
+    if (first && typeof first == 'object' &&
+        mid && typeof mid == 'object' && last && typeof last == 'object') {
+      return false;
+    }
+    var cache = getObject();
+    cache['false'] = cache['null'] = cache['true'] = cache['undefined'] = false;
+
+    var result = getObject();
+    result.array = array;
+    result.cache = cache;
+    result.push = cachePush;
+
+    while (++index < length) {
+      result.push(array[index]);
+    }
+    return result;
+  }
+
+  /**
+   * Used by `template` to escape characters for inclusion in compiled
+   * string literals.
+   *
+   * @private
+   * @param {string} match The matched character to escape.
+   * @returns {string} Returns the escaped character.
+   */
+  function escapeStringChar(match) {
+    return '\\' + stringEscapes[match];
+  }
+
+  /**
+   * Gets an array from the array pool or creates a new one if the pool is empty.
+   *
+   * @private
+   * @returns {Array} The array from the pool.
+   */
+  function getArray() {
+    return arrayPool.pop() || [];
+  }
+
+  /**
+   * Gets an object from the object pool or creates a new one if the pool is empty.
+   *
+   * @private
+   * @returns {Object} The object from the pool.
+   */
+  function getObject() {
+    return objectPool.pop() || {
+      'array': null,
+      'cache': null,
+      'criteria': null,
+      'false': false,
+      'index': 0,
+      'null': false,
+      'number': null,
+      'object': null,
+      'push': null,
+      'string': null,
+      'true': false,
+      'undefined': false,
+      'value': null
+    };
+  }
+
+  /**
+   * Releases the given array back to the array pool.
+   *
+   * @private
+   * @param {Array} [array] The array to release.
+   */
+  function releaseArray(array) {
+    array.length = 0;
+    if (arrayPool.length < maxPoolSize) {
+      arrayPool.push(array);
+    }
+  }
+
+  /**
+   * Releases the given object back to the object pool.
+   *
+   * @private
+   * @param {Object} [object] The object to release.
+   */
+  function releaseObject(object) {
+    var cache = object.cache;
+    if (cache) {
+      releaseObject(cache);
+    }
+    object.array = object.cache = object.criteria = object.object = object.number = object.string = object.value = null;
+    if (objectPool.length < maxPoolSize) {
+      objectPool.push(object);
+    }
+  }
+
+  /**
+   * Slices the `collection` from the `start` index up to, but not including,
+   * the `end` index.
+   *
+   * Note: This function is used instead of `Array#slice` to support node lists
+   * in IE < 9 and to ensure dense arrays are returned.
+   *
+   * @private
+   * @param {Array|Object|string} collection The collection to slice.
+   * @param {number} start The start index.
+   * @param {number} end The end index.
+   * @returns {Array} Returns the new array.
+   */
+  function slice(array, start, end) {
+    start || (start = 0);
+    if (typeof end == 'undefined') {
+      end = array ? array.length : 0;
+    }
+    var index = -1,
+        length = end - start || 0,
+        result = Array(length < 0 ? 0 : length);
+
+    while (++index < length) {
+      result[index] = array[start + index];
+    }
+    return result;
+  }
+
+  /*--------------------------------------------------------------------------*/
+
+  /**
+   * Create a new `lodash` function using the given context object.
+   *
+   * @static
+   * @memberOf _
+   * @category Utilities
+   * @param {Object} [context=root] The context object.
+   * @returns {Function} Returns the `lodash` function.
+   */
+  function runInContext(context) {
+    // Avoid issues with some ES3 environments that attempt to use values, named
+    // after built-in constructors like `Object`, for the creation of literals.
+    // ES5 clears this up by stating that literals must use built-in constructors.
+    // See http://es5.github.io/#x11.1.5.
+    context = context ? _.defaults(root.Object(), context, _.pick(root, contextProps)) : root;
+
+    /** Native constructor references */
+    var Array = context.Array,
+        Boolean = context.Boolean,
+        Date = context.Date,
+        Function = context.Function,
+        Math = context.Math,
+        Number = context.Number,
+        Object = context.Object,
+        RegExp = context.RegExp,
+        String = context.String,
+        TypeError = context.TypeError;
+
+    /**
+     * Used for `Array` method references.
+     *
+     * Normally `Array.prototype` would suffice, however, using an array literal
+     * avoids issues in Narwhal.
+     */
+    var arrayRef = [];
+
+    /** Used for native method references */
+    var objectProto = Object.prototype;
+
+    /** Used to restore the original `_` reference in `noConflict` */
+    var oldDash = context._;
+
+    /** Used to resolve the internal [[Class]] of values */
+    var toString = objectProto.toString;
+
+    /** Used to detect if a method is native */
+    var reNative = RegExp('^' +
+      String(toString)
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        .replace(/toString| for [^\]]+/g, '.*?') + '$'
+    );
+
+    /** Native method shortcuts */
+    var ceil = Math.ceil,
+        clearTimeout = context.clearTimeout,
+        floor = Math.floor,
+        fnToString = Function.prototype.toString,
+        getPrototypeOf = isNative(getPrototypeOf = Object.getPrototypeOf) && getPrototypeOf,
+        hasOwnProperty = objectProto.hasOwnProperty,
+        push = arrayRef.push,
+        setTimeout = context.setTimeout,
+        splice = arrayRef.splice,
+        unshift = arrayRef.unshift;
+
+    /** Used to set meta data on functions */
+    var defineProperty = (function() {
+      // IE 8 only accepts DOM elements
+      try {
+        var o = {},
+            func = isNative(func = Object.defineProperty) && func,
+            result = func(o, o, o) && func;
+      } catch(e) { }
+      return result;
+    }());
+
+    /* Native method shortcuts for methods with the same name as other `lodash` methods */
+    var nativeCreate = isNative(nativeCreate = Object.create) && nativeCreate,
+        nativeIsArray = isNative(nativeIsArray = Array.isArray) && nativeIsArray,
+        nativeIsFinite = context.isFinite,
+        nativeIsNaN = context.isNaN,
+        nativeKeys = isNative(nativeKeys = Object.keys) && nativeKeys,
+        nativeMax = Math.max,
+        nativeMin = Math.min,
+        nativeParseInt = context.parseInt,
+        nativeRandom = Math.random;
+
+    /** Used to lookup a built-in constructor by [[Class]] */
+    var ctorByClass = {};
+    ctorByClass[arrayClass] = Array;
+    ctorByClass[boolClass] = Boolean;
+    ctorByClass[dateClass] = Date;
+    ctorByClass[funcClass] = Function;
+    ctorByClass[objectClass] = Object;
+    ctorByClass[numberClass] = Number;
+    ctorByClass[regexpClass] = RegExp;
+    ctorByClass[stringClass] = String;
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Creates a `lodash` object which wraps the given value to enable intuitive
+     * method chaining.
+     *
+     * In addition to Lo-Dash methods, wrappers also have the following `Array` methods:
+     * `concat`, `join`, `pop`, `push`, `reverse`, `shift`, `slice`, `sort`, `splice`,
+     * and `unshift`
+     *
+     * Chaining is supported in custom builds as long as the `value` method is
+     * implicitly or explicitly included in the build.
+     *
+     * The chainable wrapper functions are:
+     * `after`, `assign`, `bind`, `bindAll`, `bindKey`, `chain`, `compact`,
+     * `compose`, `concat`, `countBy`, `create`, `createCallback`, `curry`,
+     * `debounce`, `defaults`, `defer`, `delay`, `difference`, `filter`, `flatten`,
+     * `forEach`, `forEachRight`, `forIn`, `forInRight`, `forOwn`, `forOwnRight`,
+     * `functions`, `groupBy`, `indexBy`, `initial`, `intersection`, `invert`,
+     * `invoke`, `keys`, `map`, `max`, `memoize`, `merge`, `min`, `object`, `omit`,
+     * `once`, `pairs`, `partial`, `partialRight`, `pick`, `pluck`, `pull`, `push`,
+     * `range`, `reject`, `remove`, `rest`, `reverse`, `shuffle`, `slice`, `sort`,
+     * `sortBy`, `splice`, `tap`, `throttle`, `times`, `toArray`, `transform`,
+     * `union`, `uniq`, `unshift`, `unzip`, `values`, `where`, `without`, `wrap`,
+     * and `zip`
+     *
+     * The non-chainable wrapper functions are:
+     * `clone`, `cloneDeep`, `contains`, `escape`, `every`, `find`, `findIndex`,
+     * `findKey`, `findLast`, `findLastIndex`, `findLastKey`, `has`, `identity`,
+     * `indexOf`, `isArguments`, `isArray`, `isBoolean`, `isDate`, `isElement`,
+     * `isEmpty`, `isEqual`, `isFinite`, `isFunction`, `isNaN`, `isNull`, `isNumber`,
+     * `isObject`, `isPlainObject`, `isRegExp`, `isString`, `isUndefined`, `join`,
+     * `lastIndexOf`, `mixin`, `noConflict`, `parseInt`, `pop`, `random`, `reduce`,
+     * `reduceRight`, `result`, `shift`, `size`, `some`, `sortedIndex`, `runInContext`,
+     * `template`, `unescape`, `uniqueId`, and `value`
+     *
+     * The wrapper functions `first` and `last` return wrapped values when `n` is
+     * provided, otherwise they return unwrapped values.
+     *
+     * Explicit chaining can be enabled by using the `_.chain` method.
+     *
+     * @name _
+     * @constructor
+     * @category Chaining
+     * @param {*} value The value to wrap in a `lodash` instance.
+     * @returns {Object} Returns a `lodash` instance.
+     * @example
+     *
+     * var wrapped = _([1, 2, 3]);
+     *
+     * // returns an unwrapped value
+     * wrapped.reduce(function(sum, num) {
+     *   return sum + num;
+     * });
+     * // => 6
+     *
+     * // returns a wrapped value
+     * var squares = wrapped.map(function(num) {
+     *   return num * num;
+     * });
+     *
+     * _.isArray(squares);
+     * // => false
+     *
+     * _.isArray(squares.value());
+     * // => true
+     */
+    function lodash(value) {
+      // don't wrap if already wrapped, even if wrapped by a different `lodash` constructor
+      return (value && typeof value == 'object' && !isArray(value) && hasOwnProperty.call(value, '__wrapped__'))
+       ? value
+       : new lodashWrapper(value);
+    }
+
+    /**
+     * A fast path for creating `lodash` wrapper objects.
+     *
+     * @private
+     * @param {*} value The value to wrap in a `lodash` instance.
+     * @param {boolean} chainAll A flag to enable chaining for all methods
+     * @returns {Object} Returns a `lodash` instance.
+     */
+    function lodashWrapper(value, chainAll) {
+      this.__chain__ = !!chainAll;
+      this.__wrapped__ = value;
+    }
+    // ensure `new lodashWrapper` is an instance of `lodash`
+    lodashWrapper.prototype = lodash.prototype;
+
+    /**
+     * An object used to flag environments features.
+     *
+     * @static
+     * @memberOf _
+     * @type Object
+     */
+    var support = lodash.support = {};
+
+    /**
+     * Detect if functions can be decompiled by `Function#toString`
+     * (all but PS3 and older Opera mobile browsers & avoided in Windows 8 apps).
+     *
+     * @memberOf _.support
+     * @type boolean
+     */
+    support.funcDecomp = !isNative(context.WinRTError) && reThis.test(runInContext);
+
+    /**
+     * Detect if `Function#name` is supported (all but IE).
+     *
+     * @memberOf _.support
+     * @type boolean
+     */
+    support.funcNames = typeof Function.name == 'string';
+
+    /**
+     * By default, the template delimiters used by Lo-Dash are similar to those in
+     * embedded Ruby (ERB). Change the following template settings to use alternative
+     * delimiters.
+     *
+     * @static
+     * @memberOf _
+     * @type Object
+     */
+    lodash.templateSettings = {
+
+      /**
+       * Used to detect `data` property values to be HTML-escaped.
+       *
+       * @memberOf _.templateSettings
+       * @type RegExp
+       */
+      'escape': /<%-([\s\S]+?)%>/g,
+
+      /**
+       * Used to detect code to be evaluated.
+       *
+       * @memberOf _.templateSettings
+       * @type RegExp
+       */
+      'evaluate': /<%([\s\S]+?)%>/g,
+
+      /**
+       * Used to detect `data` property values to inject.
+       *
+       * @memberOf _.templateSettings
+       * @type RegExp
+       */
+      'interpolate': reInterpolate,
+
+      /**
+       * Used to reference the data object in the template text.
+       *
+       * @memberOf _.templateSettings
+       * @type string
+       */
+      'variable': '',
+
+      /**
+       * Used to import variables into the compiled template.
+       *
+       * @memberOf _.templateSettings
+       * @type Object
+       */
+      'imports': {
+
+        /**
+         * A reference to the `lodash` function.
+         *
+         * @memberOf _.templateSettings.imports
+         * @type Function
+         */
+        '_': lodash
+      }
+    };
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * The base implementation of `_.bind` that creates the bound function and
+     * sets its meta data.
+     *
+     * @private
+     * @param {Array} bindData The bind data array.
+     * @returns {Function} Returns the new bound function.
+     */
+    function baseBind(bindData) {
+      var func = bindData[0],
+          partialArgs = bindData[2],
+          thisArg = bindData[4];
+
+      function bound() {
+        // `Function#bind` spec
+        // http://es5.github.io/#x15.3.4.5
+        if (partialArgs) {
+          // avoid `arguments` object deoptimizations by using `slice` instead
+          // of `Array.prototype.slice.call` and not assigning `arguments` to a
+          // variable as a ternary expression
+          var args = slice(partialArgs);
+          push.apply(args, arguments);
+        }
+        // mimic the constructor's `return` behavior
+        // http://es5.github.io/#x13.2.2
+        if (this instanceof bound) {
+          // ensure `new bound` is an instance of `func`
+          var thisBinding = baseCreate(func.prototype),
+              result = func.apply(thisBinding, args || arguments);
+          return isObject(result) ? result : thisBinding;
+        }
+        return func.apply(thisArg, args || arguments);
+      }
+      setBindData(bound, bindData);
+      return bound;
+    }
+
+    /**
+     * The base implementation of `_.clone` without argument juggling or support
+     * for `thisArg` binding.
+     *
+     * @private
+     * @param {*} value The value to clone.
+     * @param {boolean} [isDeep=false] Specify a deep clone.
+     * @param {Function} [callback] The function to customize cloning values.
+     * @param {Array} [stackA=[]] Tracks traversed source objects.
+     * @param {Array} [stackB=[]] Associates clones with source counterparts.
+     * @returns {*} Returns the cloned value.
+     */
+    function baseClone(value, isDeep, callback, stackA, stackB) {
+      if (callback) {
+        var result = callback(value);
+        if (typeof result != 'undefined') {
+          return result;
+        }
+      }
+      // inspect [[Class]]
+      var isObj = isObject(value);
+      if (isObj) {
+        var className = toString.call(value);
+        if (!cloneableClasses[className]) {
+          return value;
+        }
+        var ctor = ctorByClass[className];
+        switch (className) {
+          case boolClass:
+          case dateClass:
+            return new ctor(+value);
+
+          case numberClass:
+          case stringClass:
+            return new ctor(value);
+
+          case regexpClass:
+            result = ctor(value.source, reFlags.exec(value));
+            result.lastIndex = value.lastIndex;
+            return result;
+        }
+      } else {
+        return value;
+      }
+      var isArr = isArray(value);
+      if (isDeep) {
+        // check for circular references and return corresponding clone
+        var initedStack = !stackA;
+        stackA || (stackA = getArray());
+        stackB || (stackB = getArray());
+
+        var length = stackA.length;
+        while (length--) {
+          if (stackA[length] == value) {
+            return stackB[length];
+          }
+        }
+        result = isArr ? ctor(value.length) : {};
+      }
+      else {
+        result = isArr ? slice(value) : assign({}, value);
+      }
+      // add array properties assigned by `RegExp#exec`
+      if (isArr) {
+        if (hasOwnProperty.call(value, 'index')) {
+          result.index = value.index;
+        }
+        if (hasOwnProperty.call(value, 'input')) {
+          result.input = value.input;
+        }
+      }
+      // exit for shallow clone
+      if (!isDeep) {
+        return result;
+      }
+      // add the source value to the stack of traversed objects
+      // and associate it with its clone
+      stackA.push(value);
+      stackB.push(result);
+
+      // recursively populate clone (susceptible to call stack limits)
+      (isArr ? forEach : forOwn)(value, function(objValue, key) {
+        result[key] = baseClone(objValue, isDeep, callback, stackA, stackB);
+      });
+
+      if (initedStack) {
+        releaseArray(stackA);
+        releaseArray(stackB);
+      }
+      return result;
+    }
+
+    /**
+     * The base implementation of `_.create` without support for assigning
+     * properties to the created object.
+     *
+     * @private
+     * @param {Object} prototype The object to inherit from.
+     * @returns {Object} Returns the new object.
+     */
+    function baseCreate(prototype, properties) {
+      return isObject(prototype) ? nativeCreate(prototype) : {};
+    }
+    // fallback for browsers without `Object.create`
+    if (!nativeCreate) {
+      baseCreate = (function() {
+        function Object() {}
+        return function(prototype) {
+          if (isObject(prototype)) {
+            Object.prototype = prototype;
+            var result = new Object;
+            Object.prototype = null;
+          }
+          return result || context.Object();
+        };
+      }());
+    }
+
+    /**
+     * The base implementation of `_.createCallback` without support for creating
+     * "_.pluck" or "_.where" style callbacks.
+     *
+     * @private
+     * @param {*} [func=identity] The value to convert to a callback.
+     * @param {*} [thisArg] The `this` binding of the created callback.
+     * @param {number} [argCount] The number of arguments the callback accepts.
+     * @returns {Function} Returns a callback function.
+     */
+    function baseCreateCallback(func, thisArg, argCount) {
+      if (typeof func != 'function') {
+        return identity;
+      }
+      // exit early for no `thisArg` or already bound by `Function#bind`
+      if (typeof thisArg == 'undefined' || !('prototype' in func)) {
+        return func;
+      }
+      var bindData = func.__bindData__;
+      if (typeof bindData == 'undefined') {
+        if (support.funcNames) {
+          bindData = !func.name;
+        }
+        bindData = bindData || !support.funcDecomp;
+        if (!bindData) {
+          var source = fnToString.call(func);
+          if (!support.funcNames) {
+            bindData = !reFuncName.test(source);
+          }
+          if (!bindData) {
+            // checks if `func` references the `this` keyword and stores the result
+            bindData = reThis.test(source);
+            setBindData(func, bindData);
+          }
+        }
+      }
+      // exit early if there are no `this` references or `func` is bound
+      if (bindData === false || (bindData !== true && bindData[1] & 1)) {
+        return func;
+      }
+      switch (argCount) {
+        case 1: return function(value) {
+          return func.call(thisArg, value);
+        };
+        case 2: return function(a, b) {
+          return func.call(thisArg, a, b);
+        };
+        case 3: return function(value, index, collection) {
+          return func.call(thisArg, value, index, collection);
+        };
+        case 4: return function(accumulator, value, index, collection) {
+          return func.call(thisArg, accumulator, value, index, collection);
+        };
+      }
+      return bind(func, thisArg);
+    }
+
+    /**
+     * The base implementation of `createWrapper` that creates the wrapper and
+     * sets its meta data.
+     *
+     * @private
+     * @param {Array} bindData The bind data array.
+     * @returns {Function} Returns the new function.
+     */
+    function baseCreateWrapper(bindData) {
+      var func = bindData[0],
+          bitmask = bindData[1],
+          partialArgs = bindData[2],
+          partialRightArgs = bindData[3],
+          thisArg = bindData[4],
+          arity = bindData[5];
+
+      var isBind = bitmask & 1,
+          isBindKey = bitmask & 2,
+          isCurry = bitmask & 4,
+          isCurryBound = bitmask & 8,
+          key = func;
+
+      function bound() {
+        var thisBinding = isBind ? thisArg : this;
+        if (partialArgs) {
+          var args = slice(partialArgs);
+          push.apply(args, arguments);
+        }
+        if (partialRightArgs || isCurry) {
+          args || (args = slice(arguments));
+          if (partialRightArgs) {
+            push.apply(args, partialRightArgs);
+          }
+          if (isCurry && args.length < arity) {
+            bitmask |= 16 & ~32;
+            return baseCreateWrapper([func, (isCurryBound ? bitmask : bitmask & ~3), args, null, thisArg, arity]);
+          }
+        }
+        args || (args = arguments);
+        if (isBindKey) {
+          func = thisBinding[key];
+        }
+        if (this instanceof bound) {
+          thisBinding = baseCreate(func.prototype);
+          var result = func.apply(thisBinding, args);
+          return isObject(result) ? result : thisBinding;
+        }
+        return func.apply(thisBinding, args);
+      }
+      setBindData(bound, bindData);
+      return bound;
+    }
+
+    /**
+     * The base implementation of `_.difference` that accepts a single array
+     * of values to exclude.
+     *
+     * @private
+     * @param {Array} array The array to process.
+     * @param {Array} [values] The array of values to exclude.
+     * @returns {Array} Returns a new array of filtered values.
+     */
+    function baseDifference(array, values) {
+      var index = -1,
+          indexOf = getIndexOf(),
+          length = array ? array.length : 0,
+          isLarge = length >= largeArraySize && indexOf === baseIndexOf,
+          result = [];
+
+      if (isLarge) {
+        var cache = createCache(values);
+        if (cache) {
+          indexOf = cacheIndexOf;
+          values = cache;
+        } else {
+          isLarge = false;
+        }
+      }
+      while (++index < length) {
+        var value = array[index];
+        if (indexOf(values, value) < 0) {
+          result.push(value);
+        }
+      }
+      if (isLarge) {
+        releaseObject(values);
+      }
+      return result;
+    }
+
+    /**
+     * The base implementation of `_.flatten` without support for callback
+     * shorthands or `thisArg` binding.
+     *
+     * @private
+     * @param {Array} array The array to flatten.
+     * @param {boolean} [isShallow=false] A flag to restrict flattening to a single level.
+     * @param {boolean} [isStrict=false] A flag to restrict flattening to arrays and `arguments` objects.
+     * @param {number} [fromIndex=0] The index to start from.
+     * @returns {Array} Returns a new flattened array.
+     */
+    function baseFlatten(array, isShallow, isStrict, fromIndex) {
+      var index = (fromIndex || 0) - 1,
+          length = array ? array.length : 0,
+          result = [];
+
+      while (++index < length) {
+        var value = array[index];
+
+        if (value && typeof value == 'object' && typeof value.length == 'number'
+            && (isArray(value) || isArguments(value))) {
+          // recursively flatten arrays (susceptible to call stack limits)
+          if (!isShallow) {
+            value = baseFlatten(value, isShallow, isStrict);
+          }
+          var valIndex = -1,
+              valLength = value.length,
+              resIndex = result.length;
+
+          result.length += valLength;
+          while (++valIndex < valLength) {
+            result[resIndex++] = value[valIndex];
+          }
+        } else if (!isStrict) {
+          result.push(value);
+        }
+      }
+      return result;
+    }
+
+    /**
+     * The base implementation of `_.isEqual`, without support for `thisArg` binding,
+     * that allows partial "_.where" style comparisons.
+     *
+     * @private
+     * @param {*} a The value to compare.
+     * @param {*} b The other value to compare.
+     * @param {Function} [callback] The function to customize comparing values.
+     * @param {Function} [isWhere=false] A flag to indicate performing partial comparisons.
+     * @param {Array} [stackA=[]] Tracks traversed `a` objects.
+     * @param {Array} [stackB=[]] Tracks traversed `b` objects.
+     * @returns {boolean} Returns `true` if the values are equivalent, else `false`.
+     */
+    function baseIsEqual(a, b, callback, isWhere, stackA, stackB) {
+      // used to indicate that when comparing objects, `a` has at least the properties of `b`
+      if (callback) {
+        var result = callback(a, b);
+        if (typeof result != 'undefined') {
+          return !!result;
+        }
+      }
+      // exit early for identical values
+      if (a === b) {
+        // treat `+0` vs. `-0` as not equal
+        return a !== 0 || (1 / a == 1 / b);
+      }
+      var type = typeof a,
+          otherType = typeof b;
+
+      // exit early for unlike primitive values
+      if (a === a &&
+          !(a && objectTypes[type]) &&
+          !(b && objectTypes[otherType])) {
+        return false;
+      }
+      // exit early for `null` and `undefined` avoiding ES3's Function#call behavior
+      // http://es5.github.io/#x15.3.4.4
+      if (a == null || b == null) {
+        return a === b;
+      }
+      // compare [[Class]] names
+      var className = toString.call(a),
+          otherClass = toString.call(b);
+
+      if (className == argsClass) {
+        className = objectClass;
+      }
+      if (otherClass == argsClass) {
+        otherClass = objectClass;
+      }
+      if (className != otherClass) {
+        return false;
+      }
+      switch (className) {
+        case boolClass:
+        case dateClass:
+          // coerce dates and booleans to numbers, dates to milliseconds and booleans
+          // to `1` or `0` treating invalid dates coerced to `NaN` as not equal
+          return +a == +b;
+
+        case numberClass:
+          // treat `NaN` vs. `NaN` as equal
+          return (a != +a)
+            ? b != +b
+            // but treat `+0` vs. `-0` as not equal
+            : (a == 0 ? (1 / a == 1 / b) : a == +b);
+
+        case regexpClass:
+        case stringClass:
+          // coerce regexes to strings (http://es5.github.io/#x15.10.6.4)
+          // treat string primitives and their corresponding object instances as equal
+          return a == String(b);
+      }
+      var isArr = className == arrayClass;
+      if (!isArr) {
+        // unwrap any `lodash` wrapped values
+        var aWrapped = hasOwnProperty.call(a, '__wrapped__'),
+            bWrapped = hasOwnProperty.call(b, '__wrapped__');
+
+        if (aWrapped || bWrapped) {
+          return baseIsEqual(aWrapped ? a.__wrapped__ : a, bWrapped ? b.__wrapped__ : b, callback, isWhere, stackA, stackB);
+        }
+        // exit for functions and DOM nodes
+        if (className != objectClass) {
+          return false;
+        }
+        // in older versions of Opera, `arguments` objects have `Array` constructors
+        var ctorA = a.constructor,
+            ctorB = b.constructor;
+
+        // non `Object` object instances with different constructors are not equal
+        if (ctorA != ctorB &&
+              !(isFunction(ctorA) && ctorA instanceof ctorA && isFunction(ctorB) && ctorB instanceof ctorB) &&
+              ('constructor' in a && 'constructor' in b)
+            ) {
+          return false;
+        }
+      }
+      // assume cyclic structures are equal
+      // the algorithm for detecting cyclic structures is adapted from ES 5.1
+      // section 15.12.3, abstract operation `JO` (http://es5.github.io/#x15.12.3)
+      var initedStack = !stackA;
+      stackA || (stackA = getArray());
+      stackB || (stackB = getArray());
+
+      var length = stackA.length;
+      while (length--) {
+        if (stackA[length] == a) {
+          return stackB[length] == b;
+        }
+      }
+      var size = 0;
+      result = true;
+
+      // add `a` and `b` to the stack of traversed objects
+      stackA.push(a);
+      stackB.push(b);
+
+      // recursively compare objects and arrays (susceptible to call stack limits)
+      if (isArr) {
+        // compare lengths to determine if a deep comparison is necessary
+        length = a.length;
+        size = b.length;
+        result = size == length;
+
+        if (result || isWhere) {
+          // deep compare the contents, ignoring non-numeric properties
+          while (size--) {
+            var index = length,
+                value = b[size];
+
+            if (isWhere) {
+              while (index--) {
+                if ((result = baseIsEqual(a[index], value, callback, isWhere, stackA, stackB))) {
+                  break;
+                }
+              }
+            } else if (!(result = baseIsEqual(a[size], value, callback, isWhere, stackA, stackB))) {
+              break;
+            }
+          }
+        }
+      }
+      else {
+        // deep compare objects using `forIn`, instead of `forOwn`, to avoid `Object.keys`
+        // which, in this case, is more costly
+        forIn(b, function(value, key, b) {
+          if (hasOwnProperty.call(b, key)) {
+            // count the number of properties.
+            size++;
+            // deep compare each property value.
+            return (result = hasOwnProperty.call(a, key) && baseIsEqual(a[key], value, callback, isWhere, stackA, stackB));
+          }
+        });
+
+        if (result && !isWhere) {
+          // ensure both objects have the same number of properties
+          forIn(a, function(value, key, a) {
+            if (hasOwnProperty.call(a, key)) {
+              // `size` will be `-1` if `a` has more properties than `b`
+              return (result = --size > -1);
+            }
+          });
+        }
+      }
+      stackA.pop();
+      stackB.pop();
+
+      if (initedStack) {
+        releaseArray(stackA);
+        releaseArray(stackB);
+      }
+      return result;
+    }
+
+    /**
+     * The base implementation of `_.merge` without argument juggling or support
+     * for `thisArg` binding.
+     *
+     * @private
+     * @param {Object} object The destination object.
+     * @param {Object} source The source object.
+     * @param {Function} [callback] The function to customize merging properties.
+     * @param {Array} [stackA=[]] Tracks traversed source objects.
+     * @param {Array} [stackB=[]] Associates values with source counterparts.
+     */
+    function baseMerge(object, source, callback, stackA, stackB) {
+      (isArray(source) ? forEach : forOwn)(source, function(source, key) {
+        var found,
+            isArr,
+            result = source,
+            value = object[key];
+
+        if (source && ((isArr = isArray(source)) || isPlainObject(source))) {
+          // avoid merging previously merged cyclic sources
+          var stackLength = stackA.length;
+          while (stackLength--) {
+            if ((found = stackA[stackLength] == source)) {
+              value = stackB[stackLength];
+              break;
+            }
+          }
+          if (!found) {
+            var isShallow;
+            if (callback) {
+              result = callback(value, source);
+              if ((isShallow = typeof result != 'undefined')) {
+                value = result;
+              }
+            }
+            if (!isShallow) {
+              value = isArr
+                ? (isArray(value) ? value : [])
+                : (isPlainObject(value) ? value : {});
+            }
+            // add `source` and associated `value` to the stack of traversed objects
+            stackA.push(source);
+            stackB.push(value);
+
+            // recursively merge objects and arrays (susceptible to call stack limits)
+            if (!isShallow) {
+              baseMerge(value, source, callback, stackA, stackB);
+            }
+          }
+        }
+        else {
+          if (callback) {
+            result = callback(value, source);
+            if (typeof result == 'undefined') {
+              result = source;
+            }
+          }
+          if (typeof result != 'undefined') {
+            value = result;
+          }
+        }
+        object[key] = value;
+      });
+    }
+
+    /**
+     * The base implementation of `_.random` without argument juggling or support
+     * for returning floating-point numbers.
+     *
+     * @private
+     * @param {number} min The minimum possible value.
+     * @param {number} max The maximum possible value.
+     * @returns {number} Returns a random number.
+     */
+    function baseRandom(min, max) {
+      return min + floor(nativeRandom() * (max - min + 1));
+    }
+
+    /**
+     * The base implementation of `_.uniq` without support for callback shorthands
+     * or `thisArg` binding.
+     *
+     * @private
+     * @param {Array} array The array to process.
+     * @param {boolean} [isSorted=false] A flag to indicate that `array` is sorted.
+     * @param {Function} [callback] The function called per iteration.
+     * @returns {Array} Returns a duplicate-value-free array.
+     */
+    function baseUniq(array, isSorted, callback) {
+      var index = -1,
+          indexOf = getIndexOf(),
+          length = array ? array.length : 0,
+          result = [];
+
+      var isLarge = !isSorted && length >= largeArraySize && indexOf === baseIndexOf,
+          seen = (callback || isLarge) ? getArray() : result;
+
+      if (isLarge) {
+        var cache = createCache(seen);
+        indexOf = cacheIndexOf;
+        seen = cache;
+      }
+      while (++index < length) {
+        var value = array[index],
+            computed = callback ? callback(value, index, array) : value;
+
+        if (isSorted
+              ? !index || seen[seen.length - 1] !== computed
+              : indexOf(seen, computed) < 0
+            ) {
+          if (callback || isLarge) {
+            seen.push(computed);
+          }
+          result.push(value);
+        }
+      }
+      if (isLarge) {
+        releaseArray(seen.array);
+        releaseObject(seen);
+      } else if (callback) {
+        releaseArray(seen);
+      }
+      return result;
+    }
+
+    /**
+     * Creates a function that aggregates a collection, creating an object composed
+     * of keys generated from the results of running each element of the collection
+     * through a callback. The given `setter` function sets the keys and values
+     * of the composed object.
+     *
+     * @private
+     * @param {Function} setter The setter function.
+     * @returns {Function} Returns the new aggregator function.
+     */
+    function createAggregator(setter) {
+      return function(collection, callback, thisArg) {
+        var result = {};
+        callback = lodash.createCallback(callback, thisArg, 3);
+
+        var index = -1,
+            length = collection ? collection.length : 0;
+
+        if (typeof length == 'number') {
+          while (++index < length) {
+            var value = collection[index];
+            setter(result, value, callback(value, index, collection), collection);
+          }
+        } else {
+          forOwn(collection, function(value, key, collection) {
+            setter(result, value, callback(value, key, collection), collection);
+          });
+        }
+        return result;
+      };
+    }
+
+    /**
+     * Creates a function that, when called, either curries or invokes `func`
+     * with an optional `this` binding and partially applied arguments.
+     *
+     * @private
+     * @param {Function|string} func The function or method name to reference.
+     * @param {number} bitmask The bitmask of method flags to compose.
+     *  The bitmask may be composed of the following flags:
+     *  1 - `_.bind`
+     *  2 - `_.bindKey`
+     *  4 - `_.curry`
+     *  8 - `_.curry` (bound)
+     *  16 - `_.partial`
+     *  32 - `_.partialRight`
+     * @param {Array} [partialArgs] An array of arguments to prepend to those
+     *  provided to the new function.
+     * @param {Array} [partialRightArgs] An array of arguments to append to those
+     *  provided to the new function.
+     * @param {*} [thisArg] The `this` binding of `func`.
+     * @param {number} [arity] The arity of `func`.
+     * @returns {Function} Returns the new function.
+     */
+    function createWrapper(func, bitmask, partialArgs, partialRightArgs, thisArg, arity) {
+      var isBind = bitmask & 1,
+          isBindKey = bitmask & 2,
+          isCurry = bitmask & 4,
+          isCurryBound = bitmask & 8,
+          isPartial = bitmask & 16,
+          isPartialRight = bitmask & 32;
+
+      if (!isBindKey && !isFunction(func)) {
+        throw new TypeError;
+      }
+      if (isPartial && !partialArgs.length) {
+        bitmask &= ~16;
+        isPartial = partialArgs = false;
+      }
+      if (isPartialRight && !partialRightArgs.length) {
+        bitmask &= ~32;
+        isPartialRight = partialRightArgs = false;
+      }
+      var bindData = func && func.__bindData__;
+      if (bindData && bindData !== true) {
+        // clone `bindData`
+        bindData = slice(bindData);
+        if (bindData[2]) {
+          bindData[2] = slice(bindData[2]);
+        }
+        if (bindData[3]) {
+          bindData[3] = slice(bindData[3]);
+        }
+        // set `thisBinding` is not previously bound
+        if (isBind && !(bindData[1] & 1)) {
+          bindData[4] = thisArg;
+        }
+        // set if previously bound but not currently (subsequent curried functions)
+        if (!isBind && bindData[1] & 1) {
+          bitmask |= 8;
+        }
+        // set curried arity if not yet set
+        if (isCurry && !(bindData[1] & 4)) {
+          bindData[5] = arity;
+        }
+        // append partial left arguments
+        if (isPartial) {
+          push.apply(bindData[2] || (bindData[2] = []), partialArgs);
+        }
+        // append partial right arguments
+        if (isPartialRight) {
+          unshift.apply(bindData[3] || (bindData[3] = []), partialRightArgs);
+        }
+        // merge flags
+        bindData[1] |= bitmask;
+        return createWrapper.apply(null, bindData);
+      }
+      // fast path for `_.bind`
+      var creater = (bitmask == 1 || bitmask === 17) ? baseBind : baseCreateWrapper;
+      return creater([func, bitmask, partialArgs, partialRightArgs, thisArg, arity]);
+    }
+
+    /**
+     * Used by `escape` to convert characters to HTML entities.
+     *
+     * @private
+     * @param {string} match The matched character to escape.
+     * @returns {string} Returns the escaped character.
+     */
+    function escapeHtmlChar(match) {
+      return htmlEscapes[match];
+    }
+
+    /**
+     * Gets the appropriate "indexOf" function. If the `_.indexOf` method is
+     * customized, this method returns the custom method, otherwise it returns
+     * the `baseIndexOf` function.
+     *
+     * @private
+     * @returns {Function} Returns the "indexOf" function.
+     */
+    function getIndexOf() {
+      var result = (result = lodash.indexOf) === indexOf ? baseIndexOf : result;
+      return result;
+    }
+
+    /**
+     * Checks if `value` is a native function.
+     *
+     * @private
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a native function, else `false`.
+     */
+    function isNative(value) {
+      return typeof value == 'function' && reNative.test(value);
+    }
+
+    /**
+     * Sets `this` binding data on a given function.
+     *
+     * @private
+     * @param {Function} func The function to set data on.
+     * @param {Array} value The data array to set.
+     */
+    var setBindData = !defineProperty ? noop : function(func, value) {
+      descriptor.value = value;
+      defineProperty(func, '__bindData__', descriptor);
+      descriptor.value = null;
+    };
+
+    /**
+     * A fallback implementation of `isPlainObject` which checks if a given value
+     * is an object created by the `Object` constructor, assuming objects created
+     * by the `Object` constructor have no inherited enumerable properties and that
+     * there are no `Object.prototype` extensions.
+     *
+     * @private
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if `value` is a plain object, else `false`.
+     */
+    function shimIsPlainObject(value) {
+      var ctor,
+          result;
+
+      // avoid non Object objects, `arguments` objects, and DOM elements
+      if (!(value && toString.call(value) == objectClass) ||
+          (ctor = value.constructor, isFunction(ctor) && !(ctor instanceof ctor))) {
+        return false;
+      }
+      // In most environments an object's own properties are iterated before
+      // its inherited properties. If the last iterated property is an object's
+      // own property then there are no inherited enumerable properties.
+      forIn(value, function(value, key) {
+        result = key;
+      });
+      return typeof result == 'undefined' || hasOwnProperty.call(value, result);
+    }
+
+    /**
+     * Used by `unescape` to convert HTML entities to characters.
+     *
+     * @private
+     * @param {string} match The matched character to unescape.
+     * @returns {string} Returns the unescaped character.
+     */
+    function unescapeHtmlChar(match) {
+      return htmlUnescapes[match];
+    }
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Checks if `value` is an `arguments` object.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is an `arguments` object, else `false`.
+     * @example
+     *
+     * (function() { return _.isArguments(arguments); })(1, 2, 3);
+     * // => true
+     *
+     * _.isArguments([1, 2, 3]);
+     * // => false
+     */
+    function isArguments(value) {
+      return value && typeof value == 'object' && typeof value.length == 'number' &&
+        toString.call(value) == argsClass || false;
+    }
+
+    /**
+     * Checks if `value` is an array.
+     *
+     * @static
+     * @memberOf _
+     * @type Function
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is an array, else `false`.
+     * @example
+     *
+     * (function() { return _.isArray(arguments); })();
+     * // => false
+     *
+     * _.isArray([1, 2, 3]);
+     * // => true
+     */
+    var isArray = nativeIsArray || function(value) {
+      return value && typeof value == 'object' && typeof value.length == 'number' &&
+        toString.call(value) == arrayClass || false;
+    };
+
+    /**
+     * A fallback implementation of `Object.keys` which produces an array of the
+     * given object's own enumerable property names.
+     *
+     * @private
+     * @type Function
+     * @param {Object} object The object to inspect.
+     * @returns {Array} Returns an array of property names.
+     */
+    var shimKeys = function(object) {
+      var index, iterable = object, result = [];
+      if (!iterable) return result;
+      if (!(objectTypes[typeof object])) return result;
+        for (index in iterable) {
+          if (hasOwnProperty.call(iterable, index)) {
+            result.push(index);
+          }
+        }
+      return result
+    };
+
+    /**
+     * Creates an array composed of the own enumerable property names of an object.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to inspect.
+     * @returns {Array} Returns an array of property names.
+     * @example
+     *
+     * _.keys({ 'one': 1, 'two': 2, 'three': 3 });
+     * // => ['one', 'two', 'three'] (property order is not guaranteed across environments)
+     */
+    var keys = !nativeKeys ? shimKeys : function(object) {
+      if (!isObject(object)) {
+        return [];
+      }
+      return nativeKeys(object);
+    };
+
+    /**
+     * Used to convert characters to HTML entities:
+     *
+     * Though the `>` character is escaped for symmetry, characters like `>` and `/`
+     * don't require escaping in HTML and have no special meaning unless they're part
+     * of a tag or an unquoted attribute value.
+     * http://mathiasbynens.be/notes/ambiguous-ampersands (under "semi-related fun fact")
+     */
+    var htmlEscapes = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    };
+
+    /** Used to convert HTML entities to characters */
+    var htmlUnescapes = invert(htmlEscapes);
+
+    /** Used to match HTML entities and HTML characters */
+    var reEscapedHtml = RegExp('(' + keys(htmlUnescapes).join('|') + ')', 'g'),
+        reUnescapedHtml = RegExp('[' + keys(htmlEscapes).join('') + ']', 'g');
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Assigns own enumerable properties of source object(s) to the destination
+     * object. Subsequent sources will overwrite property assignments of previous
+     * sources. If a callback is provided it will be executed to produce the
+     * assigned values. The callback is bound to `thisArg` and invoked with two
+     * arguments; (objectValue, sourceValue).
+     *
+     * @static
+     * @memberOf _
+     * @type Function
+     * @alias extend
+     * @category Objects
+     * @param {Object} object The destination object.
+     * @param {...Object} [source] The source objects.
+     * @param {Function} [callback] The function to customize assigning values.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns the destination object.
+     * @example
+     *
+     * _.assign({ 'name': 'fred' }, { 'employer': 'slate' });
+     * // => { 'name': 'fred', 'employer': 'slate' }
+     *
+     * var defaults = _.partialRight(_.assign, function(a, b) {
+     *   return typeof a == 'undefined' ? b : a;
+     * });
+     *
+     * var object = { 'name': 'barney' };
+     * defaults(object, { 'name': 'fred', 'employer': 'slate' });
+     * // => { 'name': 'barney', 'employer': 'slate' }
+     */
+    var assign = function(object, source, guard) {
+      var index, iterable = object, result = iterable;
+      if (!iterable) return result;
+      var args = arguments,
+          argsIndex = 0,
+          argsLength = typeof guard == 'number' ? 2 : args.length;
+      if (argsLength > 3 && typeof args[argsLength - 2] == 'function') {
+        var callback = baseCreateCallback(args[--argsLength - 1], args[argsLength--], 2);
+      } else if (argsLength > 2 && typeof args[argsLength - 1] == 'function') {
+        callback = args[--argsLength];
+      }
+      while (++argsIndex < argsLength) {
+        iterable = args[argsIndex];
+        if (iterable && objectTypes[typeof iterable]) {
+        var ownIndex = -1,
+            ownProps = objectTypes[typeof iterable] && keys(iterable),
+            length = ownProps ? ownProps.length : 0;
+
+        while (++ownIndex < length) {
+          index = ownProps[ownIndex];
+          result[index] = callback ? callback(result[index], iterable[index]) : iterable[index];
+        }
+        }
+      }
+      return result
+    };
+
+    /**
+     * Creates a clone of `value`. If `isDeep` is `true` nested objects will also
+     * be cloned, otherwise they will be assigned by reference. If a callback
+     * is provided it will be executed to produce the cloned values. If the
+     * callback returns `undefined` cloning will be handled by the method instead.
+     * The callback is bound to `thisArg` and invoked with one argument; (value).
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to clone.
+     * @param {boolean} [isDeep=false] Specify a deep clone.
+     * @param {Function} [callback] The function to customize cloning values.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the cloned value.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * var shallow = _.clone(characters);
+     * shallow[0] === characters[0];
+     * // => true
+     *
+     * var deep = _.clone(characters, true);
+     * deep[0] === characters[0];
+     * // => false
+     *
+     * _.mixin({
+     *   'clone': _.partialRight(_.clone, function(value) {
+     *     return _.isElement(value) ? value.cloneNode(false) : undefined;
+     *   })
+     * });
+     *
+     * var clone = _.clone(document.body);
+     * clone.childNodes.length;
+     * // => 0
+     */
+    function clone(value, isDeep, callback, thisArg) {
+      // allows working with "Collections" methods without using their `index`
+      // and `collection` arguments for `isDeep` and `callback`
+      if (typeof isDeep != 'boolean' && isDeep != null) {
+        thisArg = callback;
+        callback = isDeep;
+        isDeep = false;
+      }
+      return baseClone(value, isDeep, typeof callback == 'function' && baseCreateCallback(callback, thisArg, 1));
+    }
+
+    /**
+     * Creates a deep clone of `value`. If a callback is provided it will be
+     * executed to produce the cloned values. If the callback returns `undefined`
+     * cloning will be handled by the method instead. The callback is bound to
+     * `thisArg` and invoked with one argument; (value).
+     *
+     * Note: This method is loosely based on the structured clone algorithm. Functions
+     * and DOM nodes are **not** cloned. The enumerable properties of `arguments` objects and
+     * objects created by constructors other than `Object` are cloned to plain `Object` objects.
+     * See http://www.w3.org/TR/html5/infrastructure.html#internal-structured-cloning-algorithm.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to deep clone.
+     * @param {Function} [callback] The function to customize cloning values.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the deep cloned value.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * var deep = _.cloneDeep(characters);
+     * deep[0] === characters[0];
+     * // => false
+     *
+     * var view = {
+     *   'label': 'docs',
+     *   'node': element
+     * };
+     *
+     * var clone = _.cloneDeep(view, function(value) {
+     *   return _.isElement(value) ? value.cloneNode(true) : undefined;
+     * });
+     *
+     * clone.node == view.node;
+     * // => false
+     */
+    function cloneDeep(value, callback, thisArg) {
+      return baseClone(value, true, typeof callback == 'function' && baseCreateCallback(callback, thisArg, 1));
+    }
+
+    /**
+     * Creates an object that inherits from the given `prototype` object. If a
+     * `properties` object is provided its own enumerable properties are assigned
+     * to the created object.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} prototype The object to inherit from.
+     * @param {Object} [properties] The properties to assign to the object.
+     * @returns {Object} Returns the new object.
+     * @example
+     *
+     * function Shape() {
+     *   this.x = 0;
+     *   this.y = 0;
+     * }
+     *
+     * function Circle() {
+     *   Shape.call(this);
+     * }
+     *
+     * Circle.prototype = _.create(Shape.prototype, { 'constructor': Circle });
+     *
+     * var circle = new Circle;
+     * circle instanceof Circle;
+     * // => true
+     *
+     * circle instanceof Shape;
+     * // => true
+     */
+    function create(prototype, properties) {
+      var result = baseCreate(prototype);
+      return properties ? assign(result, properties) : result;
+    }
+
+    /**
+     * Assigns own enumerable properties of source object(s) to the destination
+     * object for all destination properties that resolve to `undefined`. Once a
+     * property is set, additional defaults of the same property will be ignored.
+     *
+     * @static
+     * @memberOf _
+     * @type Function
+     * @category Objects
+     * @param {Object} object The destination object.
+     * @param {...Object} [source] The source objects.
+     * @param- {Object} [guard] Allows working with `_.reduce` without using its
+     *  `key` and `object` arguments as sources.
+     * @returns {Object} Returns the destination object.
+     * @example
+     *
+     * var object = { 'name': 'barney' };
+     * _.defaults(object, { 'name': 'fred', 'employer': 'slate' });
+     * // => { 'name': 'barney', 'employer': 'slate' }
+     */
+    var defaults = function(object, source, guard) {
+      var index, iterable = object, result = iterable;
+      if (!iterable) return result;
+      var args = arguments,
+          argsIndex = 0,
+          argsLength = typeof guard == 'number' ? 2 : args.length;
+      while (++argsIndex < argsLength) {
+        iterable = args[argsIndex];
+        if (iterable && objectTypes[typeof iterable]) {
+        var ownIndex = -1,
+            ownProps = objectTypes[typeof iterable] && keys(iterable),
+            length = ownProps ? ownProps.length : 0;
+
+        while (++ownIndex < length) {
+          index = ownProps[ownIndex];
+          if (typeof result[index] == 'undefined') result[index] = iterable[index];
+        }
+        }
+      }
+      return result
+    };
+
+    /**
+     * This method is like `_.findIndex` except that it returns the key of the
+     * first element that passes the callback check, instead of the element itself.
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to search.
+     * @param {Function|Object|string} [callback=identity] The function called per
+     *  iteration. If a property name or object is provided it will be used to
+     *  create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {string|undefined} Returns the key of the found element, else `undefined`.
+     * @example
+     *
+     * var characters = {
+     *   'barney': {  'age': 36, 'blocked': false },
+     *   'fred': {    'age': 40, 'blocked': true },
+     *   'pebbles': { 'age': 1,  'blocked': false }
+     * };
+     *
+     * _.findKey(characters, function(chr) {
+     *   return chr.age < 40;
+     * });
+     * // => 'barney' (property order is not guaranteed across environments)
+     *
+     * // using "_.where" callback shorthand
+     * _.findKey(characters, { 'age': 1 });
+     * // => 'pebbles'
+     *
+     * // using "_.pluck" callback shorthand
+     * _.findKey(characters, 'blocked');
+     * // => 'fred'
+     */
+    function findKey(object, callback, thisArg) {
+      var result;
+      callback = lodash.createCallback(callback, thisArg, 3);
+      forOwn(object, function(value, key, object) {
+        if (callback(value, key, object)) {
+          result = key;
+          return false;
+        }
+      });
+      return result;
+    }
+
+    /**
+     * This method is like `_.findKey` except that it iterates over elements
+     * of a `collection` in the opposite order.
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to search.
+     * @param {Function|Object|string} [callback=identity] The function called per
+     *  iteration. If a property name or object is provided it will be used to
+     *  create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {string|undefined} Returns the key of the found element, else `undefined`.
+     * @example
+     *
+     * var characters = {
+     *   'barney': {  'age': 36, 'blocked': true },
+     *   'fred': {    'age': 40, 'blocked': false },
+     *   'pebbles': { 'age': 1,  'blocked': true }
+     * };
+     *
+     * _.findLastKey(characters, function(chr) {
+     *   return chr.age < 40;
+     * });
+     * // => returns `pebbles`, assuming `_.findKey` returns `barney`
+     *
+     * // using "_.where" callback shorthand
+     * _.findLastKey(characters, { 'age': 40 });
+     * // => 'fred'
+     *
+     * // using "_.pluck" callback shorthand
+     * _.findLastKey(characters, 'blocked');
+     * // => 'pebbles'
+     */
+    function findLastKey(object, callback, thisArg) {
+      var result;
+      callback = lodash.createCallback(callback, thisArg, 3);
+      forOwnRight(object, function(value, key, object) {
+        if (callback(value, key, object)) {
+          result = key;
+          return false;
+        }
+      });
+      return result;
+    }
+
+    /**
+     * Iterates over own and inherited enumerable properties of an object,
+     * executing the callback for each property. The callback is bound to `thisArg`
+     * and invoked with three arguments; (value, key, object). Callbacks may exit
+     * iteration early by explicitly returning `false`.
+     *
+     * @static
+     * @memberOf _
+     * @type Function
+     * @category Objects
+     * @param {Object} object The object to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns `object`.
+     * @example
+     *
+     * function Shape() {
+     *   this.x = 0;
+     *   this.y = 0;
+     * }
+     *
+     * Shape.prototype.move = function(x, y) {
+     *   this.x += x;
+     *   this.y += y;
+     * };
+     *
+     * _.forIn(new Shape, function(value, key) {
+     *   console.log(key);
+     * });
+     * // => logs 'x', 'y', and 'move' (property order is not guaranteed across environments)
+     */
+    var forIn = function(collection, callback, thisArg) {
+      var index, iterable = collection, result = iterable;
+      if (!iterable) return result;
+      if (!objectTypes[typeof iterable]) return result;
+      callback = callback && typeof thisArg == 'undefined' ? callback : baseCreateCallback(callback, thisArg, 3);
+        for (index in iterable) {
+          if (callback(iterable[index], index, collection) === false) return result;
+        }
+      return result
+    };
+
+    /**
+     * This method is like `_.forIn` except that it iterates over elements
+     * of a `collection` in the opposite order.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns `object`.
+     * @example
+     *
+     * function Shape() {
+     *   this.x = 0;
+     *   this.y = 0;
+     * }
+     *
+     * Shape.prototype.move = function(x, y) {
+     *   this.x += x;
+     *   this.y += y;
+     * };
+     *
+     * _.forInRight(new Shape, function(value, key) {
+     *   console.log(key);
+     * });
+     * // => logs 'move', 'y', and 'x' assuming `_.forIn ` logs 'x', 'y', and 'move'
+     */
+    function forInRight(object, callback, thisArg) {
+      var pairs = [];
+
+      forIn(object, function(value, key) {
+        pairs.push(key, value);
+      });
+
+      var length = pairs.length;
+      callback = baseCreateCallback(callback, thisArg, 3);
+      while (length--) {
+        if (callback(pairs[length--], pairs[length], object) === false) {
+          break;
+        }
+      }
+      return object;
+    }
+
+    /**
+     * Iterates over own enumerable properties of an object, executing the callback
+     * for each property. The callback is bound to `thisArg` and invoked with three
+     * arguments; (value, key, object). Callbacks may exit iteration early by
+     * explicitly returning `false`.
+     *
+     * @static
+     * @memberOf _
+     * @type Function
+     * @category Objects
+     * @param {Object} object The object to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns `object`.
+     * @example
+     *
+     * _.forOwn({ '0': 'zero', '1': 'one', 'length': 2 }, function(num, key) {
+     *   console.log(key);
+     * });
+     * // => logs '0', '1', and 'length' (property order is not guaranteed across environments)
+     */
+    var forOwn = function(collection, callback, thisArg) {
+      var index, iterable = collection, result = iterable;
+      if (!iterable) return result;
+      if (!objectTypes[typeof iterable]) return result;
+      callback = callback && typeof thisArg == 'undefined' ? callback : baseCreateCallback(callback, thisArg, 3);
+        var ownIndex = -1,
+            ownProps = objectTypes[typeof iterable] && keys(iterable),
+            length = ownProps ? ownProps.length : 0;
+
+        while (++ownIndex < length) {
+          index = ownProps[ownIndex];
+          if (callback(iterable[index], index, collection) === false) return result;
+        }
+      return result
+    };
+
+    /**
+     * This method is like `_.forOwn` except that it iterates over elements
+     * of a `collection` in the opposite order.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns `object`.
+     * @example
+     *
+     * _.forOwnRight({ '0': 'zero', '1': 'one', 'length': 2 }, function(num, key) {
+     *   console.log(key);
+     * });
+     * // => logs 'length', '1', and '0' assuming `_.forOwn` logs '0', '1', and 'length'
+     */
+    function forOwnRight(object, callback, thisArg) {
+      var props = keys(object),
+          length = props.length;
+
+      callback = baseCreateCallback(callback, thisArg, 3);
+      while (length--) {
+        var key = props[length];
+        if (callback(object[key], key, object) === false) {
+          break;
+        }
+      }
+      return object;
+    }
+
+    /**
+     * Creates a sorted array of property names of all enumerable properties,
+     * own and inherited, of `object` that have function values.
+     *
+     * @static
+     * @memberOf _
+     * @alias methods
+     * @category Objects
+     * @param {Object} object The object to inspect.
+     * @returns {Array} Returns an array of property names that have function values.
+     * @example
+     *
+     * _.functions(_);
+     * // => ['all', 'any', 'bind', 'bindAll', 'clone', 'compact', 'compose', ...]
+     */
+    function functions(object) {
+      var result = [];
+      forIn(object, function(value, key) {
+        if (isFunction(value)) {
+          result.push(key);
+        }
+      });
+      return result.sort();
+    }
+
+    /**
+     * Checks if the specified property name exists as a direct property of `object`,
+     * instead of an inherited property.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to inspect.
+     * @param {string} key The name of the property to check.
+     * @returns {boolean} Returns `true` if key is a direct property, else `false`.
+     * @example
+     *
+     * _.has({ 'a': 1, 'b': 2, 'c': 3 }, 'b');
+     * // => true
+     */
+    function has(object, key) {
+      return object ? hasOwnProperty.call(object, key) : false;
+    }
+
+    /**
+     * Creates an object composed of the inverted keys and values of the given object.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to invert.
+     * @returns {Object} Returns the created inverted object.
+     * @example
+     *
+     * _.invert({ 'first': 'fred', 'second': 'barney' });
+     * // => { 'fred': 'first', 'barney': 'second' }
+     */
+    function invert(object) {
+      var index = -1,
+          props = keys(object),
+          length = props.length,
+          result = {};
+
+      while (++index < length) {
+        var key = props[index];
+        result[object[key]] = key;
+      }
+      return result;
+    }
+
+    /**
+     * Checks if `value` is a boolean value.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a boolean value, else `false`.
+     * @example
+     *
+     * _.isBoolean(null);
+     * // => false
+     */
+    function isBoolean(value) {
+      return value === true || value === false ||
+        value && typeof value == 'object' && toString.call(value) == boolClass || false;
+    }
+
+    /**
+     * Checks if `value` is a date.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a date, else `false`.
+     * @example
+     *
+     * _.isDate(new Date);
+     * // => true
+     */
+    function isDate(value) {
+      return value && typeof value == 'object' && toString.call(value) == dateClass || false;
+    }
+
+    /**
+     * Checks if `value` is a DOM element.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a DOM element, else `false`.
+     * @example
+     *
+     * _.isElement(document.body);
+     * // => true
+     */
+    function isElement(value) {
+      return value && value.nodeType === 1 || false;
+    }
+
+    /**
+     * Checks if `value` is empty. Arrays, strings, or `arguments` objects with a
+     * length of `0` and objects with no own enumerable properties are considered
+     * "empty".
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Array|Object|string} value The value to inspect.
+     * @returns {boolean} Returns `true` if the `value` is empty, else `false`.
+     * @example
+     *
+     * _.isEmpty([1, 2, 3]);
+     * // => false
+     *
+     * _.isEmpty({});
+     * // => true
+     *
+     * _.isEmpty('');
+     * // => true
+     */
+    function isEmpty(value) {
+      var result = true;
+      if (!value) {
+        return result;
+      }
+      var className = toString.call(value),
+          length = value.length;
+
+      if ((className == arrayClass || className == stringClass || className == argsClass ) ||
+          (className == objectClass && typeof length == 'number' && isFunction(value.splice))) {
+        return !length;
+      }
+      forOwn(value, function() {
+        return (result = false);
+      });
+      return result;
+    }
+
+    /**
+     * Performs a deep comparison between two values to determine if they are
+     * equivalent to each other. If a callback is provided it will be executed
+     * to compare values. If the callback returns `undefined` comparisons will
+     * be handled by the method instead. The callback is bound to `thisArg` and
+     * invoked with two arguments; (a, b).
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} a The value to compare.
+     * @param {*} b The other value to compare.
+     * @param {Function} [callback] The function to customize comparing values.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {boolean} Returns `true` if the values are equivalent, else `false`.
+     * @example
+     *
+     * var object = { 'name': 'fred' };
+     * var copy = { 'name': 'fred' };
+     *
+     * object == copy;
+     * // => false
+     *
+     * _.isEqual(object, copy);
+     * // => true
+     *
+     * var words = ['hello', 'goodbye'];
+     * var otherWords = ['hi', 'goodbye'];
+     *
+     * _.isEqual(words, otherWords, function(a, b) {
+     *   var reGreet = /^(?:hello|hi)$/i,
+     *       aGreet = _.isString(a) && reGreet.test(a),
+     *       bGreet = _.isString(b) && reGreet.test(b);
+     *
+     *   return (aGreet || bGreet) ? (aGreet == bGreet) : undefined;
+     * });
+     * // => true
+     */
+    function isEqual(a, b, callback, thisArg) {
+      return baseIsEqual(a, b, typeof callback == 'function' && baseCreateCallback(callback, thisArg, 2));
+    }
+
+    /**
+     * Checks if `value` is, or can be coerced to, a finite number.
+     *
+     * Note: This is not the same as native `isFinite` which will return true for
+     * booleans and empty strings. See http://es5.github.io/#x15.1.2.5.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is finite, else `false`.
+     * @example
+     *
+     * _.isFinite(-101);
+     * // => true
+     *
+     * _.isFinite('10');
+     * // => true
+     *
+     * _.isFinite(true);
+     * // => false
+     *
+     * _.isFinite('');
+     * // => false
+     *
+     * _.isFinite(Infinity);
+     * // => false
+     */
+    function isFinite(value) {
+      return nativeIsFinite(value) && !nativeIsNaN(parseFloat(value));
+    }
+
+    /**
+     * Checks if `value` is a function.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a function, else `false`.
+     * @example
+     *
+     * _.isFunction(_);
+     * // => true
+     */
+    function isFunction(value) {
+      return typeof value == 'function';
+    }
+
+    /**
+     * Checks if `value` is the language type of Object.
+     * (e.g. arrays, functions, objects, regexes, `new Number(0)`, and `new String('')`)
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is an object, else `false`.
+     * @example
+     *
+     * _.isObject({});
+     * // => true
+     *
+     * _.isObject([1, 2, 3]);
+     * // => true
+     *
+     * _.isObject(1);
+     * // => false
+     */
+    function isObject(value) {
+      // check if the value is the ECMAScript language type of Object
+      // http://es5.github.io/#x8
+      // and avoid a V8 bug
+      // http://code.google.com/p/v8/issues/detail?id=2291
+      return !!(value && objectTypes[typeof value]);
+    }
+
+    /**
+     * Checks if `value` is `NaN`.
+     *
+     * Note: This is not the same as native `isNaN` which will return `true` for
+     * `undefined` and other non-numeric values. See http://es5.github.io/#x15.1.2.4.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is `NaN`, else `false`.
+     * @example
+     *
+     * _.isNaN(NaN);
+     * // => true
+     *
+     * _.isNaN(new Number(NaN));
+     * // => true
+     *
+     * isNaN(undefined);
+     * // => true
+     *
+     * _.isNaN(undefined);
+     * // => false
+     */
+    function isNaN(value) {
+      // `NaN` as a primitive is the only value that is not equal to itself
+      // (perform the [[Class]] check first to avoid errors with some host objects in IE)
+      return isNumber(value) && value != +value;
+    }
+
+    /**
+     * Checks if `value` is `null`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is `null`, else `false`.
+     * @example
+     *
+     * _.isNull(null);
+     * // => true
+     *
+     * _.isNull(undefined);
+     * // => false
+     */
+    function isNull(value) {
+      return value === null;
+    }
+
+    /**
+     * Checks if `value` is a number.
+     *
+     * Note: `NaN` is considered a number. See http://es5.github.io/#x8.5.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a number, else `false`.
+     * @example
+     *
+     * _.isNumber(8.4 * 5);
+     * // => true
+     */
+    function isNumber(value) {
+      return typeof value == 'number' ||
+        value && typeof value == 'object' && toString.call(value) == numberClass || false;
+    }
+
+    /**
+     * Checks if `value` is an object created by the `Object` constructor.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if `value` is a plain object, else `false`.
+     * @example
+     *
+     * function Shape() {
+     *   this.x = 0;
+     *   this.y = 0;
+     * }
+     *
+     * _.isPlainObject(new Shape);
+     * // => false
+     *
+     * _.isPlainObject([1, 2, 3]);
+     * // => false
+     *
+     * _.isPlainObject({ 'x': 0, 'y': 0 });
+     * // => true
+     */
+    var isPlainObject = !getPrototypeOf ? shimIsPlainObject : function(value) {
+      if (!(value && toString.call(value) == objectClass)) {
+        return false;
+      }
+      var valueOf = value.valueOf,
+          objProto = isNative(valueOf) && (objProto = getPrototypeOf(valueOf)) && getPrototypeOf(objProto);
+
+      return objProto
+        ? (value == objProto || getPrototypeOf(value) == objProto)
+        : shimIsPlainObject(value);
+    };
+
+    /**
+     * Checks if `value` is a regular expression.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a regular expression, else `false`.
+     * @example
+     *
+     * _.isRegExp(/fred/);
+     * // => true
+     */
+    function isRegExp(value) {
+      return value && typeof value == 'object' && toString.call(value) == regexpClass || false;
+    }
+
+    /**
+     * Checks if `value` is a string.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is a string, else `false`.
+     * @example
+     *
+     * _.isString('fred');
+     * // => true
+     */
+    function isString(value) {
+      return typeof value == 'string' ||
+        value && typeof value == 'object' && toString.call(value) == stringClass || false;
+    }
+
+    /**
+     * Checks if `value` is `undefined`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {*} value The value to check.
+     * @returns {boolean} Returns `true` if the `value` is `undefined`, else `false`.
+     * @example
+     *
+     * _.isUndefined(void 0);
+     * // => true
+     */
+    function isUndefined(value) {
+      return typeof value == 'undefined';
+    }
+
+    /**
+     * Creates an object with the same keys as `object` and values generated by
+     * running each own enumerable property of `object` through the callback.
+     * The callback is bound to `thisArg` and invoked with three arguments;
+     * (value, key, object).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a new object with values of the results of each `callback` execution.
+     * @example
+     *
+     * _.mapValues({ 'a': 1, 'b': 2, 'c': 3} , function(num) { return num * 3; });
+     * // => { 'a': 3, 'b': 6, 'c': 9 }
+     *
+     * var characters = {
+     *   'fred': { 'name': 'fred', 'age': 40 },
+     *   'pebbles': { 'name': 'pebbles', 'age': 1 }
+     * };
+     *
+     * // using "_.pluck" callback shorthand
+     * _.mapValues(characters, 'age');
+     * // => { 'fred': 40, 'pebbles': 1 }
+     */
+    function mapValues(object, callback, thisArg) {
+      var result = {};
+      callback = lodash.createCallback(callback, thisArg, 3);
+
+      forOwn(object, function(value, key, object) {
+        result[key] = callback(value, key, object);
+      });
+      return result;
+    }
+
+    /**
+     * Recursively merges own enumerable properties of the source object(s), that
+     * don't resolve to `undefined` into the destination object. Subsequent sources
+     * will overwrite property assignments of previous sources. If a callback is
+     * provided it will be executed to produce the merged values of the destination
+     * and source properties. If the callback returns `undefined` merging will
+     * be handled by the method instead. The callback is bound to `thisArg` and
+     * invoked with two arguments; (objectValue, sourceValue).
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The destination object.
+     * @param {...Object} [source] The source objects.
+     * @param {Function} [callback] The function to customize merging properties.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns the destination object.
+     * @example
+     *
+     * var names = {
+     *   'characters': [
+     *     { 'name': 'barney' },
+     *     { 'name': 'fred' }
+     *   ]
+     * };
+     *
+     * var ages = {
+     *   'characters': [
+     *     { 'age': 36 },
+     *     { 'age': 40 }
+     *   ]
+     * };
+     *
+     * _.merge(names, ages);
+     * // => { 'characters': [{ 'name': 'barney', 'age': 36 }, { 'name': 'fred', 'age': 40 }] }
+     *
+     * var food = {
+     *   'fruits': ['apple'],
+     *   'vegetables': ['beet']
+     * };
+     *
+     * var otherFood = {
+     *   'fruits': ['banana'],
+     *   'vegetables': ['carrot']
+     * };
+     *
+     * _.merge(food, otherFood, function(a, b) {
+     *   return _.isArray(a) ? a.concat(b) : undefined;
+     * });
+     * // => { 'fruits': ['apple', 'banana'], 'vegetables': ['beet', 'carrot] }
+     */
+    function merge(object) {
+      var args = arguments,
+          length = 2;
+
+      if (!isObject(object)) {
+        return object;
+      }
+      // allows working with `_.reduce` and `_.reduceRight` without using
+      // their `index` and `collection` arguments
+      if (typeof args[2] != 'number') {
+        length = args.length;
+      }
+      if (length > 3 && typeof args[length - 2] == 'function') {
+        var callback = baseCreateCallback(args[--length - 1], args[length--], 2);
+      } else if (length > 2 && typeof args[length - 1] == 'function') {
+        callback = args[--length];
+      }
+      var sources = slice(arguments, 1, length),
+          index = -1,
+          stackA = getArray(),
+          stackB = getArray();
+
+      while (++index < length) {
+        baseMerge(object, sources[index], callback, stackA, stackB);
+      }
+      releaseArray(stackA);
+      releaseArray(stackB);
+      return object;
+    }
+
+    /**
+     * Creates a shallow clone of `object` excluding the specified properties.
+     * Property names may be specified as individual arguments or as arrays of
+     * property names. If a callback is provided it will be executed for each
+     * property of `object` omitting the properties the callback returns truey
+     * for. The callback is bound to `thisArg` and invoked with three arguments;
+     * (value, key, object).
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The source object.
+     * @param {Function|...string|string[]} [callback] The properties to omit or the
+     *  function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns an object without the omitted properties.
+     * @example
+     *
+     * _.omit({ 'name': 'fred', 'age': 40 }, 'age');
+     * // => { 'name': 'fred' }
+     *
+     * _.omit({ 'name': 'fred', 'age': 40 }, function(value) {
+     *   return typeof value == 'number';
+     * });
+     * // => { 'name': 'fred' }
+     */
+    function omit(object, callback, thisArg) {
+      var result = {};
+      if (typeof callback != 'function') {
+        var props = [];
+        forIn(object, function(value, key) {
+          props.push(key);
+        });
+        props = baseDifference(props, baseFlatten(arguments, true, false, 1));
+
+        var index = -1,
+            length = props.length;
+
+        while (++index < length) {
+          var key = props[index];
+          result[key] = object[key];
+        }
+      } else {
+        callback = lodash.createCallback(callback, thisArg, 3);
+        forIn(object, function(value, key, object) {
+          if (!callback(value, key, object)) {
+            result[key] = value;
+          }
+        });
+      }
+      return result;
+    }
+
+    /**
+     * Creates a two dimensional array of an object's key-value pairs,
+     * i.e. `[[key1, value1], [key2, value2]]`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to inspect.
+     * @returns {Array} Returns new array of key-value pairs.
+     * @example
+     *
+     * _.pairs({ 'barney': 36, 'fred': 40 });
+     * // => [['barney', 36], ['fred', 40]] (property order is not guaranteed across environments)
+     */
+    function pairs(object) {
+      var index = -1,
+          props = keys(object),
+          length = props.length,
+          result = Array(length);
+
+      while (++index < length) {
+        var key = props[index];
+        result[index] = [key, object[key]];
+      }
+      return result;
+    }
+
+    /**
+     * Creates a shallow clone of `object` composed of the specified properties.
+     * Property names may be specified as individual arguments or as arrays of
+     * property names. If a callback is provided it will be executed for each
+     * property of `object` picking the properties the callback returns truey
+     * for. The callback is bound to `thisArg` and invoked with three arguments;
+     * (value, key, object).
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The source object.
+     * @param {Function|...string|string[]} [callback] The function called per
+     *  iteration or property names to pick, specified as individual property
+     *  names or arrays of property names.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns an object composed of the picked properties.
+     * @example
+     *
+     * _.pick({ 'name': 'fred', '_userid': 'fred1' }, 'name');
+     * // => { 'name': 'fred' }
+     *
+     * _.pick({ 'name': 'fred', '_userid': 'fred1' }, function(value, key) {
+     *   return key.charAt(0) != '_';
+     * });
+     * // => { 'name': 'fred' }
+     */
+    function pick(object, callback, thisArg) {
+      var result = {};
+      if (typeof callback != 'function') {
+        var index = -1,
+            props = baseFlatten(arguments, true, false, 1),
+            length = isObject(object) ? props.length : 0;
+
+        while (++index < length) {
+          var key = props[index];
+          if (key in object) {
+            result[key] = object[key];
+          }
+        }
+      } else {
+        callback = lodash.createCallback(callback, thisArg, 3);
+        forIn(object, function(value, key, object) {
+          if (callback(value, key, object)) {
+            result[key] = value;
+          }
+        });
+      }
+      return result;
+    }
+
+    /**
+     * An alternative to `_.reduce` this method transforms `object` to a new
+     * `accumulator` object which is the result of running each of its own
+     * enumerable properties through a callback, with each callback execution
+     * potentially mutating the `accumulator` object. The callback is bound to
+     * `thisArg` and invoked with four arguments; (accumulator, value, key, object).
+     * Callbacks may exit iteration early by explicitly returning `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Array|Object} object The object to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [accumulator] The custom accumulator value.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the accumulated value.
+     * @example
+     *
+     * var squares = _.transform([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], function(result, num) {
+     *   num *= num;
+     *   if (num % 2) {
+     *     return result.push(num) < 3;
+     *   }
+     * });
+     * // => [1, 9, 25]
+     *
+     * var mapped = _.transform({ 'a': 1, 'b': 2, 'c': 3 }, function(result, num, key) {
+     *   result[key] = num * 3;
+     * });
+     * // => { 'a': 3, 'b': 6, 'c': 9 }
+     */
+    function transform(object, callback, accumulator, thisArg) {
+      var isArr = isArray(object);
+      if (accumulator == null) {
+        if (isArr) {
+          accumulator = [];
+        } else {
+          var ctor = object && object.constructor,
+              proto = ctor && ctor.prototype;
+
+          accumulator = baseCreate(proto);
+        }
+      }
+      if (callback) {
+        callback = lodash.createCallback(callback, thisArg, 4);
+        (isArr ? forEach : forOwn)(object, function(value, index, object) {
+          return callback(accumulator, value, index, object);
+        });
+      }
+      return accumulator;
+    }
+
+    /**
+     * Creates an array composed of the own enumerable property values of `object`.
+     *
+     * @static
+     * @memberOf _
+     * @category Objects
+     * @param {Object} object The object to inspect.
+     * @returns {Array} Returns an array of property values.
+     * @example
+     *
+     * _.values({ 'one': 1, 'two': 2, 'three': 3 });
+     * // => [1, 2, 3] (property order is not guaranteed across environments)
+     */
+    function values(object) {
+      var index = -1,
+          props = keys(object),
+          length = props.length,
+          result = Array(length);
+
+      while (++index < length) {
+        result[index] = object[props[index]];
+      }
+      return result;
+    }
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Creates an array of elements from the specified indexes, or keys, of the
+     * `collection`. Indexes may be specified as individual arguments or as arrays
+     * of indexes.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {...(number|number[]|string|string[])} [index] The indexes of `collection`
+     *   to retrieve, specified as individual indexes or arrays of indexes.
+     * @returns {Array} Returns a new array of elements corresponding to the
+     *  provided indexes.
+     * @example
+     *
+     * _.at(['a', 'b', 'c', 'd', 'e'], [0, 2, 4]);
+     * // => ['a', 'c', 'e']
+     *
+     * _.at(['fred', 'barney', 'pebbles'], 0, 2);
+     * // => ['fred', 'pebbles']
+     */
+    function at(collection) {
+      var args = arguments,
+          index = -1,
+          props = baseFlatten(args, true, false, 1),
+          length = (args[2] && args[2][args[1]] === collection) ? 1 : props.length,
+          result = Array(length);
+
+      while(++index < length) {
+        result[index] = collection[props[index]];
+      }
+      return result;
+    }
+
+    /**
+     * Checks if a given value is present in a collection using strict equality
+     * for comparisons, i.e. `===`. If `fromIndex` is negative, it is used as the
+     * offset from the end of the collection.
+     *
+     * @static
+     * @memberOf _
+     * @alias include
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {*} target The value to check for.
+     * @param {number} [fromIndex=0] The index to search from.
+     * @returns {boolean} Returns `true` if the `target` element is found, else `false`.
+     * @example
+     *
+     * _.contains([1, 2, 3], 1);
+     * // => true
+     *
+     * _.contains([1, 2, 3], 1, 2);
+     * // => false
+     *
+     * _.contains({ 'name': 'fred', 'age': 40 }, 'fred');
+     * // => true
+     *
+     * _.contains('pebbles', 'eb');
+     * // => true
+     */
+    function contains(collection, target, fromIndex) {
+      var index = -1,
+          indexOf = getIndexOf(),
+          length = collection ? collection.length : 0,
+          result = false;
+
+      fromIndex = (fromIndex < 0 ? nativeMax(0, length + fromIndex) : fromIndex) || 0;
+      if (isArray(collection)) {
+        result = indexOf(collection, target, fromIndex) > -1;
+      } else if (typeof length == 'number') {
+        result = (isString(collection) ? collection.indexOf(target, fromIndex) : indexOf(collection, target, fromIndex)) > -1;
+      } else {
+        forOwn(collection, function(value) {
+          if (++index >= fromIndex) {
+            return !(result = value === target);
+          }
+        });
+      }
+      return result;
+    }
+
+    /**
+     * Creates an object composed of keys generated from the results of running
+     * each element of `collection` through the callback. The corresponding value
+     * of each key is the number of times the key was returned by the callback.
+     * The callback is bound to `thisArg` and invoked with three arguments;
+     * (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns the composed aggregate object.
+     * @example
+     *
+     * _.countBy([4.3, 6.1, 6.4], function(num) { return Math.floor(num); });
+     * // => { '4': 1, '6': 2 }
+     *
+     * _.countBy([4.3, 6.1, 6.4], function(num) { return this.floor(num); }, Math);
+     * // => { '4': 1, '6': 2 }
+     *
+     * _.countBy(['one', 'two', 'three'], 'length');
+     * // => { '3': 2, '5': 1 }
+     */
+    var countBy = createAggregator(function(result, value, key) {
+      (hasOwnProperty.call(result, key) ? result[key]++ : result[key] = 1);
+    });
+
+    /**
+     * Checks if the given callback returns truey value for **all** elements of
+     * a collection. The callback is bound to `thisArg` and invoked with three
+     * arguments; (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias all
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {boolean} Returns `true` if all elements passed the callback check,
+     *  else `false`.
+     * @example
+     *
+     * _.every([true, 1, null, 'yes']);
+     * // => false
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.every(characters, 'age');
+     * // => true
+     *
+     * // using "_.where" callback shorthand
+     * _.every(characters, { 'age': 36 });
+     * // => false
+     */
+    function every(collection, callback, thisArg) {
+      var result = true;
+      callback = lodash.createCallback(callback, thisArg, 3);
+
+      var index = -1,
+          length = collection ? collection.length : 0;
+
+      if (typeof length == 'number') {
+        while (++index < length) {
+          if (!(result = !!callback(collection[index], index, collection))) {
+            break;
+          }
+        }
+      } else {
+        forOwn(collection, function(value, index, collection) {
+          return (result = !!callback(value, index, collection));
+        });
+      }
+      return result;
+    }
+
+    /**
+     * Iterates over elements of a collection, returning an array of all elements
+     * the callback returns truey for. The callback is bound to `thisArg` and
+     * invoked with three arguments; (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias select
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a new array of elements that passed the callback check.
+     * @example
+     *
+     * var evens = _.filter([1, 2, 3, 4, 5, 6], function(num) { return num % 2 == 0; });
+     * // => [2, 4, 6]
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36, 'blocked': false },
+     *   { 'name': 'fred',   'age': 40, 'blocked': true }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.filter(characters, 'blocked');
+     * // => [{ 'name': 'fred', 'age': 40, 'blocked': true }]
+     *
+     * // using "_.where" callback shorthand
+     * _.filter(characters, { 'age': 36 });
+     * // => [{ 'name': 'barney', 'age': 36, 'blocked': false }]
+     */
+    function filter(collection, callback, thisArg) {
+      var result = [];
+      callback = lodash.createCallback(callback, thisArg, 3);
+
+      var index = -1,
+          length = collection ? collection.length : 0;
+
+      if (typeof length == 'number') {
+        while (++index < length) {
+          var value = collection[index];
+          if (callback(value, index, collection)) {
+            result.push(value);
+          }
+        }
+      } else {
+        forOwn(collection, function(value, index, collection) {
+          if (callback(value, index, collection)) {
+            result.push(value);
+          }
+        });
+      }
+      return result;
+    }
+
+    /**
+     * Iterates over elements of a collection, returning the first element that
+     * the callback returns truey for. The callback is bound to `thisArg` and
+     * invoked with three arguments; (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias detect, findWhere
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the found element, else `undefined`.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'age': 36, 'blocked': false },
+     *   { 'name': 'fred',    'age': 40, 'blocked': true },
+     *   { 'name': 'pebbles', 'age': 1,  'blocked': false }
+     * ];
+     *
+     * _.find(characters, function(chr) {
+     *   return chr.age < 40;
+     * });
+     * // => { 'name': 'barney', 'age': 36, 'blocked': false }
+     *
+     * // using "_.where" callback shorthand
+     * _.find(characters, { 'age': 1 });
+     * // =>  { 'name': 'pebbles', 'age': 1, 'blocked': false }
+     *
+     * // using "_.pluck" callback shorthand
+     * _.find(characters, 'blocked');
+     * // => { 'name': 'fred', 'age': 40, 'blocked': true }
+     */
+    function find(collection, callback, thisArg) {
+      callback = lodash.createCallback(callback, thisArg, 3);
+
+      var index = -1,
+          length = collection ? collection.length : 0;
+
+      if (typeof length == 'number') {
+        while (++index < length) {
+          var value = collection[index];
+          if (callback(value, index, collection)) {
+            return value;
+          }
+        }
+      } else {
+        var result;
+        forOwn(collection, function(value, index, collection) {
+          if (callback(value, index, collection)) {
+            result = value;
+            return false;
+          }
+        });
+        return result;
+      }
+    }
+
+    /**
+     * This method is like `_.find` except that it iterates over elements
+     * of a `collection` from right to left.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the found element, else `undefined`.
+     * @example
+     *
+     * _.findLast([1, 2, 3, 4], function(num) {
+     *   return num % 2 == 1;
+     * });
+     * // => 3
+     */
+    function findLast(collection, callback, thisArg) {
+      var result;
+      callback = lodash.createCallback(callback, thisArg, 3);
+      forEachRight(collection, function(value, index, collection) {
+        if (callback(value, index, collection)) {
+          result = value;
+          return false;
+        }
+      });
+      return result;
+    }
+
+    /**
+     * Iterates over elements of a collection, executing the callback for each
+     * element. The callback is bound to `thisArg` and invoked with three arguments;
+     * (value, index|key, collection). Callbacks may exit iteration early by
+     * explicitly returning `false`.
+     *
+     * Note: As with other "Collections" methods, objects with a `length` property
+     * are iterated like arrays. To avoid this behavior `_.forIn` or `_.forOwn`
+     * may be used for object iteration.
+     *
+     * @static
+     * @memberOf _
+     * @alias each
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array|Object|string} Returns `collection`.
+     * @example
+     *
+     * _([1, 2, 3]).forEach(function(num) { console.log(num); }).join(',');
+     * // => logs each number and returns '1,2,3'
+     *
+     * _.forEach({ 'one': 1, 'two': 2, 'three': 3 }, function(num) { console.log(num); });
+     * // => logs each number and returns the object (property order is not guaranteed across environments)
+     */
+    function forEach(collection, callback, thisArg) {
+      var index = -1,
+          length = collection ? collection.length : 0;
+
+      callback = callback && typeof thisArg == 'undefined' ? callback : baseCreateCallback(callback, thisArg, 3);
+      if (typeof length == 'number') {
+        while (++index < length) {
+          if (callback(collection[index], index, collection) === false) {
+            break;
+          }
+        }
+      } else {
+        forOwn(collection, callback);
+      }
+      return collection;
+    }
+
+    /**
+     * This method is like `_.forEach` except that it iterates over elements
+     * of a `collection` from right to left.
+     *
+     * @static
+     * @memberOf _
+     * @alias eachRight
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array|Object|string} Returns `collection`.
+     * @example
+     *
+     * _([1, 2, 3]).forEachRight(function(num) { console.log(num); }).join(',');
+     * // => logs each number from right to left and returns '3,2,1'
+     */
+    function forEachRight(collection, callback, thisArg) {
+      var length = collection ? collection.length : 0;
+      callback = callback && typeof thisArg == 'undefined' ? callback : baseCreateCallback(callback, thisArg, 3);
+      if (typeof length == 'number') {
+        while (length--) {
+          if (callback(collection[length], length, collection) === false) {
+            break;
+          }
+        }
+      } else {
+        var props = keys(collection);
+        length = props.length;
+        forOwn(collection, function(value, key, collection) {
+          key = props ? props[--length] : --length;
+          return callback(collection[key], key, collection);
+        });
+      }
+      return collection;
+    }
+
+    /**
+     * Creates an object composed of keys generated from the results of running
+     * each element of a collection through the callback. The corresponding value
+     * of each key is an array of the elements responsible for generating the key.
+     * The callback is bound to `thisArg` and invoked with three arguments;
+     * (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns the composed aggregate object.
+     * @example
+     *
+     * _.groupBy([4.2, 6.1, 6.4], function(num) { return Math.floor(num); });
+     * // => { '4': [4.2], '6': [6.1, 6.4] }
+     *
+     * _.groupBy([4.2, 6.1, 6.4], function(num) { return this.floor(num); }, Math);
+     * // => { '4': [4.2], '6': [6.1, 6.4] }
+     *
+     * // using "_.pluck" callback shorthand
+     * _.groupBy(['one', 'two', 'three'], 'length');
+     * // => { '3': ['one', 'two'], '5': ['three'] }
+     */
+    var groupBy = createAggregator(function(result, value, key) {
+      (hasOwnProperty.call(result, key) ? result[key] : result[key] = []).push(value);
+    });
+
+    /**
+     * Creates an object composed of keys generated from the results of running
+     * each element of the collection through the given callback. The corresponding
+     * value of each key is the last element responsible for generating the key.
+     * The callback is bound to `thisArg` and invoked with three arguments;
+     * (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Object} Returns the composed aggregate object.
+     * @example
+     *
+     * var keys = [
+     *   { 'dir': 'left', 'code': 97 },
+     *   { 'dir': 'right', 'code': 100 }
+     * ];
+     *
+     * _.indexBy(keys, 'dir');
+     * // => { 'left': { 'dir': 'left', 'code': 97 }, 'right': { 'dir': 'right', 'code': 100 } }
+     *
+     * _.indexBy(keys, function(key) { return String.fromCharCode(key.code); });
+     * // => { 'a': { 'dir': 'left', 'code': 97 }, 'd': { 'dir': 'right', 'code': 100 } }
+     *
+     * _.indexBy(characters, function(key) { this.fromCharCode(key.code); }, String);
+     * // => { 'a': { 'dir': 'left', 'code': 97 }, 'd': { 'dir': 'right', 'code': 100 } }
+     */
+    var indexBy = createAggregator(function(result, value, key) {
+      result[key] = value;
+    });
+
+    /**
+     * Invokes the method named by `methodName` on each element in the `collection`
+     * returning an array of the results of each invoked method. Additional arguments
+     * will be provided to each invoked method. If `methodName` is a function it
+     * will be invoked for, and `this` bound to, each element in the `collection`.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|string} methodName The name of the method to invoke or
+     *  the function invoked per iteration.
+     * @param {...*} [arg] Arguments to invoke the method with.
+     * @returns {Array} Returns a new array of the results of each invoked method.
+     * @example
+     *
+     * _.invoke([[5, 1, 7], [3, 2, 1]], 'sort');
+     * // => [[1, 5, 7], [1, 2, 3]]
+     *
+     * _.invoke([123, 456], String.prototype.split, '');
+     * // => [['1', '2', '3'], ['4', '5', '6']]
+     */
+    function invoke(collection, methodName) {
+      var args = slice(arguments, 2),
+          index = -1,
+          isFunc = typeof methodName == 'function',
+          length = collection ? collection.length : 0,
+          result = Array(typeof length == 'number' ? length : 0);
+
+      forEach(collection, function(value) {
+        result[++index] = (isFunc ? methodName : value[methodName]).apply(value, args);
+      });
+      return result;
+    }
+
+    /**
+     * Creates an array of values by running each element in the collection
+     * through the callback. The callback is bound to `thisArg` and invoked with
+     * three arguments; (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias collect
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a new array of the results of each `callback` execution.
+     * @example
+     *
+     * _.map([1, 2, 3], function(num) { return num * 3; });
+     * // => [3, 6, 9]
+     *
+     * _.map({ 'one': 1, 'two': 2, 'three': 3 }, function(num) { return num * 3; });
+     * // => [3, 6, 9] (property order is not guaranteed across environments)
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.map(characters, 'name');
+     * // => ['barney', 'fred']
+     */
+    function map(collection, callback, thisArg) {
+      var index = -1,
+          length = collection ? collection.length : 0;
+
+      callback = lodash.createCallback(callback, thisArg, 3);
+      if (typeof length == 'number') {
+        var result = Array(length);
+        while (++index < length) {
+          result[index] = callback(collection[index], index, collection);
+        }
+      } else {
+        result = [];
+        forOwn(collection, function(value, key, collection) {
+          result[++index] = callback(value, key, collection);
+        });
+      }
+      return result;
+    }
+
+    /**
+     * Retrieves the maximum value of a collection. If the collection is empty or
+     * falsey `-Infinity` is returned. If a callback is provided it will be executed
+     * for each value in the collection to generate the criterion by which the value
+     * is ranked. The callback is bound to `thisArg` and invoked with three
+     * arguments; (value, index, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the maximum value.
+     * @example
+     *
+     * _.max([4, 2, 8, 6]);
+     * // => 8
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * _.max(characters, function(chr) { return chr.age; });
+     * // => { 'name': 'fred', 'age': 40 };
+     *
+     * // using "_.pluck" callback shorthand
+     * _.max(characters, 'age');
+     * // => { 'name': 'fred', 'age': 40 };
+     */
+    function max(collection, callback, thisArg) {
+      var computed = -Infinity,
+          result = computed;
+
+      // allows working with functions like `_.map` without using
+      // their `index` argument as a callback
+      if (typeof callback != 'function' && thisArg && thisArg[callback] === collection) {
+        callback = null;
+      }
+      if (callback == null && isArray(collection)) {
+        var index = -1,
+            length = collection.length;
+
+        while (++index < length) {
+          var value = collection[index];
+          if (value > result) {
+            result = value;
+          }
+        }
+      } else {
+        callback = (callback == null && isString(collection))
+          ? charAtCallback
+          : lodash.createCallback(callback, thisArg, 3);
+
+        forEach(collection, function(value, index, collection) {
+          var current = callback(value, index, collection);
+          if (current > computed) {
+            computed = current;
+            result = value;
+          }
+        });
+      }
+      return result;
+    }
+
+    /**
+     * Retrieves the minimum value of a collection. If the collection is empty or
+     * falsey `Infinity` is returned. If a callback is provided it will be executed
+     * for each value in the collection to generate the criterion by which the value
+     * is ranked. The callback is bound to `thisArg` and invoked with three
+     * arguments; (value, index, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the minimum value.
+     * @example
+     *
+     * _.min([4, 2, 8, 6]);
+     * // => 2
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * _.min(characters, function(chr) { return chr.age; });
+     * // => { 'name': 'barney', 'age': 36 };
+     *
+     * // using "_.pluck" callback shorthand
+     * _.min(characters, 'age');
+     * // => { 'name': 'barney', 'age': 36 };
+     */
+    function min(collection, callback, thisArg) {
+      var computed = Infinity,
+          result = computed;
+
+      // allows working with functions like `_.map` without using
+      // their `index` argument as a callback
+      if (typeof callback != 'function' && thisArg && thisArg[callback] === collection) {
+        callback = null;
+      }
+      if (callback == null && isArray(collection)) {
+        var index = -1,
+            length = collection.length;
+
+        while (++index < length) {
+          var value = collection[index];
+          if (value < result) {
+            result = value;
+          }
+        }
+      } else {
+        callback = (callback == null && isString(collection))
+          ? charAtCallback
+          : lodash.createCallback(callback, thisArg, 3);
+
+        forEach(collection, function(value, index, collection) {
+          var current = callback(value, index, collection);
+          if (current < computed) {
+            computed = current;
+            result = value;
+          }
+        });
+      }
+      return result;
+    }
+
+    /**
+     * Retrieves the value of a specified property from all elements in the collection.
+     *
+     * @static
+     * @memberOf _
+     * @type Function
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {string} property The name of the property to pluck.
+     * @returns {Array} Returns a new array of property values.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * _.pluck(characters, 'name');
+     * // => ['barney', 'fred']
+     */
+    var pluck = map;
+
+    /**
+     * Reduces a collection to a value which is the accumulated result of running
+     * each element in the collection through the callback, where each successive
+     * callback execution consumes the return value of the previous execution. If
+     * `accumulator` is not provided the first element of the collection will be
+     * used as the initial `accumulator` value. The callback is bound to `thisArg`
+     * and invoked with four arguments; (accumulator, value, index|key, collection).
+     *
+     * @static
+     * @memberOf _
+     * @alias foldl, inject
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [accumulator] Initial value of the accumulator.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the accumulated value.
+     * @example
+     *
+     * var sum = _.reduce([1, 2, 3], function(sum, num) {
+     *   return sum + num;
+     * });
+     * // => 6
+     *
+     * var mapped = _.reduce({ 'a': 1, 'b': 2, 'c': 3 }, function(result, num, key) {
+     *   result[key] = num * 3;
+     *   return result;
+     * }, {});
+     * // => { 'a': 3, 'b': 6, 'c': 9 }
+     */
+    function reduce(collection, callback, accumulator, thisArg) {
+      if (!collection) return accumulator;
+      var noaccum = arguments.length < 3;
+      callback = lodash.createCallback(callback, thisArg, 4);
+
+      var index = -1,
+          length = collection.length;
+
+      if (typeof length == 'number') {
+        if (noaccum) {
+          accumulator = collection[++index];
+        }
+        while (++index < length) {
+          accumulator = callback(accumulator, collection[index], index, collection);
+        }
+      } else {
+        forOwn(collection, function(value, index, collection) {
+          accumulator = noaccum
+            ? (noaccum = false, value)
+            : callback(accumulator, value, index, collection)
+        });
+      }
+      return accumulator;
+    }
+
+    /**
+     * This method is like `_.reduce` except that it iterates over elements
+     * of a `collection` from right to left.
+     *
+     * @static
+     * @memberOf _
+     * @alias foldr
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function} [callback=identity] The function called per iteration.
+     * @param {*} [accumulator] Initial value of the accumulator.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the accumulated value.
+     * @example
+     *
+     * var list = [[0, 1], [2, 3], [4, 5]];
+     * var flat = _.reduceRight(list, function(a, b) { return a.concat(b); }, []);
+     * // => [4, 5, 2, 3, 0, 1]
+     */
+    function reduceRight(collection, callback, accumulator, thisArg) {
+      var noaccum = arguments.length < 3;
+      callback = lodash.createCallback(callback, thisArg, 4);
+      forEachRight(collection, function(value, index, collection) {
+        accumulator = noaccum
+          ? (noaccum = false, value)
+          : callback(accumulator, value, index, collection);
+      });
+      return accumulator;
+    }
+
+    /**
+     * The opposite of `_.filter` this method returns the elements of a
+     * collection that the callback does **not** return truey for.
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a new array of elements that failed the callback check.
+     * @example
+     *
+     * var odds = _.reject([1, 2, 3, 4, 5, 6], function(num) { return num % 2 == 0; });
+     * // => [1, 3, 5]
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36, 'blocked': false },
+     *   { 'name': 'fred',   'age': 40, 'blocked': true }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.reject(characters, 'blocked');
+     * // => [{ 'name': 'barney', 'age': 36, 'blocked': false }]
+     *
+     * // using "_.where" callback shorthand
+     * _.reject(characters, { 'age': 36 });
+     * // => [{ 'name': 'fred', 'age': 40, 'blocked': true }]
+     */
+    function reject(collection, callback, thisArg) {
+      callback = lodash.createCallback(callback, thisArg, 3);
+      return filter(collection, function(value, index, collection) {
+        return !callback(value, index, collection);
+      });
+    }
+
+    /**
+     * Retrieves a random element or `n` random elements from a collection.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to sample.
+     * @param {number} [n] The number of elements to sample.
+     * @param- {Object} [guard] Allows working with functions like `_.map`
+     *  without using their `index` arguments as `n`.
+     * @returns {Array} Returns the random sample(s) of `collection`.
+     * @example
+     *
+     * _.sample([1, 2, 3, 4]);
+     * // => 2
+     *
+     * _.sample([1, 2, 3, 4], 2);
+     * // => [3, 1]
+     */
+    function sample(collection, n, guard) {
+      if (collection && typeof collection.length != 'number') {
+        collection = values(collection);
+      }
+      if (n == null || guard) {
+        return collection ? collection[baseRandom(0, collection.length - 1)] : undefined;
+      }
+      var result = shuffle(collection);
+      result.length = nativeMin(nativeMax(0, n), result.length);
+      return result;
+    }
+
+    /**
+     * Creates an array of shuffled values, using a version of the Fisher-Yates
+     * shuffle. See http://en.wikipedia.org/wiki/Fisher-Yates_shuffle.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to shuffle.
+     * @returns {Array} Returns a new shuffled collection.
+     * @example
+     *
+     * _.shuffle([1, 2, 3, 4, 5, 6]);
+     * // => [4, 1, 6, 3, 5, 2]
+     */
+    function shuffle(collection) {
+      var index = -1,
+          length = collection ? collection.length : 0,
+          result = Array(typeof length == 'number' ? length : 0);
+
+      forEach(collection, function(value) {
+        var rand = baseRandom(0, ++index);
+        result[index] = result[rand];
+        result[rand] = value;
+      });
+      return result;
+    }
+
+    /**
+     * Gets the size of the `collection` by returning `collection.length` for arrays
+     * and array-like objects or the number of own enumerable properties for objects.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to inspect.
+     * @returns {number} Returns `collection.length` or number of own enumerable properties.
+     * @example
+     *
+     * _.size([1, 2]);
+     * // => 2
+     *
+     * _.size({ 'one': 1, 'two': 2, 'three': 3 });
+     * // => 3
+     *
+     * _.size('pebbles');
+     * // => 7
+     */
+    function size(collection) {
+      var length = collection ? collection.length : 0;
+      return typeof length == 'number' ? length : keys(collection).length;
+    }
+
+    /**
+     * Checks if the callback returns a truey value for **any** element of a
+     * collection. The function returns as soon as it finds a passing value and
+     * does not iterate over the entire collection. The callback is bound to
+     * `thisArg` and invoked with three arguments; (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias any
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {boolean} Returns `true` if any element passed the callback check,
+     *  else `false`.
+     * @example
+     *
+     * _.some([null, 0, 'yes', false], Boolean);
+     * // => true
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36, 'blocked': false },
+     *   { 'name': 'fred',   'age': 40, 'blocked': true }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.some(characters, 'blocked');
+     * // => true
+     *
+     * // using "_.where" callback shorthand
+     * _.some(characters, { 'age': 1 });
+     * // => false
+     */
+    function some(collection, callback, thisArg) {
+      var result;
+      callback = lodash.createCallback(callback, thisArg, 3);
+
+      var index = -1,
+          length = collection ? collection.length : 0;
+
+      if (typeof length == 'number') {
+        while (++index < length) {
+          if ((result = callback(collection[index], index, collection))) {
+            break;
+          }
+        }
+      } else {
+        forOwn(collection, function(value, index, collection) {
+          return !(result = callback(value, index, collection));
+        });
+      }
+      return !!result;
+    }
+
+    /**
+     * Creates an array of elements, sorted in ascending order by the results of
+     * running each element in a collection through the callback. This method
+     * performs a stable sort, that is, it will preserve the original sort order
+     * of equal elements. The callback is bound to `thisArg` and invoked with
+     * three arguments; (value, index|key, collection).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an array of property names is provided for `callback` the collection
+     * will be sorted by each property value.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Array|Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a new array of sorted elements.
+     * @example
+     *
+     * _.sortBy([1, 2, 3], function(num) { return Math.sin(num); });
+     * // => [3, 1, 2]
+     *
+     * _.sortBy([1, 2, 3], function(num) { return this.sin(num); }, Math);
+     * // => [3, 1, 2]
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'age': 36 },
+     *   { 'name': 'fred',    'age': 40 },
+     *   { 'name': 'barney',  'age': 26 },
+     *   { 'name': 'fred',    'age': 30 }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.map(_.sortBy(characters, 'age'), _.values);
+     * // => [['barney', 26], ['fred', 30], ['barney', 36], ['fred', 40]]
+     *
+     * // sorting by multiple properties
+     * _.map(_.sortBy(characters, ['name', 'age']), _.values);
+     * // = > [['barney', 26], ['barney', 36], ['fred', 30], ['fred', 40]]
+     */
+    function sortBy(collection, callback, thisArg) {
+      var index = -1,
+          isArr = isArray(callback),
+          length = collection ? collection.length : 0,
+          result = Array(typeof length == 'number' ? length : 0);
+
+      if (!isArr) {
+        callback = lodash.createCallback(callback, thisArg, 3);
+      }
+      forEach(collection, function(value, key, collection) {
+        var object = result[++index] = getObject();
+        if (isArr) {
+          object.criteria = map(callback, function(key) { return value[key]; });
+        } else {
+          (object.criteria = getArray())[0] = callback(value, key, collection);
+        }
+        object.index = index;
+        object.value = value;
+      });
+
+      length = result.length;
+      result.sort(compareAscending);
+      while (length--) {
+        var object = result[length];
+        result[length] = object.value;
+        if (!isArr) {
+          releaseArray(object.criteria);
+        }
+        releaseObject(object);
+      }
+      return result;
+    }
+
+    /**
+     * Converts the `collection` to an array.
+     *
+     * @static
+     * @memberOf _
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to convert.
+     * @returns {Array} Returns the new converted array.
+     * @example
+     *
+     * (function() { return _.toArray(arguments).slice(1); })(1, 2, 3, 4);
+     * // => [2, 3, 4]
+     */
+    function toArray(collection) {
+      if (collection && typeof collection.length == 'number') {
+        return slice(collection);
+      }
+      return values(collection);
+    }
+
+    /**
+     * Performs a deep comparison of each element in a `collection` to the given
+     * `properties` object, returning an array of all elements that have equivalent
+     * property values.
+     *
+     * @static
+     * @memberOf _
+     * @type Function
+     * @category Collections
+     * @param {Array|Object|string} collection The collection to iterate over.
+     * @param {Object} props The object of property values to filter by.
+     * @returns {Array} Returns a new array of elements that have the given properties.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36, 'pets': ['hoppy'] },
+     *   { 'name': 'fred',   'age': 40, 'pets': ['baby puss', 'dino'] }
+     * ];
+     *
+     * _.where(characters, { 'age': 36 });
+     * // => [{ 'name': 'barney', 'age': 36, 'pets': ['hoppy'] }]
+     *
+     * _.where(characters, { 'pets': ['dino'] });
+     * // => [{ 'name': 'fred', 'age': 40, 'pets': ['baby puss', 'dino'] }]
+     */
+    var where = filter;
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Creates an array with all falsey values removed. The values `false`, `null`,
+     * `0`, `""`, `undefined`, and `NaN` are all falsey.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to compact.
+     * @returns {Array} Returns a new array of filtered values.
+     * @example
+     *
+     * _.compact([0, 1, false, 2, '', 3]);
+     * // => [1, 2, 3]
+     */
+    function compact(array) {
+      var index = -1,
+          length = array ? array.length : 0,
+          result = [];
+
+      while (++index < length) {
+        var value = array[index];
+        if (value) {
+          result.push(value);
+        }
+      }
+      return result;
+    }
+
+    /**
+     * Creates an array excluding all values of the provided arrays using strict
+     * equality for comparisons, i.e. `===`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to process.
+     * @param {...Array} [values] The arrays of values to exclude.
+     * @returns {Array} Returns a new array of filtered values.
+     * @example
+     *
+     * _.difference([1, 2, 3, 4, 5], [5, 2, 10]);
+     * // => [1, 3, 4]
+     */
+    function difference(array) {
+      return baseDifference(array, baseFlatten(arguments, true, true, 1));
+    }
+
+    /**
+     * This method is like `_.find` except that it returns the index of the first
+     * element that passes the callback check, instead of the element itself.
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to search.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {number} Returns the index of the found element, else `-1`.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'age': 36, 'blocked': false },
+     *   { 'name': 'fred',    'age': 40, 'blocked': true },
+     *   { 'name': 'pebbles', 'age': 1,  'blocked': false }
+     * ];
+     *
+     * _.findIndex(characters, function(chr) {
+     *   return chr.age < 20;
+     * });
+     * // => 2
+     *
+     * // using "_.where" callback shorthand
+     * _.findIndex(characters, { 'age': 36 });
+     * // => 0
+     *
+     * // using "_.pluck" callback shorthand
+     * _.findIndex(characters, 'blocked');
+     * // => 1
+     */
+    function findIndex(array, callback, thisArg) {
+      var index = -1,
+          length = array ? array.length : 0;
+
+      callback = lodash.createCallback(callback, thisArg, 3);
+      while (++index < length) {
+        if (callback(array[index], index, array)) {
+          return index;
+        }
+      }
+      return -1;
+    }
+
+    /**
+     * This method is like `_.findIndex` except that it iterates over elements
+     * of a `collection` from right to left.
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to search.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {number} Returns the index of the found element, else `-1`.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'age': 36, 'blocked': true },
+     *   { 'name': 'fred',    'age': 40, 'blocked': false },
+     *   { 'name': 'pebbles', 'age': 1,  'blocked': true }
+     * ];
+     *
+     * _.findLastIndex(characters, function(chr) {
+     *   return chr.age > 30;
+     * });
+     * // => 1
+     *
+     * // using "_.where" callback shorthand
+     * _.findLastIndex(characters, { 'age': 36 });
+     * // => 0
+     *
+     * // using "_.pluck" callback shorthand
+     * _.findLastIndex(characters, 'blocked');
+     * // => 2
+     */
+    function findLastIndex(array, callback, thisArg) {
+      var length = array ? array.length : 0;
+      callback = lodash.createCallback(callback, thisArg, 3);
+      while (length--) {
+        if (callback(array[length], length, array)) {
+          return length;
+        }
+      }
+      return -1;
+    }
+
+    /**
+     * Gets the first element or first `n` elements of an array. If a callback
+     * is provided elements at the beginning of the array are returned as long
+     * as the callback returns truey. The callback is bound to `thisArg` and
+     * invoked with three arguments; (value, index, array).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias head, take
+     * @category Arrays
+     * @param {Array} array The array to query.
+     * @param {Function|Object|number|string} [callback] The function called
+     *  per element or the number of elements to return. If a property name or
+     *  object is provided it will be used to create a "_.pluck" or "_.where"
+     *  style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the first element(s) of `array`.
+     * @example
+     *
+     * _.first([1, 2, 3]);
+     * // => 1
+     *
+     * _.first([1, 2, 3], 2);
+     * // => [1, 2]
+     *
+     * _.first([1, 2, 3], function(num) {
+     *   return num < 3;
+     * });
+     * // => [1, 2]
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'blocked': true,  'employer': 'slate' },
+     *   { 'name': 'fred',    'blocked': false, 'employer': 'slate' },
+     *   { 'name': 'pebbles', 'blocked': true,  'employer': 'na' }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.first(characters, 'blocked');
+     * // => [{ 'name': 'barney', 'blocked': true, 'employer': 'slate' }]
+     *
+     * // using "_.where" callback shorthand
+     * _.pluck(_.first(characters, { 'employer': 'slate' }), 'name');
+     * // => ['barney', 'fred']
+     */
+    function first(array, callback, thisArg) {
+      var n = 0,
+          length = array ? array.length : 0;
+
+      if (typeof callback != 'number' && callback != null) {
+        var index = -1;
+        callback = lodash.createCallback(callback, thisArg, 3);
+        while (++index < length && callback(array[index], index, array)) {
+          n++;
+        }
+      } else {
+        n = callback;
+        if (n == null || thisArg) {
+          return array ? array[0] : undefined;
+        }
+      }
+      return slice(array, 0, nativeMin(nativeMax(0, n), length));
+    }
+
+    /**
+     * Flattens a nested array (the nesting can be to any depth). If `isShallow`
+     * is truey, the array will only be flattened a single level. If a callback
+     * is provided each element of the array is passed through the callback before
+     * flattening. The callback is bound to `thisArg` and invoked with three
+     * arguments; (value, index, array).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to flatten.
+     * @param {boolean} [isShallow=false] A flag to restrict flattening to a single level.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a new flattened array.
+     * @example
+     *
+     * _.flatten([1, [2], [3, [[4]]]]);
+     * // => [1, 2, 3, 4];
+     *
+     * _.flatten([1, [2], [3, [[4]]]], true);
+     * // => [1, 2, 3, [[4]]];
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 30, 'pets': ['hoppy'] },
+     *   { 'name': 'fred',   'age': 40, 'pets': ['baby puss', 'dino'] }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.flatten(characters, 'pets');
+     * // => ['hoppy', 'baby puss', 'dino']
+     */
+    function flatten(array, isShallow, callback, thisArg) {
+      // juggle arguments
+      if (typeof isShallow != 'boolean' && isShallow != null) {
+        thisArg = callback;
+        callback = (typeof isShallow != 'function' && thisArg && thisArg[isShallow] === array) ? null : isShallow;
+        isShallow = false;
+      }
+      if (callback != null) {
+        array = map(array, callback, thisArg);
+      }
+      return baseFlatten(array, isShallow);
+    }
+
+    /**
+     * Gets the index at which the first occurrence of `value` is found using
+     * strict equality for comparisons, i.e. `===`. If the array is already sorted
+     * providing `true` for `fromIndex` will run a faster binary search.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to search.
+     * @param {*} value The value to search for.
+     * @param {boolean|number} [fromIndex=0] The index to search from or `true`
+     *  to perform a binary search on a sorted array.
+     * @returns {number} Returns the index of the matched value or `-1`.
+     * @example
+     *
+     * _.indexOf([1, 2, 3, 1, 2, 3], 2);
+     * // => 1
+     *
+     * _.indexOf([1, 2, 3, 1, 2, 3], 2, 3);
+     * // => 4
+     *
+     * _.indexOf([1, 1, 2, 2, 3, 3], 2, true);
+     * // => 2
+     */
+    function indexOf(array, value, fromIndex) {
+      if (typeof fromIndex == 'number') {
+        var length = array ? array.length : 0;
+        fromIndex = (fromIndex < 0 ? nativeMax(0, length + fromIndex) : fromIndex || 0);
+      } else if (fromIndex) {
+        var index = sortedIndex(array, value);
+        return array[index] === value ? index : -1;
+      }
+      return baseIndexOf(array, value, fromIndex);
+    }
+
+    /**
+     * Gets all but the last element or last `n` elements of an array. If a
+     * callback is provided elements at the end of the array are excluded from
+     * the result as long as the callback returns truey. The callback is bound
+     * to `thisArg` and invoked with three arguments; (value, index, array).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to query.
+     * @param {Function|Object|number|string} [callback=1] The function called
+     *  per element or the number of elements to exclude. If a property name or
+     *  object is provided it will be used to create a "_.pluck" or "_.where"
+     *  style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a slice of `array`.
+     * @example
+     *
+     * _.initial([1, 2, 3]);
+     * // => [1, 2]
+     *
+     * _.initial([1, 2, 3], 2);
+     * // => [1]
+     *
+     * _.initial([1, 2, 3], function(num) {
+     *   return num > 1;
+     * });
+     * // => [1]
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'blocked': false, 'employer': 'slate' },
+     *   { 'name': 'fred',    'blocked': true,  'employer': 'slate' },
+     *   { 'name': 'pebbles', 'blocked': true,  'employer': 'na' }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.initial(characters, 'blocked');
+     * // => [{ 'name': 'barney',  'blocked': false, 'employer': 'slate' }]
+     *
+     * // using "_.where" callback shorthand
+     * _.pluck(_.initial(characters, { 'employer': 'na' }), 'name');
+     * // => ['barney', 'fred']
+     */
+    function initial(array, callback, thisArg) {
+      var n = 0,
+          length = array ? array.length : 0;
+
+      if (typeof callback != 'number' && callback != null) {
+        var index = length;
+        callback = lodash.createCallback(callback, thisArg, 3);
+        while (index-- && callback(array[index], index, array)) {
+          n++;
+        }
+      } else {
+        n = (callback == null || thisArg) ? 1 : callback || n;
+      }
+      return slice(array, 0, nativeMin(nativeMax(0, length - n), length));
+    }
+
+    /**
+     * Creates an array of unique values present in all provided arrays using
+     * strict equality for comparisons, i.e. `===`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {...Array} [array] The arrays to inspect.
+     * @returns {Array} Returns an array of shared values.
+     * @example
+     *
+     * _.intersection([1, 2, 3], [5, 2, 1, 4], [2, 1]);
+     * // => [1, 2]
+     */
+    function intersection() {
+      var args = [],
+          argsIndex = -1,
+          argsLength = arguments.length,
+          caches = getArray(),
+          indexOf = getIndexOf(),
+          trustIndexOf = indexOf === baseIndexOf,
+          seen = getArray();
+
+      while (++argsIndex < argsLength) {
+        var value = arguments[argsIndex];
+        if (isArray(value) || isArguments(value)) {
+          args.push(value);
+          caches.push(trustIndexOf && value.length >= largeArraySize &&
+            createCache(argsIndex ? args[argsIndex] : seen));
+        }
+      }
+      var array = args[0],
+          index = -1,
+          length = array ? array.length : 0,
+          result = [];
+
+      outer:
+      while (++index < length) {
+        var cache = caches[0];
+        value = array[index];
+
+        if ((cache ? cacheIndexOf(cache, value) : indexOf(seen, value)) < 0) {
+          argsIndex = argsLength;
+          (cache || seen).push(value);
+          while (--argsIndex) {
+            cache = caches[argsIndex];
+            if ((cache ? cacheIndexOf(cache, value) : indexOf(args[argsIndex], value)) < 0) {
+              continue outer;
+            }
+          }
+          result.push(value);
+        }
+      }
+      while (argsLength--) {
+        cache = caches[argsLength];
+        if (cache) {
+          releaseObject(cache);
+        }
+      }
+      releaseArray(caches);
+      releaseArray(seen);
+      return result;
+    }
+
+    /**
+     * Gets the last element or last `n` elements of an array. If a callback is
+     * provided elements at the end of the array are returned as long as the
+     * callback returns truey. The callback is bound to `thisArg` and invoked
+     * with three arguments; (value, index, array).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to query.
+     * @param {Function|Object|number|string} [callback] The function called
+     *  per element or the number of elements to return. If a property name or
+     *  object is provided it will be used to create a "_.pluck" or "_.where"
+     *  style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {*} Returns the last element(s) of `array`.
+     * @example
+     *
+     * _.last([1, 2, 3]);
+     * // => 3
+     *
+     * _.last([1, 2, 3], 2);
+     * // => [2, 3]
+     *
+     * _.last([1, 2, 3], function(num) {
+     *   return num > 1;
+     * });
+     * // => [2, 3]
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'blocked': false, 'employer': 'slate' },
+     *   { 'name': 'fred',    'blocked': true,  'employer': 'slate' },
+     *   { 'name': 'pebbles', 'blocked': true,  'employer': 'na' }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.pluck(_.last(characters, 'blocked'), 'name');
+     * // => ['fred', 'pebbles']
+     *
+     * // using "_.where" callback shorthand
+     * _.last(characters, { 'employer': 'na' });
+     * // => [{ 'name': 'pebbles', 'blocked': true, 'employer': 'na' }]
+     */
+    function last(array, callback, thisArg) {
+      var n = 0,
+          length = array ? array.length : 0;
+
+      if (typeof callback != 'number' && callback != null) {
+        var index = length;
+        callback = lodash.createCallback(callback, thisArg, 3);
+        while (index-- && callback(array[index], index, array)) {
+          n++;
+        }
+      } else {
+        n = callback;
+        if (n == null || thisArg) {
+          return array ? array[length - 1] : undefined;
+        }
+      }
+      return slice(array, nativeMax(0, length - n));
+    }
+
+    /**
+     * Gets the index at which the last occurrence of `value` is found using strict
+     * equality for comparisons, i.e. `===`. If `fromIndex` is negative, it is used
+     * as the offset from the end of the collection.
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to search.
+     * @param {*} value The value to search for.
+     * @param {number} [fromIndex=array.length-1] The index to search from.
+     * @returns {number} Returns the index of the matched value or `-1`.
+     * @example
+     *
+     * _.lastIndexOf([1, 2, 3, 1, 2, 3], 2);
+     * // => 4
+     *
+     * _.lastIndexOf([1, 2, 3, 1, 2, 3], 2, 3);
+     * // => 1
+     */
+    function lastIndexOf(array, value, fromIndex) {
+      var index = array ? array.length : 0;
+      if (typeof fromIndex == 'number') {
+        index = (fromIndex < 0 ? nativeMax(0, index + fromIndex) : nativeMin(fromIndex, index - 1)) + 1;
+      }
+      while (index--) {
+        if (array[index] === value) {
+          return index;
+        }
+      }
+      return -1;
+    }
+
+    /**
+     * Removes all provided values from the given array using strict equality for
+     * comparisons, i.e. `===`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to modify.
+     * @param {...*} [value] The values to remove.
+     * @returns {Array} Returns `array`.
+     * @example
+     *
+     * var array = [1, 2, 3, 1, 2, 3];
+     * _.pull(array, 2, 3);
+     * console.log(array);
+     * // => [1, 1]
+     */
+    function pull(array) {
+      var args = arguments,
+          argsIndex = 0,
+          argsLength = args.length,
+          length = array ? array.length : 0;
+
+      while (++argsIndex < argsLength) {
+        var index = -1,
+            value = args[argsIndex];
+        while (++index < length) {
+          if (array[index] === value) {
+            splice.call(array, index--, 1);
+            length--;
+          }
+        }
+      }
+      return array;
+    }
+
+    /**
+     * Creates an array of numbers (positive and/or negative) progressing from
+     * `start` up to but not including `end`. If `start` is less than `stop` a
+     * zero-length range is created unless a negative `step` is specified.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {number} [start=0] The start of the range.
+     * @param {number} end The end of the range.
+     * @param {number} [step=1] The value to increment or decrement by.
+     * @returns {Array} Returns a new range array.
+     * @example
+     *
+     * _.range(4);
+     * // => [0, 1, 2, 3]
+     *
+     * _.range(1, 5);
+     * // => [1, 2, 3, 4]
+     *
+     * _.range(0, 20, 5);
+     * // => [0, 5, 10, 15]
+     *
+     * _.range(0, -4, -1);
+     * // => [0, -1, -2, -3]
+     *
+     * _.range(1, 4, 0);
+     * // => [1, 1, 1]
+     *
+     * _.range(0);
+     * // => []
+     */
+    function range(start, end, step) {
+      start = +start || 0;
+      step = typeof step == 'number' ? step : (+step || 1);
+
+      if (end == null) {
+        end = start;
+        start = 0;
+      }
+      // use `Array(length)` so engines like Chakra and V8 avoid slower modes
+      // http://youtu.be/XAqIpGU8ZZk#t=17m25s
+      var index = -1,
+          length = nativeMax(0, ceil((end - start) / (step || 1))),
+          result = Array(length);
+
+      while (++index < length) {
+        result[index] = start;
+        start += step;
+      }
+      return result;
+    }
+
+    /**
+     * Removes all elements from an array that the callback returns truey for
+     * and returns an array of removed elements. The callback is bound to `thisArg`
+     * and invoked with three arguments; (value, index, array).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to modify.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a new array of removed elements.
+     * @example
+     *
+     * var array = [1, 2, 3, 4, 5, 6];
+     * var evens = _.remove(array, function(num) { return num % 2 == 0; });
+     *
+     * console.log(array);
+     * // => [1, 3, 5]
+     *
+     * console.log(evens);
+     * // => [2, 4, 6]
+     */
+    function remove(array, callback, thisArg) {
+      var index = -1,
+          length = array ? array.length : 0,
+          result = [];
+
+      callback = lodash.createCallback(callback, thisArg, 3);
+      while (++index < length) {
+        var value = array[index];
+        if (callback(value, index, array)) {
+          result.push(value);
+          splice.call(array, index--, 1);
+          length--;
+        }
+      }
+      return result;
+    }
+
+    /**
+     * The opposite of `_.initial` this method gets all but the first element or
+     * first `n` elements of an array. If a callback function is provided elements
+     * at the beginning of the array are excluded from the result as long as the
+     * callback returns truey. The callback is bound to `thisArg` and invoked
+     * with three arguments; (value, index, array).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias drop, tail
+     * @category Arrays
+     * @param {Array} array The array to query.
+     * @param {Function|Object|number|string} [callback=1] The function called
+     *  per element or the number of elements to exclude. If a property name or
+     *  object is provided it will be used to create a "_.pluck" or "_.where"
+     *  style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a slice of `array`.
+     * @example
+     *
+     * _.rest([1, 2, 3]);
+     * // => [2, 3]
+     *
+     * _.rest([1, 2, 3], 2);
+     * // => [3]
+     *
+     * _.rest([1, 2, 3], function(num) {
+     *   return num < 3;
+     * });
+     * // => [3]
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'blocked': true,  'employer': 'slate' },
+     *   { 'name': 'fred',    'blocked': false,  'employer': 'slate' },
+     *   { 'name': 'pebbles', 'blocked': true, 'employer': 'na' }
+     * ];
+     *
+     * // using "_.pluck" callback shorthand
+     * _.pluck(_.rest(characters, 'blocked'), 'name');
+     * // => ['fred', 'pebbles']
+     *
+     * // using "_.where" callback shorthand
+     * _.rest(characters, { 'employer': 'slate' });
+     * // => [{ 'name': 'pebbles', 'blocked': true, 'employer': 'na' }]
+     */
+    function rest(array, callback, thisArg) {
+      if (typeof callback != 'number' && callback != null) {
+        var n = 0,
+            index = -1,
+            length = array ? array.length : 0;
+
+        callback = lodash.createCallback(callback, thisArg, 3);
+        while (++index < length && callback(array[index], index, array)) {
+          n++;
+        }
+      } else {
+        n = (callback == null || thisArg) ? 1 : nativeMax(0, callback);
+      }
+      return slice(array, n);
+    }
+
+    /**
+     * Uses a binary search to determine the smallest index at which a value
+     * should be inserted into a given sorted array in order to maintain the sort
+     * order of the array. If a callback is provided it will be executed for
+     * `value` and each element of `array` to compute their sort ranking. The
+     * callback is bound to `thisArg` and invoked with one argument; (value).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to inspect.
+     * @param {*} value The value to evaluate.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {number} Returns the index at which `value` should be inserted
+     *  into `array`.
+     * @example
+     *
+     * _.sortedIndex([20, 30, 50], 40);
+     * // => 2
+     *
+     * // using "_.pluck" callback shorthand
+     * _.sortedIndex([{ 'x': 20 }, { 'x': 30 }, { 'x': 50 }], { 'x': 40 }, 'x');
+     * // => 2
+     *
+     * var dict = {
+     *   'wordToNumber': { 'twenty': 20, 'thirty': 30, 'fourty': 40, 'fifty': 50 }
+     * };
+     *
+     * _.sortedIndex(['twenty', 'thirty', 'fifty'], 'fourty', function(word) {
+     *   return dict.wordToNumber[word];
+     * });
+     * // => 2
+     *
+     * _.sortedIndex(['twenty', 'thirty', 'fifty'], 'fourty', function(word) {
+     *   return this.wordToNumber[word];
+     * }, dict);
+     * // => 2
+     */
+    function sortedIndex(array, value, callback, thisArg) {
+      var low = 0,
+          high = array ? array.length : low;
+
+      // explicitly reference `identity` for better inlining in Firefox
+      callback = callback ? lodash.createCallback(callback, thisArg, 1) : identity;
+      value = callback(value);
+
+      while (low < high) {
+        var mid = (low + high) >>> 1;
+        (callback(array[mid]) < value)
+          ? low = mid + 1
+          : high = mid;
+      }
+      return low;
+    }
+
+    /**
+     * Creates an array of unique values, in order, of the provided arrays using
+     * strict equality for comparisons, i.e. `===`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {...Array} [array] The arrays to inspect.
+     * @returns {Array} Returns an array of combined values.
+     * @example
+     *
+     * _.union([1, 2, 3], [5, 2, 1, 4], [2, 1]);
+     * // => [1, 2, 3, 5, 4]
+     */
+    function union() {
+      return baseUniq(baseFlatten(arguments, true, true));
+    }
+
+    /**
+     * Creates a duplicate-value-free version of an array using strict equality
+     * for comparisons, i.e. `===`. If the array is sorted, providing
+     * `true` for `isSorted` will use a faster algorithm. If a callback is provided
+     * each element of `array` is passed through the callback before uniqueness
+     * is computed. The callback is bound to `thisArg` and invoked with three
+     * arguments; (value, index, array).
+     *
+     * If a property name is provided for `callback` the created "_.pluck" style
+     * callback will return the property value of the given element.
+     *
+     * If an object is provided for `callback` the created "_.where" style callback
+     * will return `true` for elements that have the properties of the given object,
+     * else `false`.
+     *
+     * @static
+     * @memberOf _
+     * @alias unique
+     * @category Arrays
+     * @param {Array} array The array to process.
+     * @param {boolean} [isSorted=false] A flag to indicate that `array` is sorted.
+     * @param {Function|Object|string} [callback=identity] The function called
+     *  per iteration. If a property name or object is provided it will be used
+     *  to create a "_.pluck" or "_.where" style callback, respectively.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns a duplicate-value-free array.
+     * @example
+     *
+     * _.uniq([1, 2, 1, 3, 1]);
+     * // => [1, 2, 3]
+     *
+     * _.uniq([1, 1, 2, 2, 3], true);
+     * // => [1, 2, 3]
+     *
+     * _.uniq(['A', 'b', 'C', 'a', 'B', 'c'], function(letter) { return letter.toLowerCase(); });
+     * // => ['A', 'b', 'C']
+     *
+     * _.uniq([1, 2.5, 3, 1.5, 2, 3.5], function(num) { return this.floor(num); }, Math);
+     * // => [1, 2.5, 3]
+     *
+     * // using "_.pluck" callback shorthand
+     * _.uniq([{ 'x': 1 }, { 'x': 2 }, { 'x': 1 }], 'x');
+     * // => [{ 'x': 1 }, { 'x': 2 }]
+     */
+    function uniq(array, isSorted, callback, thisArg) {
+      // juggle arguments
+      if (typeof isSorted != 'boolean' && isSorted != null) {
+        thisArg = callback;
+        callback = (typeof isSorted != 'function' && thisArg && thisArg[isSorted] === array) ? null : isSorted;
+        isSorted = false;
+      }
+      if (callback != null) {
+        callback = lodash.createCallback(callback, thisArg, 3);
+      }
+      return baseUniq(array, isSorted, callback);
+    }
+
+    /**
+     * Creates an array excluding all provided values using strict equality for
+     * comparisons, i.e. `===`.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {Array} array The array to filter.
+     * @param {...*} [value] The values to exclude.
+     * @returns {Array} Returns a new array of filtered values.
+     * @example
+     *
+     * _.without([1, 2, 1, 0, 3, 1, 4], 0, 1);
+     * // => [2, 3, 4]
+     */
+    function without(array) {
+      return baseDifference(array, slice(arguments, 1));
+    }
+
+    /**
+     * Creates an array that is the symmetric difference of the provided arrays.
+     * See http://en.wikipedia.org/wiki/Symmetric_difference.
+     *
+     * @static
+     * @memberOf _
+     * @category Arrays
+     * @param {...Array} [array] The arrays to inspect.
+     * @returns {Array} Returns an array of values.
+     * @example
+     *
+     * _.xor([1, 2, 3], [5, 2, 1, 4]);
+     * // => [3, 5, 4]
+     *
+     * _.xor([1, 2, 5], [2, 3, 5], [3, 4, 5]);
+     * // => [1, 4, 5]
+     */
+    function xor() {
+      var index = -1,
+          length = arguments.length;
+
+      while (++index < length) {
+        var array = arguments[index];
+        if (isArray(array) || isArguments(array)) {
+          var result = result
+            ? baseUniq(baseDifference(result, array).concat(baseDifference(array, result)))
+            : array;
+        }
+      }
+      return result || [];
+    }
+
+    /**
+     * Creates an array of grouped elements, the first of which contains the first
+     * elements of the given arrays, the second of which contains the second
+     * elements of the given arrays, and so on.
+     *
+     * @static
+     * @memberOf _
+     * @alias unzip
+     * @category Arrays
+     * @param {...Array} [array] Arrays to process.
+     * @returns {Array} Returns a new array of grouped elements.
+     * @example
+     *
+     * _.zip(['fred', 'barney'], [30, 40], [true, false]);
+     * // => [['fred', 30, true], ['barney', 40, false]]
+     */
+    function zip() {
+      var array = arguments.length > 1 ? arguments : arguments[0],
+          index = -1,
+          length = array ? max(pluck(array, 'length')) : 0,
+          result = Array(length < 0 ? 0 : length);
+
+      while (++index < length) {
+        result[index] = pluck(array, index);
+      }
+      return result;
+    }
+
+    /**
+     * Creates an object composed from arrays of `keys` and `values`. Provide
+     * either a single two dimensional array, i.e. `[[key1, value1], [key2, value2]]`
+     * or two arrays, one of `keys` and one of corresponding `values`.
+     *
+     * @static
+     * @memberOf _
+     * @alias object
+     * @category Arrays
+     * @param {Array} keys The array of keys.
+     * @param {Array} [values=[]] The array of values.
+     * @returns {Object} Returns an object composed of the given keys and
+     *  corresponding values.
+     * @example
+     *
+     * _.zipObject(['fred', 'barney'], [30, 40]);
+     * // => { 'fred': 30, 'barney': 40 }
+     */
+    function zipObject(keys, values) {
+      var index = -1,
+          length = keys ? keys.length : 0,
+          result = {};
+
+      if (!values && length && !isArray(keys[0])) {
+        values = [];
+      }
+      while (++index < length) {
+        var key = keys[index];
+        if (values) {
+          result[key] = values[index];
+        } else if (key) {
+          result[key[0]] = key[1];
+        }
+      }
+      return result;
+    }
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Creates a function that executes `func`, with  the `this` binding and
+     * arguments of the created function, only after being called `n` times.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {number} n The number of times the function must be called before
+     *  `func` is executed.
+     * @param {Function} func The function to restrict.
+     * @returns {Function} Returns the new restricted function.
+     * @example
+     *
+     * var saves = ['profile', 'settings'];
+     *
+     * var done = _.after(saves.length, function() {
+     *   console.log('Done saving!');
+     * });
+     *
+     * _.forEach(saves, function(type) {
+     *   asyncSave({ 'type': type, 'complete': done });
+     * });
+     * // => logs 'Done saving!', after all saves have completed
+     */
+    function after(n, func) {
+      if (!isFunction(func)) {
+        throw new TypeError;
+      }
+      return function() {
+        if (--n < 1) {
+          return func.apply(this, arguments);
+        }
+      };
+    }
+
+    /**
+     * Creates a function that, when called, invokes `func` with the `this`
+     * binding of `thisArg` and prepends any additional `bind` arguments to those
+     * provided to the bound function.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to bind.
+     * @param {*} [thisArg] The `this` binding of `func`.
+     * @param {...*} [arg] Arguments to be partially applied.
+     * @returns {Function} Returns the new bound function.
+     * @example
+     *
+     * var func = function(greeting) {
+     *   return greeting + ' ' + this.name;
+     * };
+     *
+     * func = _.bind(func, { 'name': 'fred' }, 'hi');
+     * func();
+     * // => 'hi fred'
+     */
+    function bind(func, thisArg) {
+      return arguments.length > 2
+        ? createWrapper(func, 17, slice(arguments, 2), null, thisArg)
+        : createWrapper(func, 1, null, null, thisArg);
+    }
+
+    /**
+     * Binds methods of an object to the object itself, overwriting the existing
+     * method. Method names may be specified as individual arguments or as arrays
+     * of method names. If no method names are provided all the function properties
+     * of `object` will be bound.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Object} object The object to bind and assign the bound methods to.
+     * @param {...string} [methodName] The object method names to
+     *  bind, specified as individual method names or arrays of method names.
+     * @returns {Object} Returns `object`.
+     * @example
+     *
+     * var view = {
+     *   'label': 'docs',
+     *   'onClick': function() { console.log('clicked ' + this.label); }
+     * };
+     *
+     * _.bindAll(view);
+     * jQuery('#docs').on('click', view.onClick);
+     * // => logs 'clicked docs', when the button is clicked
+     */
+    function bindAll(object) {
+      var funcs = arguments.length > 1 ? baseFlatten(arguments, true, false, 1) : functions(object),
+          index = -1,
+          length = funcs.length;
+
+      while (++index < length) {
+        var key = funcs[index];
+        object[key] = createWrapper(object[key], 1, null, null, object);
+      }
+      return object;
+    }
+
+    /**
+     * Creates a function that, when called, invokes the method at `object[key]`
+     * and prepends any additional `bindKey` arguments to those provided to the bound
+     * function. This method differs from `_.bind` by allowing bound functions to
+     * reference methods that will be redefined or don't yet exist.
+     * See http://michaux.ca/articles/lazy-function-definition-pattern.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Object} object The object the method belongs to.
+     * @param {string} key The key of the method.
+     * @param {...*} [arg] Arguments to be partially applied.
+     * @returns {Function} Returns the new bound function.
+     * @example
+     *
+     * var object = {
+     *   'name': 'fred',
+     *   'greet': function(greeting) {
+     *     return greeting + ' ' + this.name;
+     *   }
+     * };
+     *
+     * var func = _.bindKey(object, 'greet', 'hi');
+     * func();
+     * // => 'hi fred'
+     *
+     * object.greet = function(greeting) {
+     *   return greeting + 'ya ' + this.name + '!';
+     * };
+     *
+     * func();
+     * // => 'hiya fred!'
+     */
+    function bindKey(object, key) {
+      return arguments.length > 2
+        ? createWrapper(key, 19, slice(arguments, 2), null, object)
+        : createWrapper(key, 3, null, null, object);
+    }
+
+    /**
+     * Creates a function that is the composition of the provided functions,
+     * where each function consumes the return value of the function that follows.
+     * For example, composing the functions `f()`, `g()`, and `h()` produces `f(g(h()))`.
+     * Each function is executed with the `this` binding of the composed function.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {...Function} [func] Functions to compose.
+     * @returns {Function} Returns the new composed function.
+     * @example
+     *
+     * var realNameMap = {
+     *   'pebbles': 'penelope'
+     * };
+     *
+     * var format = function(name) {
+     *   name = realNameMap[name.toLowerCase()] || name;
+     *   return name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
+     * };
+     *
+     * var greet = function(formatted) {
+     *   return 'Hiya ' + formatted + '!';
+     * };
+     *
+     * var welcome = _.compose(greet, format);
+     * welcome('pebbles');
+     * // => 'Hiya Penelope!'
+     */
+    function compose() {
+      var funcs = arguments,
+          length = funcs.length;
+
+      while (length--) {
+        if (!isFunction(funcs[length])) {
+          throw new TypeError;
+        }
+      }
+      return function() {
+        var args = arguments,
+            length = funcs.length;
+
+        while (length--) {
+          args = [funcs[length].apply(this, args)];
+        }
+        return args[0];
+      };
+    }
+
+    /**
+     * Creates a function which accepts one or more arguments of `func` that when
+     * invoked either executes `func` returning its result, if all `func` arguments
+     * have been provided, or returns a function that accepts one or more of the
+     * remaining `func` arguments, and so on. The arity of `func` can be specified
+     * if `func.length` is not sufficient.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to curry.
+     * @param {number} [arity=func.length] The arity of `func`.
+     * @returns {Function} Returns the new curried function.
+     * @example
+     *
+     * var curried = _.curry(function(a, b, c) {
+     *   console.log(a + b + c);
+     * });
+     *
+     * curried(1)(2)(3);
+     * // => 6
+     *
+     * curried(1, 2)(3);
+     * // => 6
+     *
+     * curried(1, 2, 3);
+     * // => 6
+     */
+    function curry(func, arity) {
+      arity = typeof arity == 'number' ? arity : (+arity || func.length);
+      return createWrapper(func, 4, null, null, null, arity);
+    }
+
+    /**
+     * Creates a function that will delay the execution of `func` until after
+     * `wait` milliseconds have elapsed since the last time it was invoked.
+     * Provide an options object to indicate that `func` should be invoked on
+     * the leading and/or trailing edge of the `wait` timeout. Subsequent calls
+     * to the debounced function will return the result of the last `func` call.
+     *
+     * Note: If `leading` and `trailing` options are `true` `func` will be called
+     * on the trailing edge of the timeout only if the the debounced function is
+     * invoked more than once during the `wait` timeout.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to debounce.
+     * @param {number} wait The number of milliseconds to delay.
+     * @param {Object} [options] The options object.
+     * @param {boolean} [options.leading=false] Specify execution on the leading edge of the timeout.
+     * @param {number} [options.maxWait] The maximum time `func` is allowed to be delayed before it's called.
+     * @param {boolean} [options.trailing=true] Specify execution on the trailing edge of the timeout.
+     * @returns {Function} Returns the new debounced function.
+     * @example
+     *
+     * // avoid costly calculations while the window size is in flux
+     * var lazyLayout = _.debounce(calculateLayout, 150);
+     * jQuery(window).on('resize', lazyLayout);
+     *
+     * // execute `sendMail` when the click event is fired, debouncing subsequent calls
+     * jQuery('#postbox').on('click', _.debounce(sendMail, 300, {
+     *   'leading': true,
+     *   'trailing': false
+     * });
+     *
+     * // ensure `batchLog` is executed once after 1 second of debounced calls
+     * var source = new EventSource('/stream');
+     * source.addEventListener('message', _.debounce(batchLog, 250, {
+     *   'maxWait': 1000
+     * }, false);
+     */
+    function debounce(func, wait, options) {
+      var args,
+          maxTimeoutId,
+          result,
+          stamp,
+          thisArg,
+          timeoutId,
+          trailingCall,
+          lastCalled = 0,
+          maxWait = false,
+          trailing = true;
+
+      if (!isFunction(func)) {
+        throw new TypeError;
+      }
+      wait = nativeMax(0, wait) || 0;
+      if (options === true) {
+        var leading = true;
+        trailing = false;
+      } else if (isObject(options)) {
+        leading = options.leading;
+        maxWait = 'maxWait' in options && (nativeMax(wait, options.maxWait) || 0);
+        trailing = 'trailing' in options ? options.trailing : trailing;
+      }
+      var delayed = function() {
+        var remaining = wait - (now() - stamp);
+        if (remaining <= 0) {
+          if (maxTimeoutId) {
+            clearTimeout(maxTimeoutId);
+          }
+          var isCalled = trailingCall;
+          maxTimeoutId = timeoutId = trailingCall = undefined;
+          if (isCalled) {
+            lastCalled = now();
+            result = func.apply(thisArg, args);
+            if (!timeoutId && !maxTimeoutId) {
+              args = thisArg = null;
+            }
+          }
+        } else {
+          timeoutId = setTimeout(delayed, remaining);
+        }
+      };
+
+      var maxDelayed = function() {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        maxTimeoutId = timeoutId = trailingCall = undefined;
+        if (trailing || (maxWait !== wait)) {
+          lastCalled = now();
+          result = func.apply(thisArg, args);
+          if (!timeoutId && !maxTimeoutId) {
+            args = thisArg = null;
+          }
+        }
+      };
+
+      return function() {
+        args = arguments;
+        stamp = now();
+        thisArg = this;
+        trailingCall = trailing && (timeoutId || !leading);
+
+        if (maxWait === false) {
+          var leadingCall = leading && !timeoutId;
+        } else {
+          if (!maxTimeoutId && !leading) {
+            lastCalled = stamp;
+          }
+          var remaining = maxWait - (stamp - lastCalled),
+              isCalled = remaining <= 0;
+
+          if (isCalled) {
+            if (maxTimeoutId) {
+              maxTimeoutId = clearTimeout(maxTimeoutId);
+            }
+            lastCalled = stamp;
+            result = func.apply(thisArg, args);
+          }
+          else if (!maxTimeoutId) {
+            maxTimeoutId = setTimeout(maxDelayed, remaining);
+          }
+        }
+        if (isCalled && timeoutId) {
+          timeoutId = clearTimeout(timeoutId);
+        }
+        else if (!timeoutId && wait !== maxWait) {
+          timeoutId = setTimeout(delayed, wait);
+        }
+        if (leadingCall) {
+          isCalled = true;
+          result = func.apply(thisArg, args);
+        }
+        if (isCalled && !timeoutId && !maxTimeoutId) {
+          args = thisArg = null;
+        }
+        return result;
+      };
+    }
+
+    /**
+     * Defers executing the `func` function until the current call stack has cleared.
+     * Additional arguments will be provided to `func` when it is invoked.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to defer.
+     * @param {...*} [arg] Arguments to invoke the function with.
+     * @returns {number} Returns the timer id.
+     * @example
+     *
+     * _.defer(function(text) { console.log(text); }, 'deferred');
+     * // logs 'deferred' after one or more milliseconds
+     */
+    function defer(func) {
+      if (!isFunction(func)) {
+        throw new TypeError;
+      }
+      var args = slice(arguments, 1);
+      return setTimeout(function() { func.apply(undefined, args); }, 1);
+    }
+
+    /**
+     * Executes the `func` function after `wait` milliseconds. Additional arguments
+     * will be provided to `func` when it is invoked.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to delay.
+     * @param {number} wait The number of milliseconds to delay execution.
+     * @param {...*} [arg] Arguments to invoke the function with.
+     * @returns {number} Returns the timer id.
+     * @example
+     *
+     * _.delay(function(text) { console.log(text); }, 1000, 'later');
+     * // => logs 'later' after one second
+     */
+    function delay(func, wait) {
+      if (!isFunction(func)) {
+        throw new TypeError;
+      }
+      var args = slice(arguments, 2);
+      return setTimeout(function() { func.apply(undefined, args); }, wait);
+    }
+
+    /**
+     * Creates a function that memoizes the result of `func`. If `resolver` is
+     * provided it will be used to determine the cache key for storing the result
+     * based on the arguments provided to the memoized function. By default, the
+     * first argument provided to the memoized function is used as the cache key.
+     * The `func` is executed with the `this` binding of the memoized function.
+     * The result cache is exposed as the `cache` property on the memoized function.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to have its output memoized.
+     * @param {Function} [resolver] A function used to resolve the cache key.
+     * @returns {Function} Returns the new memoizing function.
+     * @example
+     *
+     * var fibonacci = _.memoize(function(n) {
+     *   return n < 2 ? n : fibonacci(n - 1) + fibonacci(n - 2);
+     * });
+     *
+     * fibonacci(9)
+     * // => 34
+     *
+     * var data = {
+     *   'fred': { 'name': 'fred', 'age': 40 },
+     *   'pebbles': { 'name': 'pebbles', 'age': 1 }
+     * };
+     *
+     * // modifying the result cache
+     * var get = _.memoize(function(name) { return data[name]; }, _.identity);
+     * get('pebbles');
+     * // => { 'name': 'pebbles', 'age': 1 }
+     *
+     * get.cache.pebbles.name = 'penelope';
+     * get('pebbles');
+     * // => { 'name': 'penelope', 'age': 1 }
+     */
+    function memoize(func, resolver) {
+      if (!isFunction(func)) {
+        throw new TypeError;
+      }
+      var memoized = function() {
+        var cache = memoized.cache,
+            key = resolver ? resolver.apply(this, arguments) : keyPrefix + arguments[0];
+
+        return hasOwnProperty.call(cache, key)
+          ? cache[key]
+          : (cache[key] = func.apply(this, arguments));
+      }
+      memoized.cache = {};
+      return memoized;
+    }
+
+    /**
+     * Creates a function that is restricted to execute `func` once. Repeat calls to
+     * the function will return the value of the first call. The `func` is executed
+     * with the `this` binding of the created function.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to restrict.
+     * @returns {Function} Returns the new restricted function.
+     * @example
+     *
+     * var initialize = _.once(createApplication);
+     * initialize();
+     * initialize();
+     * // `initialize` executes `createApplication` once
+     */
+    function once(func) {
+      var ran,
+          result;
+
+      if (!isFunction(func)) {
+        throw new TypeError;
+      }
+      return function() {
+        if (ran) {
+          return result;
+        }
+        ran = true;
+        result = func.apply(this, arguments);
+
+        // clear the `func` variable so the function may be garbage collected
+        func = null;
+        return result;
+      };
+    }
+
+    /**
+     * Creates a function that, when called, invokes `func` with any additional
+     * `partial` arguments prepended to those provided to the new function. This
+     * method is similar to `_.bind` except it does **not** alter the `this` binding.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to partially apply arguments to.
+     * @param {...*} [arg] Arguments to be partially applied.
+     * @returns {Function} Returns the new partially applied function.
+     * @example
+     *
+     * var greet = function(greeting, name) { return greeting + ' ' + name; };
+     * var hi = _.partial(greet, 'hi');
+     * hi('fred');
+     * // => 'hi fred'
+     */
+    function partial(func) {
+      return createWrapper(func, 16, slice(arguments, 1));
+    }
+
+    /**
+     * This method is like `_.partial` except that `partial` arguments are
+     * appended to those provided to the new function.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to partially apply arguments to.
+     * @param {...*} [arg] Arguments to be partially applied.
+     * @returns {Function} Returns the new partially applied function.
+     * @example
+     *
+     * var defaultsDeep = _.partialRight(_.merge, _.defaults);
+     *
+     * var options = {
+     *   'variable': 'data',
+     *   'imports': { 'jq': $ }
+     * };
+     *
+     * defaultsDeep(options, _.templateSettings);
+     *
+     * options.variable
+     * // => 'data'
+     *
+     * options.imports
+     * // => { '_': _, 'jq': $ }
+     */
+    function partialRight(func) {
+      return createWrapper(func, 32, null, slice(arguments, 1));
+    }
+
+    /**
+     * Creates a function that, when executed, will only call the `func` function
+     * at most once per every `wait` milliseconds. Provide an options object to
+     * indicate that `func` should be invoked on the leading and/or trailing edge
+     * of the `wait` timeout. Subsequent calls to the throttled function will
+     * return the result of the last `func` call.
+     *
+     * Note: If `leading` and `trailing` options are `true` `func` will be called
+     * on the trailing edge of the timeout only if the the throttled function is
+     * invoked more than once during the `wait` timeout.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {Function} func The function to throttle.
+     * @param {number} wait The number of milliseconds to throttle executions to.
+     * @param {Object} [options] The options object.
+     * @param {boolean} [options.leading=true] Specify execution on the leading edge of the timeout.
+     * @param {boolean} [options.trailing=true] Specify execution on the trailing edge of the timeout.
+     * @returns {Function} Returns the new throttled function.
+     * @example
+     *
+     * // avoid excessively updating the position while scrolling
+     * var throttled = _.throttle(updatePosition, 100);
+     * jQuery(window).on('scroll', throttled);
+     *
+     * // execute `renewToken` when the click event is fired, but not more than once every 5 minutes
+     * jQuery('.interactive').on('click', _.throttle(renewToken, 300000, {
+     *   'trailing': false
+     * }));
+     */
+    function throttle(func, wait, options) {
+      var leading = true,
+          trailing = true;
+
+      if (!isFunction(func)) {
+        throw new TypeError;
+      }
+      if (options === false) {
+        leading = false;
+      } else if (isObject(options)) {
+        leading = 'leading' in options ? options.leading : leading;
+        trailing = 'trailing' in options ? options.trailing : trailing;
+      }
+      debounceOptions.leading = leading;
+      debounceOptions.maxWait = wait;
+      debounceOptions.trailing = trailing;
+
+      return debounce(func, wait, debounceOptions);
+    }
+
+    /**
+     * Creates a function that provides `value` to the wrapper function as its
+     * first argument. Additional arguments provided to the function are appended
+     * to those provided to the wrapper function. The wrapper is executed with
+     * the `this` binding of the created function.
+     *
+     * @static
+     * @memberOf _
+     * @category Functions
+     * @param {*} value The value to wrap.
+     * @param {Function} wrapper The wrapper function.
+     * @returns {Function} Returns the new function.
+     * @example
+     *
+     * var p = _.wrap(_.escape, function(func, text) {
+     *   return '<p>' + func(text) + '</p>';
+     * });
+     *
+     * p('Fred, Wilma, & Pebbles');
+     * // => '<p>Fred, Wilma, &amp; Pebbles</p>'
+     */
+    function wrap(value, wrapper) {
+      return createWrapper(wrapper, 16, [value]);
+    }
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Creates a function that returns `value`.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {*} value The value to return from the new function.
+     * @returns {Function} Returns the new function.
+     * @example
+     *
+     * var object = { 'name': 'fred' };
+     * var getter = _.constant(object);
+     * getter() === object;
+     * // => true
+     */
+    function constant(value) {
+      return function() {
+        return value;
+      };
+    }
+
+    /**
+     * Produces a callback bound to an optional `thisArg`. If `func` is a property
+     * name the created callback will return the property value for a given element.
+     * If `func` is an object the created callback will return `true` for elements
+     * that contain the equivalent object properties, otherwise it will return `false`.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {*} [func=identity] The value to convert to a callback.
+     * @param {*} [thisArg] The `this` binding of the created callback.
+     * @param {number} [argCount] The number of arguments the callback accepts.
+     * @returns {Function} Returns a callback function.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * // wrap to create custom callback shorthands
+     * _.createCallback = _.wrap(_.createCallback, function(func, callback, thisArg) {
+     *   var match = /^(.+?)__([gl]t)(.+)$/.exec(callback);
+     *   return !match ? func(callback, thisArg) : function(object) {
+     *     return match[2] == 'gt' ? object[match[1]] > match[3] : object[match[1]] < match[3];
+     *   };
+     * });
+     *
+     * _.filter(characters, 'age__gt38');
+     * // => [{ 'name': 'fred', 'age': 40 }]
+     */
+    function createCallback(func, thisArg, argCount) {
+      var type = typeof func;
+      if (func == null || type == 'function') {
+        return baseCreateCallback(func, thisArg, argCount);
+      }
+      // handle "_.pluck" style callback shorthands
+      if (type != 'object') {
+        return property(func);
+      }
+      var props = keys(func),
+          key = props[0],
+          a = func[key];
+
+      // handle "_.where" style callback shorthands
+      if (props.length == 1 && a === a && !isObject(a)) {
+        // fast path the common case of providing an object with a single
+        // property containing a primitive value
+        return function(object) {
+          var b = object[key];
+          return a === b && (a !== 0 || (1 / a == 1 / b));
+        };
+      }
+      return function(object) {
+        var length = props.length,
+            result = false;
+
+        while (length--) {
+          if (!(result = baseIsEqual(object[props[length]], func[props[length]], null, true))) {
+            break;
+          }
+        }
+        return result;
+      };
+    }
+
+    /**
+     * Converts the characters `&`, `<`, `>`, `"`, and `'` in `string` to their
+     * corresponding HTML entities.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {string} string The string to escape.
+     * @returns {string} Returns the escaped string.
+     * @example
+     *
+     * _.escape('Fred, Wilma, & Pebbles');
+     * // => 'Fred, Wilma, &amp; Pebbles'
+     */
+    function escape(string) {
+      return string == null ? '' : String(string).replace(reUnescapedHtml, escapeHtmlChar);
+    }
+
+    /**
+     * This method returns the first argument provided to it.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {*} value Any value.
+     * @returns {*} Returns `value`.
+     * @example
+     *
+     * var object = { 'name': 'fred' };
+     * _.identity(object) === object;
+     * // => true
+     */
+    function identity(value) {
+      return value;
+    }
+
+    /**
+     * Adds function properties of a source object to the destination object.
+     * If `object` is a function methods will be added to its prototype as well.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {Function|Object} [object=lodash] object The destination object.
+     * @param {Object} source The object of functions to add.
+     * @param {Object} [options] The options object.
+     * @param {boolean} [options.chain=true] Specify whether the functions added are chainable.
+     * @example
+     *
+     * function capitalize(string) {
+     *   return string.charAt(0).toUpperCase() + string.slice(1).toLowerCase();
+     * }
+     *
+     * _.mixin({ 'capitalize': capitalize });
+     * _.capitalize('fred');
+     * // => 'Fred'
+     *
+     * _('fred').capitalize().value();
+     * // => 'Fred'
+     *
+     * _.mixin({ 'capitalize': capitalize }, { 'chain': false });
+     * _('fred').capitalize();
+     * // => 'Fred'
+     */
+    function mixin(object, source, options) {
+      var chain = true,
+          methodNames = source && functions(source);
+
+      if (!source || (!options && !methodNames.length)) {
+        if (options == null) {
+          options = source;
+        }
+        ctor = lodashWrapper;
+        source = object;
+        object = lodash;
+        methodNames = functions(source);
+      }
+      if (options === false) {
+        chain = false;
+      } else if (isObject(options) && 'chain' in options) {
+        chain = options.chain;
+      }
+      var ctor = object,
+          isFunc = isFunction(ctor);
+
+      forEach(methodNames, function(methodName) {
+        var func = object[methodName] = source[methodName];
+        if (isFunc) {
+          ctor.prototype[methodName] = function() {
+            var chainAll = this.__chain__,
+                value = this.__wrapped__,
+                args = [value];
+
+            push.apply(args, arguments);
+            var result = func.apply(object, args);
+            if (chain || chainAll) {
+              if (value === result && isObject(result)) {
+                return this;
+              }
+              result = new ctor(result);
+              result.__chain__ = chainAll;
+            }
+            return result;
+          };
+        }
+      });
+    }
+
+    /**
+     * Reverts the '_' variable to its previous value and returns a reference to
+     * the `lodash` function.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @returns {Function} Returns the `lodash` function.
+     * @example
+     *
+     * var lodash = _.noConflict();
+     */
+    function noConflict() {
+      context._ = oldDash;
+      return this;
+    }
+
+    /**
+     * A no-operation function.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @example
+     *
+     * var object = { 'name': 'fred' };
+     * _.noop(object) === undefined;
+     * // => true
+     */
+    function noop() {
+      // no operation performed
+    }
+
+    /**
+     * Gets the number of milliseconds that have elapsed since the Unix epoch
+     * (1 January 1970 00:00:00 UTC).
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @example
+     *
+     * var stamp = _.now();
+     * _.defer(function() { console.log(_.now() - stamp); });
+     * // => logs the number of milliseconds it took for the deferred function to be called
+     */
+    var now = isNative(now = Date.now) && now || function() {
+      return new Date().getTime();
+    };
+
+    /**
+     * Converts the given value into an integer of the specified radix.
+     * If `radix` is `undefined` or `0` a `radix` of `10` is used unless the
+     * `value` is a hexadecimal, in which case a `radix` of `16` is used.
+     *
+     * Note: This method avoids differences in native ES3 and ES5 `parseInt`
+     * implementations. See http://es5.github.io/#E.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {string} value The value to parse.
+     * @param {number} [radix] The radix used to interpret the value to parse.
+     * @returns {number} Returns the new integer value.
+     * @example
+     *
+     * _.parseInt('08');
+     * // => 8
+     */
+    var parseInt = nativeParseInt(whitespace + '08') == 8 ? nativeParseInt : function(value, radix) {
+      // Firefox < 21 and Opera < 15 follow the ES3 specified implementation of `parseInt`
+      return nativeParseInt(isString(value) ? value.replace(reLeadingSpacesAndZeros, '') : value, radix || 0);
+    };
+
+    /**
+     * Creates a "_.pluck" style function, which returns the `key` value of a
+     * given object.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {string} key The name of the property to retrieve.
+     * @returns {Function} Returns the new function.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'fred',   'age': 40 },
+     *   { 'name': 'barney', 'age': 36 }
+     * ];
+     *
+     * var getName = _.property('name');
+     *
+     * _.map(characters, getName);
+     * // => ['barney', 'fred']
+     *
+     * _.sortBy(characters, getName);
+     * // => [{ 'name': 'barney', 'age': 36 }, { 'name': 'fred',   'age': 40 }]
+     */
+    function property(key) {
+      return function(object) {
+        return object[key];
+      };
+    }
+
+    /**
+     * Produces a random number between `min` and `max` (inclusive). If only one
+     * argument is provided a number between `0` and the given number will be
+     * returned. If `floating` is truey or either `min` or `max` are floats a
+     * floating-point number will be returned instead of an integer.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {number} [min=0] The minimum possible value.
+     * @param {number} [max=1] The maximum possible value.
+     * @param {boolean} [floating=false] Specify returning a floating-point number.
+     * @returns {number} Returns a random number.
+     * @example
+     *
+     * _.random(0, 5);
+     * // => an integer between 0 and 5
+     *
+     * _.random(5);
+     * // => also an integer between 0 and 5
+     *
+     * _.random(5, true);
+     * // => a floating-point number between 0 and 5
+     *
+     * _.random(1.2, 5.2);
+     * // => a floating-point number between 1.2 and 5.2
+     */
+    function random(min, max, floating) {
+      var noMin = min == null,
+          noMax = max == null;
+
+      if (floating == null) {
+        if (typeof min == 'boolean' && noMax) {
+          floating = min;
+          min = 1;
+        }
+        else if (!noMax && typeof max == 'boolean') {
+          floating = max;
+          noMax = true;
+        }
+      }
+      if (noMin && noMax) {
+        max = 1;
+      }
+      min = +min || 0;
+      if (noMax) {
+        max = min;
+        min = 0;
+      } else {
+        max = +max || 0;
+      }
+      if (floating || min % 1 || max % 1) {
+        var rand = nativeRandom();
+        return nativeMin(min + (rand * (max - min + parseFloat('1e-' + ((rand +'').length - 1)))), max);
+      }
+      return baseRandom(min, max);
+    }
+
+    /**
+     * Resolves the value of property `key` on `object`. If `key` is a function
+     * it will be invoked with the `this` binding of `object` and its result returned,
+     * else the property value is returned. If `object` is falsey then `undefined`
+     * is returned.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {Object} object The object to inspect.
+     * @param {string} key The name of the property to resolve.
+     * @returns {*} Returns the resolved value.
+     * @example
+     *
+     * var object = {
+     *   'cheese': 'crumpets',
+     *   'stuff': function() {
+     *     return 'nonsense';
+     *   }
+     * };
+     *
+     * _.result(object, 'cheese');
+     * // => 'crumpets'
+     *
+     * _.result(object, 'stuff');
+     * // => 'nonsense'
+     */
+    function result(object, key) {
+      if (object) {
+        var value = object[key];
+        return isFunction(value) ? object[key]() : value;
+      }
+    }
+
+    /**
+     * A micro-templating method that handles arbitrary delimiters, preserves
+     * whitespace, and correctly escapes quotes within interpolated code.
+     *
+     * Note: In the development build, `_.template` utilizes sourceURLs for easier
+     * debugging. See http://www.html5rocks.com/en/tutorials/developertools/sourcemaps/#toc-sourceurl
+     *
+     * For more information on precompiling templates see:
+     * https://lodash.com/custom-builds
+     *
+     * For more information on Chrome extension sandboxes see:
+     * http://developer.chrome.com/stable/extensions/sandboxingEval.html
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {string} text The template text.
+     * @param {Object} data The data object used to populate the text.
+     * @param {Object} [options] The options object.
+     * @param {RegExp} [options.escape] The "escape" delimiter.
+     * @param {RegExp} [options.evaluate] The "evaluate" delimiter.
+     * @param {Object} [options.imports] An object to import into the template as local variables.
+     * @param {RegExp} [options.interpolate] The "interpolate" delimiter.
+     * @param {string} [sourceURL] The sourceURL of the template's compiled source.
+     * @param {string} [variable] The data object variable name.
+     * @returns {Function|string} Returns a compiled function when no `data` object
+     *  is given, else it returns the interpolated text.
+     * @example
+     *
+     * // using the "interpolate" delimiter to create a compiled template
+     * var compiled = _.template('hello <%= name %>');
+     * compiled({ 'name': 'fred' });
+     * // => 'hello fred'
+     *
+     * // using the "escape" delimiter to escape HTML in data property values
+     * _.template('<b><%- value %></b>', { 'value': '<script>' });
+     * // => '<b>&lt;script&gt;</b>'
+     *
+     * // using the "evaluate" delimiter to generate HTML
+     * var list = '<% _.forEach(people, function(name) { %><li><%- name %></li><% }); %>';
+     * _.template(list, { 'people': ['fred', 'barney'] });
+     * // => '<li>fred</li><li>barney</li>'
+     *
+     * // using the ES6 delimiter as an alternative to the default "interpolate" delimiter
+     * _.template('hello ${ name }', { 'name': 'pebbles' });
+     * // => 'hello pebbles'
+     *
+     * // using the internal `print` function in "evaluate" delimiters
+     * _.template('<% print("hello " + name); %>!', { 'name': 'barney' });
+     * // => 'hello barney!'
+     *
+     * // using a custom template delimiters
+     * _.templateSettings = {
+     *   'interpolate': /{{([\s\S]+?)}}/g
+     * };
+     *
+     * _.template('hello {{ name }}!', { 'name': 'mustache' });
+     * // => 'hello mustache!'
+     *
+     * // using the `imports` option to import jQuery
+     * var list = '<% jq.each(people, function(name) { %><li><%- name %></li><% }); %>';
+     * _.template(list, { 'people': ['fred', 'barney'] }, { 'imports': { 'jq': jQuery } });
+     * // => '<li>fred</li><li>barney</li>'
+     *
+     * // using the `sourceURL` option to specify a custom sourceURL for the template
+     * var compiled = _.template('hello <%= name %>', null, { 'sourceURL': '/basic/greeting.jst' });
+     * compiled(data);
+     * // => find the source of "greeting.jst" under the Sources tab or Resources panel of the web inspector
+     *
+     * // using the `variable` option to ensure a with-statement isn't used in the compiled template
+     * var compiled = _.template('hi <%= data.name %>!', null, { 'variable': 'data' });
+     * compiled.source;
+     * // => function(data) {
+     *   var __t, __p = '', __e = _.escape;
+     *   __p += 'hi ' + ((__t = ( data.name )) == null ? '' : __t) + '!';
+     *   return __p;
+     * }
+     *
+     * // using the `source` property to inline compiled templates for meaningful
+     * // line numbers in error messages and a stack trace
+     * fs.writeFileSync(path.join(cwd, 'jst.js'), '\
+     *   var JST = {\
+     *     "main": ' + _.template(mainText).source + '\
+     *   };\
+     * ');
+     */
+    function template(text, data, options) {
+      // based on John Resig's `tmpl` implementation
+      // http://ejohn.org/blog/javascript-micro-templating/
+      // and Laura Doktorova's doT.js
+      // https://github.com/olado/doT
+      var settings = lodash.templateSettings;
+      text = String(text || '');
+
+      // avoid missing dependencies when `iteratorTemplate` is not defined
+      options = defaults({}, options, settings);
+
+      var imports = defaults({}, options.imports, settings.imports),
+          importsKeys = keys(imports),
+          importsValues = values(imports);
+
+      var isEvaluating,
+          index = 0,
+          interpolate = options.interpolate || reNoMatch,
+          source = "__p += '";
+
+      // compile the regexp to match each delimiter
+      var reDelimiters = RegExp(
+        (options.escape || reNoMatch).source + '|' +
+        interpolate.source + '|' +
+        (interpolate === reInterpolate ? reEsTemplate : reNoMatch).source + '|' +
+        (options.evaluate || reNoMatch).source + '|$'
+      , 'g');
+
+      text.replace(reDelimiters, function(match, escapeValue, interpolateValue, esTemplateValue, evaluateValue, offset) {
+        interpolateValue || (interpolateValue = esTemplateValue);
+
+        // escape characters that cannot be included in string literals
+        source += text.slice(index, offset).replace(reUnescapedString, escapeStringChar);
+
+        // replace delimiters with snippets
+        if (escapeValue) {
+          source += "' +\n__e(" + escapeValue + ") +\n'";
+        }
+        if (evaluateValue) {
+          isEvaluating = true;
+          source += "';\n" + evaluateValue + ";\n__p += '";
+        }
+        if (interpolateValue) {
+          source += "' +\n((__t = (" + interpolateValue + ")) == null ? '' : __t) +\n'";
+        }
+        index = offset + match.length;
+
+        // the JS engine embedded in Adobe products requires returning the `match`
+        // string in order to produce the correct `offset` value
+        return match;
+      });
+
+      source += "';\n";
+
+      // if `variable` is not specified, wrap a with-statement around the generated
+      // code to add the data object to the top of the scope chain
+      var variable = options.variable,
+          hasVariable = variable;
+
+      if (!hasVariable) {
+        variable = 'obj';
+        source = 'with (' + variable + ') {\n' + source + '\n}\n';
+      }
+      // cleanup code by stripping empty strings
+      source = (isEvaluating ? source.replace(reEmptyStringLeading, '') : source)
+        .replace(reEmptyStringMiddle, '$1')
+        .replace(reEmptyStringTrailing, '$1;');
+
+      // frame code as the function body
+      source = 'function(' + variable + ') {\n' +
+        (hasVariable ? '' : variable + ' || (' + variable + ' = {});\n') +
+        "var __t, __p = '', __e = _.escape" +
+        (isEvaluating
+          ? ', __j = Array.prototype.join;\n' +
+            "function print() { __p += __j.call(arguments, '') }\n"
+          : ';\n'
+        ) +
+        source +
+        'return __p\n}';
+
+      // Use a sourceURL for easier debugging.
+      // http://www.html5rocks.com/en/tutorials/developertools/sourcemaps/#toc-sourceurl
+      var sourceURL = '\n/*\n//# sourceURL=' + (options.sourceURL || '/lodash/template/source[' + (templateCounter++) + ']') + '\n*/';
+
+      try {
+        var result = Function(importsKeys, 'return ' + source + sourceURL).apply(undefined, importsValues);
+      } catch(e) {
+        e.source = source;
+        throw e;
+      }
+      if (data) {
+        return result(data);
+      }
+      // provide the compiled function's source by its `toString` method, in
+      // supported environments, or the `source` property as a convenience for
+      // inlining compiled templates during the build process
+      result.source = source;
+      return result;
+    }
+
+    /**
+     * Executes the callback `n` times, returning an array of the results
+     * of each callback execution. The callback is bound to `thisArg` and invoked
+     * with one argument; (index).
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {number} n The number of times to execute the callback.
+     * @param {Function} callback The function called per iteration.
+     * @param {*} [thisArg] The `this` binding of `callback`.
+     * @returns {Array} Returns an array of the results of each `callback` execution.
+     * @example
+     *
+     * var diceRolls = _.times(3, _.partial(_.random, 1, 6));
+     * // => [3, 6, 4]
+     *
+     * _.times(3, function(n) { mage.castSpell(n); });
+     * // => calls `mage.castSpell(n)` three times, passing `n` of `0`, `1`, and `2` respectively
+     *
+     * _.times(3, function(n) { this.cast(n); }, mage);
+     * // => also calls `mage.castSpell(n)` three times
+     */
+    function times(n, callback, thisArg) {
+      n = (n = +n) > -1 ? n : 0;
+      var index = -1,
+          result = Array(n);
+
+      callback = baseCreateCallback(callback, thisArg, 1);
+      while (++index < n) {
+        result[index] = callback(index);
+      }
+      return result;
+    }
+
+    /**
+     * The inverse of `_.escape` this method converts the HTML entities
+     * `&amp;`, `&lt;`, `&gt;`, `&quot;`, and `&#39;` in `string` to their
+     * corresponding characters.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {string} string The string to unescape.
+     * @returns {string} Returns the unescaped string.
+     * @example
+     *
+     * _.unescape('Fred, Barney &amp; Pebbles');
+     * // => 'Fred, Barney & Pebbles'
+     */
+    function unescape(string) {
+      return string == null ? '' : String(string).replace(reEscapedHtml, unescapeHtmlChar);
+    }
+
+    /**
+     * Generates a unique ID. If `prefix` is provided the ID will be appended to it.
+     *
+     * @static
+     * @memberOf _
+     * @category Utilities
+     * @param {string} [prefix] The value to prefix the ID with.
+     * @returns {string} Returns the unique ID.
+     * @example
+     *
+     * _.uniqueId('contact_');
+     * // => 'contact_104'
+     *
+     * _.uniqueId();
+     * // => '105'
+     */
+    function uniqueId(prefix) {
+      var id = ++idCounter;
+      return String(prefix == null ? '' : prefix) + id;
+    }
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * Creates a `lodash` object that wraps the given value with explicit
+     * method chaining enabled.
+     *
+     * @static
+     * @memberOf _
+     * @category Chaining
+     * @param {*} value The value to wrap.
+     * @returns {Object} Returns the wrapper object.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney',  'age': 36 },
+     *   { 'name': 'fred',    'age': 40 },
+     *   { 'name': 'pebbles', 'age': 1 }
+     * ];
+     *
+     * var youngest = _.chain(characters)
+     *     .sortBy('age')
+     *     .map(function(chr) { return chr.name + ' is ' + chr.age; })
+     *     .first()
+     *     .value();
+     * // => 'pebbles is 1'
+     */
+    function chain(value) {
+      value = new lodashWrapper(value);
+      value.__chain__ = true;
+      return value;
+    }
+
+    /**
+     * Invokes `interceptor` with the `value` as the first argument and then
+     * returns `value`. The purpose of this method is to "tap into" a method
+     * chain in order to perform operations on intermediate results within
+     * the chain.
+     *
+     * @static
+     * @memberOf _
+     * @category Chaining
+     * @param {*} value The value to provide to `interceptor`.
+     * @param {Function} interceptor The function to invoke.
+     * @returns {*} Returns `value`.
+     * @example
+     *
+     * _([1, 2, 3, 4])
+     *  .tap(function(array) { array.pop(); })
+     *  .reverse()
+     *  .value();
+     * // => [3, 2, 1]
+     */
+    function tap(value, interceptor) {
+      interceptor(value);
+      return value;
+    }
+
+    /**
+     * Enables explicit method chaining on the wrapper object.
+     *
+     * @name chain
+     * @memberOf _
+     * @category Chaining
+     * @returns {*} Returns the wrapper object.
+     * @example
+     *
+     * var characters = [
+     *   { 'name': 'barney', 'age': 36 },
+     *   { 'name': 'fred',   'age': 40 }
+     * ];
+     *
+     * // without explicit chaining
+     * _(characters).first();
+     * // => { 'name': 'barney', 'age': 36 }
+     *
+     * // with explicit chaining
+     * _(characters).chain()
+     *   .first()
+     *   .pick('age')
+     *   .value();
+     * // => { 'age': 36 }
+     */
+    function wrapperChain() {
+      this.__chain__ = true;
+      return this;
+    }
+
+    /**
+     * Produces the `toString` result of the wrapped value.
+     *
+     * @name toString
+     * @memberOf _
+     * @category Chaining
+     * @returns {string} Returns the string result.
+     * @example
+     *
+     * _([1, 2, 3]).toString();
+     * // => '1,2,3'
+     */
+    function wrapperToString() {
+      return String(this.__wrapped__);
+    }
+
+    /**
+     * Extracts the wrapped value.
+     *
+     * @name valueOf
+     * @memberOf _
+     * @alias value
+     * @category Chaining
+     * @returns {*} Returns the wrapped value.
+     * @example
+     *
+     * _([1, 2, 3]).valueOf();
+     * // => [1, 2, 3]
+     */
+    function wrapperValueOf() {
+      return this.__wrapped__;
+    }
+
+    /*--------------------------------------------------------------------------*/
+
+    // add functions that return wrapped values when chaining
+    lodash.after = after;
+    lodash.assign = assign;
+    lodash.at = at;
+    lodash.bind = bind;
+    lodash.bindAll = bindAll;
+    lodash.bindKey = bindKey;
+    lodash.chain = chain;
+    lodash.compact = compact;
+    lodash.compose = compose;
+    lodash.constant = constant;
+    lodash.countBy = countBy;
+    lodash.create = create;
+    lodash.createCallback = createCallback;
+    lodash.curry = curry;
+    lodash.debounce = debounce;
+    lodash.defaults = defaults;
+    lodash.defer = defer;
+    lodash.delay = delay;
+    lodash.difference = difference;
+    lodash.filter = filter;
+    lodash.flatten = flatten;
+    lodash.forEach = forEach;
+    lodash.forEachRight = forEachRight;
+    lodash.forIn = forIn;
+    lodash.forInRight = forInRight;
+    lodash.forOwn = forOwn;
+    lodash.forOwnRight = forOwnRight;
+    lodash.functions = functions;
+    lodash.groupBy = groupBy;
+    lodash.indexBy = indexBy;
+    lodash.initial = initial;
+    lodash.intersection = intersection;
+    lodash.invert = invert;
+    lodash.invoke = invoke;
+    lodash.keys = keys;
+    lodash.map = map;
+    lodash.mapValues = mapValues;
+    lodash.max = max;
+    lodash.memoize = memoize;
+    lodash.merge = merge;
+    lodash.min = min;
+    lodash.omit = omit;
+    lodash.once = once;
+    lodash.pairs = pairs;
+    lodash.partial = partial;
+    lodash.partialRight = partialRight;
+    lodash.pick = pick;
+    lodash.pluck = pluck;
+    lodash.property = property;
+    lodash.pull = pull;
+    lodash.range = range;
+    lodash.reject = reject;
+    lodash.remove = remove;
+    lodash.rest = rest;
+    lodash.shuffle = shuffle;
+    lodash.sortBy = sortBy;
+    lodash.tap = tap;
+    lodash.throttle = throttle;
+    lodash.times = times;
+    lodash.toArray = toArray;
+    lodash.transform = transform;
+    lodash.union = union;
+    lodash.uniq = uniq;
+    lodash.values = values;
+    lodash.where = where;
+    lodash.without = without;
+    lodash.wrap = wrap;
+    lodash.xor = xor;
+    lodash.zip = zip;
+    lodash.zipObject = zipObject;
+
+    // add aliases
+    lodash.collect = map;
+    lodash.drop = rest;
+    lodash.each = forEach;
+    lodash.eachRight = forEachRight;
+    lodash.extend = assign;
+    lodash.methods = functions;
+    lodash.object = zipObject;
+    lodash.select = filter;
+    lodash.tail = rest;
+    lodash.unique = uniq;
+    lodash.unzip = zip;
+
+    // add functions to `lodash.prototype`
+    mixin(lodash);
+
+    /*--------------------------------------------------------------------------*/
+
+    // add functions that return unwrapped values when chaining
+    lodash.clone = clone;
+    lodash.cloneDeep = cloneDeep;
+    lodash.contains = contains;
+    lodash.escape = escape;
+    lodash.every = every;
+    lodash.find = find;
+    lodash.findIndex = findIndex;
+    lodash.findKey = findKey;
+    lodash.findLast = findLast;
+    lodash.findLastIndex = findLastIndex;
+    lodash.findLastKey = findLastKey;
+    lodash.has = has;
+    lodash.identity = identity;
+    lodash.indexOf = indexOf;
+    lodash.isArguments = isArguments;
+    lodash.isArray = isArray;
+    lodash.isBoolean = isBoolean;
+    lodash.isDate = isDate;
+    lodash.isElement = isElement;
+    lodash.isEmpty = isEmpty;
+    lodash.isEqual = isEqual;
+    lodash.isFinite = isFinite;
+    lodash.isFunction = isFunction;
+    lodash.isNaN = isNaN;
+    lodash.isNull = isNull;
+    lodash.isNumber = isNumber;
+    lodash.isObject = isObject;
+    lodash.isPlainObject = isPlainObject;
+    lodash.isRegExp = isRegExp;
+    lodash.isString = isString;
+    lodash.isUndefined = isUndefined;
+    lodash.lastIndexOf = lastIndexOf;
+    lodash.mixin = mixin;
+    lodash.noConflict = noConflict;
+    lodash.noop = noop;
+    lodash.now = now;
+    lodash.parseInt = parseInt;
+    lodash.random = random;
+    lodash.reduce = reduce;
+    lodash.reduceRight = reduceRight;
+    lodash.result = result;
+    lodash.runInContext = runInContext;
+    lodash.size = size;
+    lodash.some = some;
+    lodash.sortedIndex = sortedIndex;
+    lodash.template = template;
+    lodash.unescape = unescape;
+    lodash.uniqueId = uniqueId;
+
+    // add aliases
+    lodash.all = every;
+    lodash.any = some;
+    lodash.detect = find;
+    lodash.findWhere = find;
+    lodash.foldl = reduce;
+    lodash.foldr = reduceRight;
+    lodash.include = contains;
+    lodash.inject = reduce;
+
+    mixin(function() {
+      var source = {}
+      forOwn(lodash, function(func, methodName) {
+        if (!lodash.prototype[methodName]) {
+          source[methodName] = func;
+        }
+      });
+      return source;
+    }(), false);
+
+    /*--------------------------------------------------------------------------*/
+
+    // add functions capable of returning wrapped and unwrapped values when chaining
+    lodash.first = first;
+    lodash.last = last;
+    lodash.sample = sample;
+
+    // add aliases
+    lodash.take = first;
+    lodash.head = first;
+
+    forOwn(lodash, function(func, methodName) {
+      var callbackable = methodName !== 'sample';
+      if (!lodash.prototype[methodName]) {
+        lodash.prototype[methodName]= function(n, guard) {
+          var chainAll = this.__chain__,
+              result = func(this.__wrapped__, n, guard);
+
+          return !chainAll && (n == null || (guard && !(callbackable && typeof n == 'function')))
+            ? result
+            : new lodashWrapper(result, chainAll);
+        };
+      }
+    });
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * The semantic version number.
+     *
+     * @static
+     * @memberOf _
+     * @type string
+     */
+    lodash.VERSION = '2.4.2';
+
+    // add "Chaining" functions to the wrapper
+    lodash.prototype.chain = wrapperChain;
+    lodash.prototype.toString = wrapperToString;
+    lodash.prototype.value = wrapperValueOf;
+    lodash.prototype.valueOf = wrapperValueOf;
+
+    // add `Array` functions that return unwrapped values
+    forEach(['join', 'pop', 'shift'], function(methodName) {
+      var func = arrayRef[methodName];
+      lodash.prototype[methodName] = function() {
+        var chainAll = this.__chain__,
+            result = func.apply(this.__wrapped__, arguments);
+
+        return chainAll
+          ? new lodashWrapper(result, chainAll)
+          : result;
+      };
+    });
+
+    // add `Array` functions that return the existing wrapped value
+    forEach(['push', 'reverse', 'sort', 'unshift'], function(methodName) {
+      var func = arrayRef[methodName];
+      lodash.prototype[methodName] = function() {
+        func.apply(this.__wrapped__, arguments);
+        return this;
+      };
+    });
+
+    // add `Array` functions that return new wrapped values
+    forEach(['concat', 'slice', 'splice'], function(methodName) {
+      var func = arrayRef[methodName];
+      lodash.prototype[methodName] = function() {
+        return new lodashWrapper(func.apply(this.__wrapped__, arguments), this.__chain__);
+      };
+    });
+
+    return lodash;
+  }
+
+  /*--------------------------------------------------------------------------*/
+
+  // expose Lo-Dash
+  var _ = runInContext();
+
+  // some AMD build optimizers like r.js check for condition patterns like the following:
+  if (typeof define == 'function' && typeof define.amd == 'object' && define.amd) {
+    // Expose Lo-Dash to the global object even when an AMD loader is present in
+    // case Lo-Dash is loaded with a RequireJS shim config.
+    // See http://requirejs.org/docs/api.html#config-shim
+    root._ = _;
+
+    // define as an anonymous module so, through path mapping, it can be
+    // referenced as the "underscore" module
+    define(function() {
+      return _;
+    });
+  }
+  // check for `exports` after `define` in case a build optimizer adds an `exports` object
+  else if (freeExports && freeModule) {
+    // in Node.js or RingoJS
+    if (moduleExports) {
+      (freeModule.exports = _)._ = _;
+    }
+    // in Narwhal or Rhino -require
+    else {
+      freeExports._ = _;
+    }
+  }
+  else {
+    // in a browser or Rhino
+    root._ = _;
+  }
+}.call(this));
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],7:[function(require,module,exports){
+module.exports=[
   {
     "id": 1,
     "mappedTo": "A",
@@ -6607,18 +15217,27 @@
       {
         "x": 5,
         "y": -1
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 2
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
       {
         "x": 3,
         "y": 9
@@ -6636,8 +15255,8 @@
         "y": 6
       }
     ],
-    "width": 13,
-    "height": 3
+    "width": 23,
+    "height": 21
   },
   {
     "id": 553,
@@ -6872,20 +15491,22 @@
       {
         "x": 3,
         "y": -2
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 8,
+        "y": 2
+      },
+      {
+        "x": 10,
+        "y": 3
       }
     ],
     "width": 23,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 555,
@@ -7369,25 +15990,34 @@
       {
         "x": 3,
         "y": 5
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 5,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 8
+      },
+      {
+        "x": 8,
+        "y": 7
+      },
       {
         "x": 10,
         "y": 4
       }
     ],
-    "width": 15,
-    "height": 0
+    "width": 24,
+    "height": 21
   },
   {
     "id": 559,
@@ -7727,18 +16357,27 @@
       {
         "x": 1,
         "y": -1
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
       {
         "x": 7,
         "y": 7
@@ -7748,8 +16387,8 @@
         "y": 4
       }
     ],
-    "width": 14,
-    "height": 3
+    "width": 24,
+    "height": 21
   },
   {
     "id": 562,
@@ -7998,18 +16637,27 @@
       {
         "x": 5,
         "y": -11
-      }
-    ],
-    "width": 33,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 11,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -12
+      },
+      {
+        "x": 8,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": -11
+      },
+      {
+        "x": 11,
+        "y": -9
+      },
+      {
+        "x": 11,
+        "y": -7
+      },
       {
         "x": 10,
         "y": -2
@@ -8043,8 +16691,8 @@
         "y": 4
       }
     ],
-    "width": 4,
-    "height": 11
+    "width": 33,
+    "height": 21
   },
   {
     "id": 564,
@@ -8177,16 +16825,6 @@
     ],
     "width": 24,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 565,
@@ -8578,16 +17216,6 @@
     "height": 21
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 568,
     "mappedTo": null,
     "vertexCount": 38,
@@ -8717,25 +17345,34 @@
       {
         "x": 3,
         "y": 1
-      }
-    ],
-    "width": 25,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
+      {
+        "x": 8,
+        "y": 8
+      },
+      {
+        "x": 9,
+        "y": 7
+      },
       {
         "x": 11,
         "y": 4
       }
     ],
-    "width": 16,
-    "height": 0
+    "width": 25,
+    "height": 21
   },
   {
     "id": 569,
@@ -9087,20 +17724,14 @@
       {
         "x": 9,
         "y": 7
+      },
+      {
+        "x": 11,
+        "y": 4
       }
     ],
     "width": 24,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 572,
@@ -9236,16 +17867,6 @@
     ],
     "width": 23,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 573,
@@ -9472,20 +18093,26 @@
       {
         "x": -6,
         "y": 8
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      {
+        "x": -10,
+        "y": 9
+      },
+      {
+        "x": -11,
+        "y": 8
+      },
+      {
+        "x": -11,
+        "y": 6
       }
     ],
     "width": 24,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 575,
@@ -9614,25 +18241,34 @@
       {
         "x": -5,
         "y": 20
-      }
-    ],
-    "width": 23,
-    "height": 33
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 18
+      },
+      {
+        "x": -4,
+        "y": 15
+      },
+      {
+        "x": -2,
+        "y": 12
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
       {
         "x": 9,
         "y": 4
       }
     ],
-    "width": 11,
-    "height": 0
+    "width": 23,
+    "height": 33
   },
   {
     "id": 576,
@@ -9764,18 +18400,27 @@
       {
         "x": -4,
         "y": 20
-      }
-    ],
-    "width": 21,
-    "height": 32
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 12,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 21
+      },
+      {
+        "x": -7,
+        "y": 20
+      },
+      {
+        "x": -7,
+        "y": 18
+      },
+      {
+        "x": -6,
+        "y": 15
+      },
+      {
+        "x": -4,
+        "y": 12
+      },
       {
         "x": -1,
         "y": 9
@@ -9789,8 +18434,8 @@
         "y": 4
       }
     ],
-    "width": 16,
-    "height": 5
+    "width": 21,
+    "height": 33
   },
   {
     "id": 583,
@@ -14253,20 +22898,14 @@
       {
         "x": 7,
         "y": 7
+      },
+      {
+        "x": 9,
+        "y": 4
       }
     ],
     "width": 14,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 662,
@@ -14471,20 +23110,14 @@
       {
         "x": 10,
         "y": 7
+      },
+      {
+        "x": 12,
+        "y": 4
       }
     ],
     "width": 25,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 664,
@@ -18039,20 +26672,22 @@
       {
         "x": 7,
         "y": 9
+      },
+      {
+        "x": 9,
+        "y": 9
+      },
+      {
+        "x": 10,
+        "y": 8
+      },
+      {
+        "x": 10,
+        "y": 7
       }
     ],
     "width": 26,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 735,
@@ -18434,20 +27069,14 @@
       {
         "x": -2,
         "y": 10
+      },
+      {
+        "x": 2,
+        "y": 10
       }
     ],
     "width": 24,
     "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 742,
@@ -18759,18 +27388,27 @@
       {
         "x": -9,
         "y": 3
-      }
-    ],
-    "width": 24,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 5
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
       "PENUP",
       {
         "x": 0,
@@ -18807,8 +27445,8 @@
         "y": 10
       }
     ],
-    "width": 2,
-    "height": 8
+    "width": 24,
+    "height": 20
   },
   {
     "id": 745,
@@ -18925,18 +27563,27 @@
         "x": -8,
         "y": 0
       },
-      "PENUP"
-    ],
-    "width": 24,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -3,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 9,
+        "y": -3
+      },
       {
         "x": 9,
         "y": -1
@@ -19004,8 +27651,8 @@
         "y": 0
       }
     ],
-    "width": 6,
-    "height": 5
+    "width": 24,
+    "height": 20
   },
   {
     "id": 746,
@@ -19128,18 +27775,24 @@
       {
         "x": 1,
         "y": 3
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 1,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      "PENUP",
+      {
+        "x": 9,
+        "y": 1
+      },
       {
         "x": 9,
         "y": 0
@@ -19207,8 +27860,8 @@
         "y": 4
       }
     ],
-    "width": 10,
-    "height": 9
+    "width": 24,
+    "height": 21
   },
   {
     "id": 750,
@@ -22519,20 +31172,19 @@
       {
         "x": 2,
         "y": 2
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 1
       }
     ],
     "width": 8,
     "height": 8
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 851,
@@ -23535,16 +32187,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 868,
     "mappedTo": null,
     "vertexCount": 10,
@@ -23709,20 +32351,18 @@
       {
         "x": 1,
         "y": 10
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 8
       }
     ],
     "width": 22,
     "height": 22
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 870,
@@ -23830,18 +32470,24 @@
       {
         "x": -6,
         "y": -7
-      }
-    ],
-    "width": 16,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -6
+      },
+      {
+        "x": -6,
+        "y": -6
+      },
+      {
+        "x": -8,
+        "y": -5
+      },
       "PENUP",
       {
         "x": 0,
@@ -23933,8 +32579,8 @@
         "y": 0
       }
     ],
-    "width": 3,
-    "height": 7
+    "width": 16,
+    "height": 21
   },
   {
     "id": 871,
@@ -24039,18 +32685,24 @@
       {
         "x": 0,
         "y": -7
-      }
-    ],
-    "width": 16,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -5,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -7
+      },
       {
         "x": 2,
         "y": -4
@@ -24162,18 +32814,24 @@
       {
         "x": 4,
         "y": 2
-      }
-    ],
-    "width": -7,
-    "height": 6
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -2,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
       {
         "x": -6,
         "y": 8
@@ -24253,8 +32911,8 @@
         "y": 8
       }
     ],
-    "width": 13,
-    "height": 5
+    "width": 16,
+    "height": 21
   },
   {
     "id": 872,
@@ -24377,18 +33035,27 @@
       {
         "x": -8,
         "y": -3
-      }
-    ],
-    "width": 16,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 0
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -7,
+        "y": 2
+      },
+      {
+        "x": -8,
+        "y": 3
+      },
+      {
+        "x": -8,
+        "y": 6
+      },
       {
         "x": -6,
         "y": 8
@@ -24402,8 +33069,8 @@
         "y": 7
       }
     ],
-    "width": 14,
-    "height": 1
+    "width": 16,
+    "height": 21
   },
   {
     "id": 873,
@@ -24530,16 +33197,6 @@
     ],
     "width": 16,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 874,
@@ -25120,20 +33777,18 @@
       {
         "x": 6,
         "y": -16
+      },
+      {
+        "x": 2,
+        "y": -17
+      },
+      {
+        "x": -2,
+        "y": -17
       }
     ],
     "width": 34,
     "height": 34
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 906,
@@ -25265,20 +33920,18 @@
       {
         "x": 7,
         "y": -21
+      },
+      {
+        "x": 2,
+        "y": -22
+      },
+      {
+        "x": -2,
+        "y": -22
       }
     ],
     "width": 44,
     "height": 44
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 907,
@@ -25410,18 +34063,27 @@
       {
         "x": 31,
         "y": 27
-      }
-    ],
-    "width": 82,
-    "height": 82
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 41,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      {
+        "x": 34,
+        "y": 23
+      },
+      {
+        "x": 37,
+        "y": 18
+      },
+      {
+        "x": 39,
+        "y": 13
+      },
+      {
+        "x": 40,
+        "y": 9
+      },
+      {
+        "x": 41,
+        "y": 3
+      },
       {
         "x": 41,
         "y": -3
@@ -25475,8 +34137,8 @@
         "y": -41
       }
     ],
-    "width": 44,
-    "height": 38
+    "width": 82,
+    "height": 82
   },
   {
     "id": 908,
@@ -25605,20 +34267,18 @@
       {
         "x": 5,
         "y": 14
+      },
+      {
+        "x": 2,
+        "y": 15
+      },
+      {
+        "x": 0,
+        "y": 17
       }
     ],
     "width": 40,
     "height": 34
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 909,
@@ -25744,20 +34404,14 @@
       {
         "x": -16,
         "y": -10
+      },
+      {
+        "x": 16,
+        "y": -10
       }
     ],
     "width": 34,
     "height": 34
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 997,
@@ -25995,20 +34649,22 @@
       {
         "x": 4,
         "y": 2
+      },
+      {
+        "x": 4,
+        "y": 3
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 6
       }
     ],
     "width": 16,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1003,
@@ -26482,20 +35138,23 @@
       {
         "x": 5,
         "y": 1
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": 1
       }
     ],
     "width": 16,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1008,
@@ -27159,16 +35818,6 @@
     "height": 13
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 1016,
     "mappedTo": null,
     "vertexCount": 25,
@@ -27387,18 +36036,24 @@
       {
         "x": 2,
         "y": -7
-      }
-    ],
-    "width": 15,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": -2,
+        "y": 3
+      },
+      {
+        "x": -1,
+        "y": 2
+      },
+      {
+        "x": 1,
+        "y": 2
+      },
       {
         "x": 2,
         "y": 3
@@ -27437,8 +36092,8 @@
         "y": 9
       }
     ],
-    "width": 3,
-    "height": 6
+    "width": 15,
+    "height": 16
   },
   {
     "id": 1018,
@@ -27555,20 +36210,27 @@
       {
         "x": 6,
         "y": 5
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 0
+      },
+      {
+        "x": 3,
+        "y": 1
+      },
+      {
+        "x": 4,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 6
       }
     ],
     "width": 16,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [],
-    "width": 11,
-    "height": null
   },
   {
     "id": 1019,
@@ -27701,16 +36363,6 @@
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1020,
@@ -28375,20 +37027,22 @@
       {
         "x": 4,
         "y": 2
+      },
+      {
+        "x": 4,
+        "y": 3
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 6
       }
     ],
     "width": 16,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1029,
@@ -28856,18 +37510,21 @@
       {
         "x": 2,
         "y": -7
-      }
-    ],
-    "width": 15,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -3
+      },
+      {
+        "x": -1,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -3
+      },
       {
         "x": 2,
         "y": 2
@@ -28891,8 +37548,8 @@
         "y": 0
       }
     ],
-    "width": -1,
-    "height": 3
+    "width": 15,
+    "height": 13
   },
   {
     "id": 1035,
@@ -29359,20 +38016,23 @@
       {
         "x": -5,
         "y": 5
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 6
       }
     ],
     "width": 16,
     "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1041,
@@ -29502,16 +38162,6 @@
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1042,
@@ -29936,20 +38586,14 @@
       {
         "x": -2,
         "y": 6
+      },
+      {
+        "x": 3,
+        "y": 6
       }
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1047,
@@ -30069,18 +38713,24 @@
       {
         "x": 5,
         "y": -1
-      }
-    ],
-    "width": 15,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 2,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -7
+      },
+      {
+        "x": 3,
+        "y": -7
+      },
       "PENUP",
       {
         "x": -2,
@@ -30091,8 +38741,8 @@
         "y": 6
       }
     ],
-    "width": -4,
-    "height": 0
+    "width": 15,
+    "height": 13
   },
   {
     "id": 1048,
@@ -30279,20 +38929,14 @@
       {
         "x": -2,
         "y": 6
+      },
+      {
+        "x": 3,
+        "y": 6
       }
     ],
     "width": 17,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1050,
@@ -30415,20 +39059,19 @@
       {
         "x": -2,
         "y": 5
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 5
       }
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1051,
@@ -30609,20 +39252,18 @@
       {
         "x": 2,
         "y": 3
+      },
+      {
+        "x": 1,
+        "y": 5
+      },
+      {
+        "x": -1,
+        "y": 6
       }
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1053,
@@ -31103,20 +39744,14 @@
       {
         "x": 1,
         "y": 1
+      },
+      {
+        "x": 6,
+        "y": 1
       }
     ],
     "width": 14,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1058,
@@ -31780,16 +40415,6 @@
     "height": 13
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 1066,
     "mappedTo": null,
     "vertexCount": 24,
@@ -32004,18 +40629,24 @@
       {
         "x": 2,
         "y": -7
-      }
-    ],
-    "width": 14,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 4
+      },
+      {
+        "x": -2,
+        "y": 3
+      },
+      {
+        "x": -1,
+        "y": 3
+      },
       {
         "x": 0,
         "y": 4
@@ -32050,8 +40681,8 @@
         "y": 9
       }
     ],
-    "width": 4,
-    "height": 5
+    "width": 14,
+    "height": 16
   },
   {
     "id": 1068,
@@ -32168,20 +40799,19 @@
       {
         "x": 4,
         "y": 6
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 6
       }
     ],
     "width": 16,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1069,
@@ -32910,16 +41540,6 @@
     "height": 9
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 1102,
     "mappedTo": null,
     "vertexCount": 29,
@@ -33251,16 +41871,6 @@
     "height": 13
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 1105,
     "mappedTo": null,
     "vertexCount": 26,
@@ -33558,18 +42168,27 @@
         "x": 4,
         "y": 8
       },
-      "PENUP"
-    ],
-    "width": 13,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -2,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
       {
         "x": 2,
         "y": 10
@@ -33592,7 +42211,7 @@
       }
     ],
     "width": 13,
-    "height": 4
+    "height": 13
   },
   {
     "id": 1108,
@@ -34104,18 +42723,21 @@
       {
         "x": 8,
         "y": 6
-      }
-    ],
-    "width": 25,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -10,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": -3
+      },
+      {
+        "x": -7,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": 6
+      },
       {
         "x": -5,
         "y": 6
@@ -34139,8 +42761,8 @@
         "y": 6
       }
     ],
-    "width": 16,
-    "height": 0
+    "width": 25,
+    "height": 9
   },
   {
     "id": 1114,
@@ -34475,16 +43097,6 @@
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1117,
@@ -35432,16 +44044,6 @@
     "height": 9
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 1128,
     "mappedTo": null,
     "vertexCount": 40,
@@ -35559,18 +44161,24 @@
       {
         "x": -1,
         "y": 6
-      }
-    ],
-    "width": 13,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -4,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": 0
+      },
       {
         "x": 2,
         "y": 2
@@ -35584,8 +44192,8 @@
         "y": 6
       }
     ],
-    "width": 1,
-    "height": 4
+    "width": 13,
+    "height": 17
   },
   {
     "id": 1129,
@@ -35788,18 +44396,24 @@
       {
         "x": 3,
         "y": 2
-      }
-    ],
-    "width": 14,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -6
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
       {
         "x": 2,
         "y": -7
@@ -35809,8 +44423,8 @@
         "y": -5
       }
     ],
-    "width": -7,
-    "height": 2
+    "width": 14,
+    "height": 14
   },
   {
     "id": 1131,
@@ -36260,20 +44874,22 @@
       {
         "x": 2,
         "y": 2
+      },
+      {
+        "x": 3,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -7
       }
     ],
     "width": 16,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1135,
@@ -36779,20 +45395,26 @@
       {
         "x": 1,
         "y": 1
+      },
+      {
+        "x": -1,
+        "y": 2
+      },
+      {
+        "x": -2,
+        "y": 3
+      },
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": -1,
+        "y": 6
       }
     ],
     "width": 11,
     "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1141,
@@ -37481,20 +46103,22 @@
         "x": 1,
         "y": 0
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -1,
+        "y": 6
+      },
+      {
+        "x": -2,
+        "y": 10
+      }
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1148,
@@ -37796,20 +46420,26 @@
         "x": 5,
         "y": -2
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": 1,
+        "y": 5
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 4
+      }
     ],
     "width": 16,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1151,
@@ -37938,16 +46568,6 @@
     "height": 9
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 1152,
     "mappedTo": null,
     "vertexCount": 32,
@@ -38069,16 +46689,6 @@
     ],
     "width": 14,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1153,
@@ -38293,20 +46903,19 @@
       {
         "x": -2,
         "y": 6
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -7
+      },
+      {
+        "x": 6,
+        "y": -7
       }
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1155,
@@ -38618,20 +47227,18 @@
       {
         "x": -4,
         "y": 1
+      },
+      {
+        "x": -4,
+        "y": 4
+      },
+      {
+        "x": -2,
+        "y": 6
       }
     ],
     "width": 14,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1158,
@@ -39075,16 +47682,6 @@
     "height": 13
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 1162,
     "mappedTo": null,
     "vertexCount": 16,
@@ -39267,18 +47864,24 @@
       {
         "x": 8,
         "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 3
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
       {
         "x": 6,
         "y": -3
@@ -39316,7 +47919,7 @@
         "y": 3
       }
     ],
-    "width": 50,
+    "width": 24,
     "height": 9
   },
   {
@@ -39440,20 +48043,14 @@
       {
         "x": 7,
         "y": 5
+      },
+      {
+        "x": 8,
+        "y": 3
       }
     ],
     "width": 17,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1165,
@@ -39689,20 +48286,19 @@
       {
         "x": 1,
         "y": 6
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 10
+      },
+      {
+        "x": -3,
+        "y": 10
       }
     ],
     "width": 15,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1167,
@@ -40186,20 +48782,14 @@
       {
         "x": 3,
         "y": 5
+      },
+      {
+        "x": 4,
+        "y": 6
       }
     ],
     "width": 17,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1172,
@@ -40422,20 +49012,30 @@
       {
         "x": 5,
         "y": 5
+      },
+      {
+        "x": 7,
+        "y": 3
+      },
+      {
+        "x": 8,
+        "y": 0
+      },
+      {
+        "x": 8,
+        "y": -3
+      },
+      {
+        "x": 7,
+        "y": -3
+      },
+      {
+        "x": 8,
+        "y": -2
       }
     ],
     "width": 20,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -2,
-    "vertices": [],
-    "width": 6,
-    "height": null
   },
   {
     "id": 1174,
@@ -40558,25 +49158,34 @@
         "x": 1,
         "y": 6
       },
-      "PENUP"
-    ],
-    "width": 16,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 5,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -1,
+        "y": 3
+      },
+      {
+        "x": -1,
+        "y": 5
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 5
+      },
       {
         "x": 5,
         "y": 3
       }
     ],
-    "width": 9,
-    "height": 0
+    "width": 16,
+    "height": 9
   },
   {
     "id": 1175,
@@ -40699,20 +49308,22 @@
       {
         "x": -5,
         "y": 10
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 10
       }
     ],
     "width": 16,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1176,
@@ -40935,18 +49546,21 @@
       {
         "x": -8,
         "y": -3
-      }
-    ],
-    "width": 19,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 6
+      },
+      "PENUP",
       {
         "x": 0,
         "y": 6
@@ -40956,8 +49570,8 @@
         "y": 6
       }
     ],
-    "width": 50,
-    "height": 0
+    "width": 19,
+    "height": 13
   },
   {
     "id": 1178,
@@ -41279,18 +49893,21 @@
       {
         "x": 8,
         "y": -3
-      }
-    ],
-    "width": 25,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 9,
+        "y": -3
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      "PENUP",
       {
         "x": -10,
         "y": -3
@@ -41327,8 +49944,8 @@
         "y": 6
       }
     ],
-    "width": 50,
-    "height": 9
+    "width": 25,
+    "height": 13
   },
   {
     "id": 1181,
@@ -41445,18 +50062,24 @@
         "x": 8,
         "y": 6
       },
-      "PENUP"
-    ],
-    "width": 25,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -3,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 9,
+        "y": -7
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": -3
+      },
+      {
+        "x": 8,
+        "y": -3
+      },
       "PENUP",
       {
         "x": -10,
@@ -41485,8 +50108,8 @@
         "y": 6
       }
     ],
-    "width": 5,
-    "height": 0
+    "width": 25,
+    "height": 13
   },
   {
     "id": 1182,
@@ -41743,20 +50366,19 @@
       {
         "x": 3,
         "y": -7
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -1
+      },
+      {
+        "x": 4,
+        "y": -1
       }
     ],
     "width": 13,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1186,
@@ -41876,20 +50498,18 @@
       {
         "x": 5,
         "y": 0
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -3
       }
     ],
     "width": 15,
     "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1187,
@@ -42107,18 +50727,24 @@
       {
         "x": -1,
         "y": 10
-      }
-    ],
-    "width": 18,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -7
+      },
+      {
+        "x": 6,
+        "y": -6
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": 7
+      },
       {
         "x": 1,
         "y": 9
@@ -42149,8 +50775,8 @@
         "y": -3
       }
     ],
-    "width": 9,
-    "height": 13
+    "width": 18,
+    "height": 17
   },
   {
     "id": 1192,
@@ -42273,25 +50899,31 @@
       {
         "x": 5,
         "y": -3
-      }
-    ],
-    "width": 17,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": -3
+      },
       {
         "x": 5,
         "y": -3
       }
     ],
-    "width": 3,
-    "height": 0
+    "width": 17,
+    "height": 17
   },
   {
     "id": 1193,
@@ -42411,25 +51043,31 @@
       {
         "x": 6,
         "y": -7
-      }
-    ],
-    "width": 17,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": -3
+      },
       {
         "x": 4,
         "y": -3
       }
     ],
-    "width": 3,
-    "height": 0
+    "width": 17,
+    "height": 17
   },
   {
     "id": 1194,
@@ -42549,18 +51187,27 @@
         "x": 3,
         "y": -6
       },
-      "PENUP"
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 10,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": -5
+      },
+      {
+        "x": 1,
+        "y": -3
+      },
+      {
+        "x": -2,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 10
+      },
       "PENUP",
       {
         "x": 5,
@@ -42654,7 +51301,7 @@
         "y": -3
       }
     ],
-    "width": 14,
+    "width": 24,
     "height": 17
   },
   {
@@ -42772,18 +51419,27 @@
         "x": 3,
         "y": -6
       },
-      "PENUP"
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 10,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": -5
+      },
+      {
+        "x": 1,
+        "y": -3
+      },
+      {
+        "x": -2,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 10
+      },
       "PENUP",
       {
         "x": 5,
@@ -42877,7 +51533,7 @@
         "y": -3
       }
     ],
-    "width": 14,
+    "width": 24,
     "height": 17
   },
   {
@@ -42992,16 +51648,6 @@
     "rightHandPosition": 6,
     "vertices": [],
     "width": 12,
-    "height": null
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
     "height": null
   },
   {
@@ -43279,20 +51925,22 @@
       {
         "x": 1,
         "y": 6
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 4
+      },
+      {
+        "x": 5,
+        "y": 3
       }
     ],
     "width": 13,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1203,
@@ -43418,18 +52066,24 @@
       {
         "x": -3,
         "y": 4
-      }
-    ],
-    "width": 13,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 4,
+        "y": 2
+      },
+      {
+        "x": 4,
+        "y": 3
+      },
       {
         "x": 3,
         "y": 5
@@ -43439,8 +52093,8 @@
         "y": 6
       }
     ],
-    "width": 7,
-    "height": 1
+    "width": 13,
+    "height": 13
   },
   {
     "id": 1204,
@@ -43610,20 +52264,14 @@
       {
         "x": 3,
         "y": 5
+      },
+      {
+        "x": 2,
+        "y": 6
       }
     ],
     "width": 13,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1206,
@@ -43749,20 +52397,26 @@
       {
         "x": 3,
         "y": 5
+      },
+      {
+        "x": 4,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 1
+      },
+      {
+        "x": 3,
+        "y": -1
+      },
+      {
+        "x": 2,
+        "y": -2
       }
     ],
     "width": 13,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1207,
@@ -43968,71 +52622,80 @@
       {
         "x": 2,
         "y": 6
+      },
+      {
+        "x": 4,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 2
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -1
+      },
+      {
+        "x": -2,
+        "y": 0
+      },
+      {
+        "x": -3,
+        "y": 2
+      },
+      {
+        "x": -3,
+        "y": 3
+      },
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": -1,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 6
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 2
+      },
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 2,
+        "y": -1
       }
     ],
     "width": 13,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -1,
-    "vertices": [
-      "PENUP",
-      {
-        "x": -1,
-        "y": -1
-      },
-      {
-        "x": -2,
-        "y": 0
-      },
-      {
-        "x": -3,
-        "y": 2
-      },
-      {
-        "x": -3,
-        "y": 3
-      },
-      {
-        "x": -2,
-        "y": 5
-      },
-      {
-        "x": -1,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": 6
-      },
-      {
-        "x": 3,
-        "y": 5
-      },
-      {
-        "x": 4,
-        "y": 3
-      },
-      {
-        "x": 4,
-        "y": 2
-      },
-      {
-        "x": 3,
-        "y": 0
-      },
-      {
-        "x": 2,
-        "y": -1
-      }
-    ],
-    "width": 1,
-    "height": 7
   },
   {
     "id": 1209,
@@ -44158,20 +52821,26 @@
       {
         "x": -2,
         "y": -6
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -3,
+        "y": -2
+      },
+      {
+        "x": -2,
+        "y": 0
+      },
+      {
+        "x": -1,
+        "y": 1
       }
     ],
     "width": 13,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1210,
@@ -45050,25 +53719,34 @@
         "x": -1,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 11,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 1,
+        "y": 2
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": -2,
+        "y": 6
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
       {
         "x": 1,
         "y": 10
       }
     ],
-    "width": 10,
-    "height": 0
+    "width": 11,
+    "height": 20
   },
   {
     "id": 1226,
@@ -45182,25 +53860,34 @@
         "x": 1,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 11,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -1,
+        "y": 2
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 2,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
       {
         "x": -1,
         "y": 10
       }
     ],
-    "width": 10,
-    "height": 0
+    "width": 11,
+    "height": 20
   },
   {
     "id": 1227,
@@ -46841,20 +55528,30 @@
       {
         "x": 2,
         "y": 4
+      },
+      {
+        "x": 3,
+        "y": 2
+      },
+      {
+        "x": 4,
+        "y": -1
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 3,
+        "y": -6
+      },
+      {
+        "x": 2,
+        "y": -7
       }
     ],
     "width": 14,
     "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -7,
-    "vertices": [],
-    "width": -5,
-    "height": null
   },
   {
     "id": 1266,
@@ -47184,18 +55881,27 @@
       {
         "x": -3,
         "y": 3
-      }
-    ],
-    "width": 18,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -1,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
+      {
+        "x": 1,
+        "y": 4
+      },
+      {
+        "x": 3,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 1
+      },
+      {
+        "x": 4,
+        "y": -1
+      },
       {
         "x": 3,
         "y": -3
@@ -47209,8 +55915,8 @@
         "y": -4
       }
     ],
-    "width": 3,
-    "height": 1
+    "width": 18,
+    "height": 20
   },
   {
     "id": 1270,
@@ -47555,18 +56261,24 @@
         "x": 7,
         "y": 5
       },
-      "PENUP"
-    ],
-    "width": 17,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -3,
+        "y": 6
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -3,
+        "y": 0
+      },
+      "PENUP",
       {
         "x": -3,
         "y": -4
@@ -47584,8 +56296,8 @@
         "y": 6
       }
     ],
-    "width": 50,
-    "height": 10
+    "width": 17,
+    "height": 13
   },
   {
     "id": 1273,
@@ -47828,20 +56540,18 @@
       {
         "x": -3,
         "y": 3
+      },
+      {
+        "x": -3,
+        "y": 4
+      },
+      {
+        "x": -4,
+        "y": 4
       }
     ],
     "width": 15,
     "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1275,
@@ -48010,18 +56720,27 @@
       {
         "x": 2,
         "y": 7
-      }
-    ],
-    "width": 12,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 10
+      },
+      {
+        "x": -1,
+        "y": 10
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
       {
         "x": -1,
         "y": 8
@@ -48035,8 +56754,8 @@
         "y": 9
       }
     ],
-    "width": 10,
-    "height": 1
+    "width": 12,
+    "height": 17
   },
   {
     "id": 1277,
@@ -48270,18 +56989,27 @@
         "x": 2,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 12,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 6,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -2,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 6
+      },
       {
         "x": 2,
         "y": 6
@@ -48303,8 +57031,8 @@
         "y": 6
       }
     ],
-    "width": 8,
-    "height": 2
+    "width": 12,
+    "height": 17
   },
   {
     "id": 1279,
@@ -48567,20 +57295,14 @@
       {
         "x": -3,
         "y": 5
+      },
+      {
+        "x": 4,
+        "y": 5
       }
     ],
     "width": 13,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1283,
@@ -49721,20 +58443,18 @@
       {
         "x": -2,
         "y": -6
+      },
+      {
+        "x": 3,
+        "y": -6
+      },
+      {
+        "x": 5,
+        "y": -5
       }
     ],
     "width": 17,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1295,
@@ -49863,20 +58583,18 @@
       {
         "x": -2,
         "y": 6
+      },
+      {
+        "x": 3,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 5
       }
     ],
     "width": 17,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 1401,
@@ -50410,18 +59128,27 @@
       {
         "x": 1,
         "y": 3
-      }
-    ],
-    "width": 14,
-    "height": 31
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 12,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 5
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 10
+      },
+      {
+        "x": -2,
+        "y": 12
+      },
       {
         "x": -1,
         "y": 14
@@ -50436,7 +59163,7 @@
       }
     ],
     "width": 14,
-    "height": 2
+    "height": 32
   },
   {
     "id": 1408,
@@ -50562,18 +59289,27 @@
       {
         "x": -1,
         "y": 3
-      }
-    ],
-    "width": 14,
-    "height": 31
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 12,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 5
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 10
+      },
+      {
+        "x": 2,
+        "y": 12
+      },
       {
         "x": 1,
         "y": 14
@@ -50588,7 +59324,7 @@
       }
     ],
     "width": 14,
-    "height": 2
+    "height": 32
   },
   {
     "id": 1409,
@@ -50973,16 +59709,6 @@
     "height": 32
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2001,
     "mappedTo": null,
     "vertexCount": 18,
@@ -51164,18 +59890,24 @@
       {
         "x": 8,
         "y": 5
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 3,
         "y": -2
@@ -51209,8 +59941,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 11
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2003,
@@ -51343,16 +60075,6 @@
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2004,
@@ -51748,18 +60470,24 @@
         "x": -1,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 3,
@@ -51770,8 +60498,8 @@
         "y": 1
       }
     ],
-    "width": 16,
-    "height": 0
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2008,
@@ -52436,18 +61164,24 @@
       {
         "x": -3,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 6,
         "y": 4
@@ -52477,8 +61211,8 @@
         "y": -12
       }
     ],
-    "width": 11,
-    "height": 16
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2016,
@@ -52718,18 +61452,24 @@
       {
         "x": -3,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 6,
         "y": 4
@@ -52833,7 +61573,7 @@
         "y": 12
       }
     ],
-    "width": 11,
+    "width": 22,
     "height": 26
   },
   {
@@ -52951,18 +61691,27 @@
       {
         "x": 2,
         "y": -1
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 7,
+        "y": 8
+      },
+      {
+        "x": 8,
+        "y": 8
+      },
+      {
+        "x": 9,
+        "y": 7
+      },
       "PENUP",
       {
         "x": 2,
@@ -52993,8 +61742,8 @@
         "y": 6
       }
     ],
-    "width": 16,
-    "height": 10
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2019,
@@ -53123,20 +61872,18 @@
       {
         "x": -7,
         "y": 3
+      },
+      {
+        "x": -7,
+        "y": 9
+      },
+      {
+        "x": -6,
+        "y": 6
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2020,
@@ -53816,18 +62563,24 @@
       {
         "x": 8,
         "y": 5
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 3,
         "y": -2
@@ -53861,8 +62614,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 11
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2029,
@@ -54333,18 +63086,24 @@
       {
         "x": -3,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 6,
         "y": 4
@@ -54410,8 +63169,8 @@
         "y": -1
       }
     ],
-    "width": 11,
-    "height": 16
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2035,
@@ -54878,20 +63637,23 @@
       {
         "x": -7,
         "y": 7
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": 8
+      },
+      {
+        "x": 7,
+        "y": 8
       }
     ],
     "width": 22,
     "height": 23
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2041,
@@ -55020,18 +63782,24 @@
       {
         "x": -3,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 6,
         "y": 4
@@ -55061,8 +63829,8 @@
         "y": -12
       }
     ],
-    "width": 11,
-    "height": 16
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2042,
@@ -55503,20 +64271,14 @@
       {
         "x": -3,
         "y": 9
+      },
+      {
+        "x": 4,
+        "y": 9
       }
     ],
     "width": 19,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2047,
@@ -55639,18 +64401,24 @@
       {
         "x": -4,
         "y": 3
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": 4
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
       {
         "x": 7,
         "y": 0
@@ -55690,7 +64458,7 @@
         "y": 9
       }
     ],
-    "width": 8,
+    "width": 21,
     "height": 21
   },
   {
@@ -55884,18 +64652,24 @@
       {
         "x": 6,
         "y": -1
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 9,
+        "y": -6
+      },
+      {
+        "x": 10,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -12
+      },
       {
         "x": 4,
         "y": -12
@@ -55910,7 +64684,7 @@
         "y": 9
       }
     ],
-    "width": -9,
+    "width": 23,
     "height": 21
   },
   {
@@ -56037,18 +64811,27 @@
       {
         "x": 4,
         "y": -11
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -6
+      },
+      {
+        "x": 7,
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
       "PENUP",
       {
         "x": -7,
@@ -56068,8 +64851,8 @@
         "y": 8
       }
     ],
-    "width": 10,
-    "height": 0
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2051,
@@ -56253,18 +65036,24 @@
       {
         "x": 0,
         "y": 9
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 1,
-    "vertices": [
+      },
+      {
+        "x": -12,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 5,
+        "y": -1
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
       {
         "x": 6,
         "y": 3
@@ -56282,8 +65071,8 @@
         "y": 9
       }
     ],
-    "width": 7,
-    "height": 6
+    "width": 24,
+    "height": 21
   },
   {
     "id": 2053,
@@ -56412,20 +65201,18 @@
       {
         "x": -5,
         "y": 7
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2054,
@@ -56824,18 +65611,24 @@
       {
         "x": -5,
         "y": 7
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
       {
         "x": 4,
         "y": 6
@@ -56854,8 +65647,8 @@
         "y": 2
       }
     ],
-    "width": 10,
-    "height": 4
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2058,
@@ -57524,18 +66317,24 @@
       {
         "x": -4,
         "y": 9
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
       {
         "x": 6,
         "y": 0
@@ -57557,8 +66356,8 @@
         "y": -12
       }
     ],
-    "width": 8,
-    "height": 12
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2066,
@@ -57790,18 +66589,24 @@
       {
         "x": -4,
         "y": 9
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
       {
         "x": 6,
         "y": 0
@@ -57893,7 +66698,7 @@
         "y": 12
       }
     ],
-    "width": 8,
+    "width": 22,
     "height": 26
   },
   {
@@ -58014,18 +66819,24 @@
       {
         "x": 8,
         "y": 7
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
       {
         "x": 7,
         "y": 8
@@ -58044,8 +66855,8 @@
         "y": 9
       }
     ],
-    "width": 14,
-    "height": 2
+    "width": 24,
+    "height": 21
   },
   {
     "id": 2069,
@@ -58174,20 +66985,22 @@
       {
         "x": -8,
         "y": 3
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -7,
+        "y": 7
       }
     ],
     "width": 23,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2070,
@@ -58805,18 +67618,24 @@
         "x": -7,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -6,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -6
+      },
       {
         "x": 5,
         "y": -4
@@ -58851,8 +67670,8 @@
         "y": -4
       }
     ],
-    "width": -2,
-    "height": 5
+    "width": 20,
+    "height": 18
   },
   {
     "id": 2101,
@@ -58978,18 +67797,24 @@
       {
         "x": 5,
         "y": 6
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 1
+      },
+      {
+        "x": -4,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
       {
         "x": -4,
         "y": 8
@@ -58999,8 +67824,8 @@
         "y": 9
       }
     ],
-    "width": 11,
-    "height": 1
+    "width": 20,
+    "height": 14
   },
   {
     "id": 2102,
@@ -59120,20 +67945,14 @@
       {
         "x": -9,
         "y": -12
+      },
+      {
+        "x": -5,
+        "y": -12
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2103,
@@ -59369,20 +68188,23 @@
       {
         "x": 2,
         "y": -12
+      },
+      {
+        "x": 6,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 9
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2105,
@@ -59716,18 +68538,24 @@
       {
         "x": 7,
         "y": -5
-      }
-    ],
-    "width": 19,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 3
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
       {
         "x": -6,
         "y": 6
@@ -59818,8 +68646,8 @@
         "y": 9
       }
     ],
-    "width": 9,
-    "height": 10
+    "width": 19,
+    "height": 21
   },
   {
     "id": 2108,
@@ -60339,18 +69167,21 @@
       {
         "x": 11,
         "y": 9
-      }
-    ],
-    "width": 33,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -14,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -14,
+        "y": -5
+      },
+      {
+        "x": -10,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": -14,
+        "y": 9
+      },
       {
         "x": -7,
         "y": 9
@@ -60374,8 +69205,8 @@
         "y": 9
       }
     ],
-    "width": 23,
-    "height": 0
+    "width": 33,
+    "height": 14
   },
   {
     "id": 2114,
@@ -60602,20 +69433,26 @@
       {
         "x": 6,
         "y": 3
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 1,
+        "y": -5
       }
     ],
     "width": 20,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2116,
@@ -60735,20 +69572,23 @@
       {
         "x": -9,
         "y": -5
+      },
+      {
+        "x": -5,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": 16
+      },
+      {
+        "x": -2,
+        "y": 16
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2117,
@@ -60868,20 +69708,14 @@
       {
         "x": 2,
         "y": 16
+      },
+      {
+        "x": 9,
+        "y": 16
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2118,
@@ -61101,16 +69935,6 @@
     ],
     "width": 17,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2120,
@@ -61757,18 +70581,24 @@
       {
         "x": 8,
         "y": 9
-      }
-    ],
-    "width": 23,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -5
+      },
+      {
+        "x": 2,
+        "y": -4
+      },
+      {
+        "x": 3,
+        "y": -2
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 6,
         "y": 8
@@ -61782,8 +70612,8 @@
         "y": 9
       }
     ],
-    "width": 11,
-    "height": 1
+    "width": 23,
+    "height": 14
   },
   {
     "id": 2128,
@@ -61906,18 +70736,24 @@
       {
         "x": 6,
         "y": -7
-      }
-    ],
-    "width": 21,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -5
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -3
+      },
       {
         "x": 2,
         "y": -2
@@ -61996,8 +70832,8 @@
         "y": 9
       }
     ],
-    "width": -1,
-    "height": 12
+    "width": 21,
+    "height": 28
   },
   {
     "id": 2129,
@@ -62233,18 +71069,27 @@
         "x": -4,
         "y": 8
       },
-      "PENUP"
-    ],
-    "width": 19,
-    "height": 22
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 2
+      },
+      {
+        "x": 5,
+        "y": -2
+      },
       {
         "x": 4,
         "y": -4
@@ -62274,8 +71119,8 @@
         "y": -10
       }
     ],
-    "width": 3,
-    "height": 8
+    "width": 19,
+    "height": 22
   },
   {
     "id": 2131,
@@ -62402,16 +71247,6 @@
     ],
     "width": 18,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2132,
@@ -62668,16 +71503,6 @@
     "height": 21
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2134,
     "mappedTo": null,
     "vertexCount": 44,
@@ -62804,18 +71629,24 @@
       {
         "x": 1,
         "y": -5
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -2
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 8,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 8
+      },
       {
         "x": 3,
         "y": 5
@@ -62845,8 +71676,8 @@
         "y": -12
       }
     ],
-    "width": 9,
-    "height": 17
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2135,
@@ -63432,18 +72263,27 @@
       {
         "x": -4,
         "y": 10
-      }
-    ],
-    "width": 17,
-    "height": 22
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 16,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 12
+      },
+      {
+        "x": 2,
+        "y": 13
+      },
+      {
+        "x": 2,
+        "y": 15
+      },
+      {
+        "x": 0,
+        "y": 16
+      },
+      {
+        "x": -2,
+        "y": 16
+      },
       "PENUP",
       {
         "x": 1,
@@ -63474,8 +72314,8 @@
         "y": 12
       }
     ],
-    "width": 18,
-    "height": 10
+    "width": 17,
+    "height": 28
   },
   {
     "id": 2141,
@@ -63605,16 +72445,6 @@
     ],
     "width": 18,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2142,
@@ -63945,20 +72775,19 @@
       {
         "x": 3,
         "y": -4
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 9,
+        "y": -4
       }
     ],
     "width": 21,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2145,
@@ -64271,20 +73100,30 @@
       {
         "x": 6,
         "y": -4
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -2
+      },
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": -2,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 16
       }
     ],
     "width": 22,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 16,
-    "vertices": [],
-    "width": 20,
-    "height": null
   },
   {
     "id": 2148,
@@ -64500,20 +73339,18 @@
       {
         "x": 6,
         "y": 3
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 9,
+        "y": -5
       }
     ],
     "width": 23,
     "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2150,
@@ -64639,18 +73476,27 @@
       {
         "x": 8,
         "y": -1
-      }
-    ],
-    "width": 23,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -1,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -3
+      },
+      {
+        "x": 8,
+        "y": -1
+      },
       "PENUP",
       {
         "x": -1,
@@ -64677,8 +73523,8 @@
         "y": 5
       }
     ],
-    "width": 7,
-    "height": 3
+    "width": 23,
+    "height": 14
   },
   {
     "id": 2151,
@@ -64804,18 +73650,24 @@
       {
         "x": 4,
         "y": 2
-      }
-    ],
-    "width": 21,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -5,
+        "y": -1
+      },
+      {
+        "x": -6,
+        "y": 2
+      },
       {
         "x": -6,
         "y": 6
@@ -64825,8 +73677,8 @@
         "y": 8
       }
     ],
-    "width": 8,
-    "height": 2
+    "width": 21,
+    "height": 14
   },
   {
     "id": 2152,
@@ -64949,20 +73801,23 @@
       {
         "x": 2,
         "y": 8
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": -1,
+        "y": -12
       }
     ],
     "width": 19,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2153,
@@ -65192,18 +74047,24 @@
       {
         "x": 4,
         "y": 2
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -5,
+        "y": -1
+      },
+      {
+        "x": -6,
+        "y": 2
+      },
       {
         "x": -6,
         "y": 6
@@ -65222,8 +74083,8 @@
         "y": -12
       }
     ],
-    "width": 8,
-    "height": 20
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2155,
@@ -65460,20 +74321,19 @@
       {
         "x": -8,
         "y": 15
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -5
+      },
+      {
+        "x": 7,
+        "y": -5
       }
     ],
     "width": 15,
     "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2157,
@@ -65599,18 +74459,24 @@
       {
         "x": -3,
         "y": 9
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 2
+      },
+      "PENUP",
       {
         "x": -1,
         "y": -5
@@ -65636,8 +74502,8 @@
         "y": 8
       }
     ],
-    "width": 50,
-    "height": 13
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2158,
@@ -65993,16 +74859,6 @@
     "height": 28
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2161,
     "mappedTo": null,
     "vertexCount": 34,
@@ -66117,20 +74973,18 @@
         "x": 7,
         "y": 5
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": -1,
+        "y": -12
+      }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2162,
@@ -66323,18 +75177,27 @@
       {
         "x": 0,
         "y": 2
-      }
-    ],
-    "width": 33,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -5
+      },
+      {
+        "x": 8,
+        "y": -5
+      },
+      {
+        "x": 10,
+        "y": -4
+      },
       {
         "x": 11,
         "y": -3
@@ -66393,7 +75256,7 @@
         "y": 5
       }
     ],
-    "width": 6,
+    "width": 33,
     "height": 14
   },
   {
@@ -66517,20 +75380,30 @@
       {
         "x": 3,
         "y": 5
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 7
+      },
+      {
+        "x": 10,
+        "y": 5
       }
     ],
     "width": 23,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": 5,
-    "vertices": [],
-    "width": 15,
-    "height": null
   },
   {
     "id": 2165,
@@ -66662,16 +75535,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2166,
     "mappedTo": null,
     "vertexCount": 42,
@@ -66795,18 +75658,24 @@
       {
         "x": -4,
         "y": 2
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
       {
         "x": 3,
         "y": 8
@@ -66825,8 +75694,8 @@
         "y": 16
       }
     ],
-    "width": 10,
-    "height": 8
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2167,
@@ -66946,20 +75815,14 @@
       {
         "x": -3,
         "y": 16
+      },
+      {
+        "x": 4,
+        "y": 16
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2168,
@@ -67376,20 +76239,30 @@
         "x": 10,
         "y": 5
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": 2
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 9
+      }
     ],
     "width": 23,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 9,
-    "vertices": [],
-    "width": 14,
-    "height": null
   },
   {
     "id": 2172,
@@ -67623,18 +76496,24 @@
       {
         "x": 10,
         "y": 4
-      }
-    ],
-    "width": 29,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 11,
+        "y": 0
+      },
+      {
+        "x": 11,
+        "y": -5
+      },
+      {
+        "x": 10,
+        "y": -5
+      },
+      {
+        "x": 11,
+        "y": -3
+      },
+      "PENUP",
       {
         "x": 3,
         "y": -5
@@ -67652,7 +76531,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 29,
     "height": 14
   },
   {
@@ -67776,18 +76655,27 @@
       {
         "x": 7,
         "y": -2
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": -3
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 6,
+        "y": -5
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
       {
         "x": 2,
         "y": -2
@@ -67809,8 +76697,8 @@
         "y": 9
       }
     ],
-    "width": 0,
-    "height": 11
+    "width": 20,
+    "height": 14
   },
   {
     "id": 2175,
@@ -67936,18 +76824,24 @@
       {
         "x": -8,
         "y": 13
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 12
+      },
+      {
+        "x": -6,
+        "y": 13
+      },
+      {
+        "x": -7,
+        "y": 14
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -5
+      },
       {
         "x": 3,
         "y": 9
@@ -67965,8 +76859,8 @@
         "y": 16
       }
     ],
-    "width": 2,
-    "height": 7
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2176,
@@ -68208,18 +77102,24 @@
       {
         "x": 7,
         "y": -11
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": -5
+      },
+      {
+        "x": 9,
+        "y": -5
+      },
       "PENUP",
       {
         "x": -9,
@@ -68239,8 +77139,8 @@
         "y": 9
       }
     ],
-    "width": 4,
-    "height": 0
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2178,
@@ -68354,20 +77254,14 @@
       {
         "x": 2,
         "y": 9
+      },
+      {
+        "x": 9,
+        "y": 9
       }
     ],
     "width": 22,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2179,
@@ -68481,20 +77375,19 @@
       {
         "x": -2,
         "y": 9
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 9
       }
     ],
     "width": 22,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2180,
@@ -68617,18 +77510,24 @@
       {
         "x": 6,
         "y": -12
-      }
-    ],
-    "width": 33,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -11
+      },
+      {
+        "x": 2,
+        "y": -9
+      },
+      {
+        "x": 1,
+        "y": -6
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 11,
         "y": -5
@@ -68683,8 +77582,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 14
+    "width": 33,
+    "height": 21
   },
   {
     "id": 2181,
@@ -69152,18 +78051,27 @@
       {
         "x": -1,
         "y": 9
-      }
-    ],
-    "width": 19,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": -5
+      },
       {
         "x": 6,
         "y": -9
@@ -69186,8 +78094,8 @@
         "y": -2
       }
     ],
-    "width": 1,
-    "height": 10
+    "width": 19,
+    "height": 21
   },
   {
     "id": 2186,
@@ -69310,18 +78218,24 @@
       {
         "x": -4,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 6
+      },
       {
         "x": 7,
         "y": 3
@@ -69341,18 +78255,27 @@
       {
         "x": 2,
         "y": -5
-      }
-    ],
-    "width": 12,
-    "height": 8
-  },
-  {
-    "id": 2187,
-    "mappedTo": null,
-    "vertexCount": 27,
-    "leftHandPosition": -9,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -50,
+        "y": -32
+      },
+      {
+        "x": -33,
+        "y": -26
+      },
+      {
+        "x": -27,
+        "y": -50
+      },
+      {
+        "x": -32,
+        "y": -27
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
       {
         "x": 2,
         "y": -5
@@ -69455,8 +78378,8 @@
         "y": 13
       }
     ],
-    "width": 18,
-    "height": 18
+    "width": 22,
+    "height": 66
   },
   {
     "id": 2190,
@@ -69585,18 +78508,27 @@
       {
         "x": 3,
         "y": 9
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 5
+      },
+      {
+        "x": 3,
+        "y": 6
+      },
       {
         "x": 2,
         "y": 7
@@ -69627,8 +78559,8 @@
         "y": 8
       }
     ],
-    "width": 9,
-    "height": 13
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2191,
@@ -69757,18 +78689,24 @@
       {
         "x": -14,
         "y": 13
-      }
-    ],
-    "width": 26,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 12,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      {
+        "x": -13,
+        "y": 14
+      },
+      {
+        "x": -14,
+        "y": 15
+      },
+      "PENUP",
+      {
+        "x": 13,
+        "y": -11
+      },
+      {
+        "x": 12,
+        "y": -10
+      },
       {
         "x": 13,
         "y": -9
@@ -69886,20 +78824,14 @@
       {
         "x": -9,
         "y": -5
+      },
+      {
+        "x": 12,
+        "y": -5
       }
     ],
-    "width": 2,
+    "width": 26,
     "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2192,
@@ -70028,18 +78960,24 @@
       {
         "x": -13,
         "y": 13
-      }
-    ],
-    "width": 24,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": -12,
+        "y": 14
+      },
+      {
+        "x": -13,
+        "y": 15
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": 2
+      },
       {
         "x": 4,
         "y": 6
@@ -70095,8 +79033,8 @@
         "y": -5
       }
     ],
-    "width": 7,
-    "height": 14
+    "width": 24,
+    "height": 28
   },
   {
     "id": 2193,
@@ -70222,18 +79160,24 @@
       {
         "x": -14,
         "y": 15
-      }
-    ],
-    "width": 24,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -14,
+        "y": 14
+      },
+      {
+        "x": -13,
+        "y": 13
+      },
+      {
+        "x": -12,
+        "y": 14
+      },
+      {
+        "x": -13,
+        "y": 15
+      },
+      "PENUP",
       {
         "x": 9,
         "y": -12
@@ -70297,8 +79241,8 @@
         "y": -5
       }
     ],
-    "width": 50,
-    "height": 21
+    "width": 24,
+    "height": 28
   },
   {
     "id": 2194,
@@ -70427,18 +79371,24 @@
       {
         "x": -19,
         "y": 13
-      }
-    ],
-    "width": 35,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 13,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      {
+        "x": -18,
+        "y": 14
+      },
+      {
+        "x": -19,
+        "y": 15
+      },
+      "PENUP",
+      {
+        "x": 14,
+        "y": -11
+      },
+      {
+        "x": 13,
+        "y": -10
+      },
       {
         "x": 14,
         "y": -9
@@ -70559,18 +79509,24 @@
       {
         "x": -8,
         "y": 15
-      }
-    ],
-    "width": 3,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 12,
+        "y": -5
+      },
+      {
+        "x": 10,
+        "y": 2
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      {
+        "x": 9,
+        "y": 8
+      },
       {
         "x": 10,
         "y": 9
@@ -70618,8 +79574,8 @@
         "y": -5
       }
     ],
-    "width": 17,
-    "height": 14
+    "width": 35,
+    "height": 28
   },
   {
     "id": 2195,
@@ -70748,18 +79704,24 @@
       {
         "x": -19,
         "y": 13
-      }
-    ],
-    "width": 35,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 11,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      {
+        "x": -18,
+        "y": 14
+      },
+      {
+        "x": -19,
+        "y": 15
+      },
+      "PENUP",
+      {
+        "x": 12,
+        "y": -11
+      },
+      {
+        "x": 11,
+        "y": -10
+      },
       {
         "x": 12,
         "y": -9
@@ -70877,18 +79839,24 @@
       {
         "x": -8,
         "y": 13
-      }
-    ],
-    "width": 1,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 14
+      },
+      {
+        "x": -8,
+        "y": 15
+      },
+      "PENUP",
+      {
+        "x": 14,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": 2
+      },
       {
         "x": 9,
         "y": 6
@@ -70944,8 +79912,8 @@
         "y": -5
       }
     ],
-    "width": 12,
-    "height": 21
+    "width": 35,
+    "height": 28
   },
   {
     "id": 2196,
@@ -71185,18 +80153,27 @@
       {
         "x": 3,
         "y": 8
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -8,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -8
+      },
       {
         "x": 4,
         "y": -10
@@ -71210,8 +80187,8 @@
         "y": -12
       }
     ],
-    "width": -3,
-    "height": 2
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2201,
@@ -71382,18 +80359,27 @@
       {
         "x": -7,
         "y": 7
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
       {
         "x": 7,
         "y": 6
@@ -71424,8 +80410,8 @@
         "y": 4
       }
     ],
-    "width": 13,
-    "height": 5
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2203,
@@ -71551,18 +80537,27 @@
       {
         "x": 2,
         "y": 9
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      {
+        "x": -7,
+        "y": 4
+      },
       {
         "x": -6,
         "y": 3
@@ -71601,8 +80596,8 @@
         "y": 9
       }
     ],
-    "width": 11,
-    "height": 10
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2204,
@@ -71778,18 +80773,21 @@
       {
         "x": 1,
         "y": 9
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": 5,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -11
+      },
       {
         "x": 0,
         "y": -11
@@ -71799,8 +80797,8 @@
         "y": -12
       }
     ],
-    "width": -6,
-    "height": 1
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2206,
@@ -71929,18 +80927,27 @@
       {
         "x": -2,
         "y": -11
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -7
+      },
+      {
+        "x": -6,
+        "y": -3
+      },
+      {
+        "x": -6,
+        "y": 3
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
       {
         "x": -3,
         "y": 8
@@ -71983,8 +80990,8 @@
         "y": -4
       }
     ],
-    "width": 11,
-    "height": 13
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2207,
@@ -72226,119 +81233,128 @@
       {
         "x": -6,
         "y": -1
+      },
+      {
+        "x": -7,
+        "y": 1
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": -1
+      },
+      {
+        "x": 5,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -3
+      },
+      {
+        "x": -4,
+        "y": -2
+      },
+      {
+        "x": -5,
+        "y": -1
+      },
+      {
+        "x": -6,
+        "y": 1
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
+      {
+        "x": -5,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": -1
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -3
       }
     ],
     "width": 20,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 9,
-    "vertices": [
-      {
-        "x": 2,
-        "y": 9
-      },
-      {
-        "x": 5,
-        "y": 8
-      },
-      {
-        "x": 6,
-        "y": 7
-      },
-      {
-        "x": 7,
-        "y": 5
-      },
-      {
-        "x": 7,
-        "y": 1
-      },
-      {
-        "x": 6,
-        "y": -1
-      },
-      {
-        "x": 5,
-        "y": -2
-      },
-      {
-        "x": 2,
-        "y": -3
-      },
-      "PENUP",
-      {
-        "x": -2,
-        "y": -3
-      },
-      {
-        "x": -4,
-        "y": -2
-      },
-      {
-        "x": -5,
-        "y": -1
-      },
-      {
-        "x": -6,
-        "y": 1
-      },
-      {
-        "x": -6,
-        "y": 5
-      },
-      {
-        "x": -5,
-        "y": 7
-      },
-      {
-        "x": -4,
-        "y": 8
-      },
-      {
-        "x": -2,
-        "y": 9
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": 9
-      },
-      {
-        "x": 4,
-        "y": 8
-      },
-      {
-        "x": 5,
-        "y": 7
-      },
-      {
-        "x": 6,
-        "y": 5
-      },
-      {
-        "x": 6,
-        "y": 1
-      },
-      {
-        "x": 5,
-        "y": -1
-      },
-      {
-        "x": 4,
-        "y": -2
-      },
-      {
-        "x": 2,
-        "y": -3
-      }
-    ],
-    "width": 11,
-    "height": 12
+    "height": 21
   },
   {
     "id": 2209,
@@ -72467,18 +81483,27 @@
       {
         "x": -3,
         "y": 0
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": -2
+      },
+      {
+        "x": -6,
+        "y": -5
+      },
+      {
+        "x": -6,
+        "y": -6
+      },
+      {
+        "x": -5,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
       {
         "x": -1,
         "y": -12
@@ -72521,7 +81546,7 @@
         "y": 9
       }
     ],
-    "width": -8,
+    "width": 20,
     "height": 21
   },
   {
@@ -72895,16 +81920,6 @@
     ],
     "width": 18,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2216,
@@ -73483,18 +82498,27 @@
       {
         "x": 1,
         "y": 3
-      }
-    ],
-    "width": 14,
-    "height": 31
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 12,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 5
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 10
+      },
+      {
+        "x": -2,
+        "y": 12
+      },
       {
         "x": -1,
         "y": 14
@@ -73509,7 +82533,7 @@
       }
     ],
     "width": 14,
-    "height": 2
+    "height": 32
   },
   {
     "id": 2226,
@@ -73635,18 +82659,27 @@
       {
         "x": -1,
         "y": 3
-      }
-    ],
-    "width": 14,
-    "height": 31
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 12,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 5
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 10
+      },
+      {
+        "x": 2,
+        "y": 12
+      },
       {
         "x": 1,
         "y": 14
@@ -73661,7 +82694,7 @@
       }
     ],
     "width": 14,
-    "height": 2
+    "height": 32
   },
   {
     "id": 2227,
@@ -75402,18 +84435,24 @@
       {
         "x": -4,
         "y": -1
-      }
-    ],
-    "width": 19,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 9
+      },
       {
         "x": 2,
         "y": 8
@@ -75443,8 +84482,8 @@
         "y": -12
       }
     ],
-    "width": 9,
-    "height": 20
+    "width": 19,
+    "height": 21
   },
   {
     "id": 2266,
@@ -75675,16 +84714,6 @@
     "height": 32
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2269,
     "mappedTo": null,
     "vertexCount": 50,
@@ -75811,18 +84840,24 @@
       {
         "x": -9,
         "y": 15
-      }
-    ],
-    "width": 24,
-    "height": 32
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": -1,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -7
+      },
+      {
+        "x": -4,
+        "y": -6
+      },
+      {
+        "x": -6,
+        "y": -4
+      },
+      {
+        "x": -7,
+        "y": -1
+      },
       {
         "x": -7,
         "y": 1
@@ -75876,8 +84911,8 @@
         "y": -7
       }
     ],
-    "width": 6,
-    "height": 14
+    "width": 24,
+    "height": 32
   },
   {
     "id": 2270,
@@ -76120,16 +85155,6 @@
     "height": 21
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2272,
     "mappedTo": null,
     "vertexCount": 49,
@@ -76259,18 +85284,24 @@
       {
         "x": 5,
         "y": 8
-      }
-    ],
-    "width": 25,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 9
+      },
+      {
+        "x": 10,
+        "y": 8
+      },
+      {
+        "x": 10,
+        "y": 7
+      },
+      "PENUP",
       {
         "x": -5,
         "y": 9
@@ -76317,8 +85348,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 16
+    "width": 25,
+    "height": 21
   },
   {
     "id": 2273,
@@ -76444,18 +85475,27 @@
       {
         "x": 9,
         "y": -8
-      }
-    ],
-    "width": 27,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -10
+      },
+      {
+        "x": 5,
+        "y": -11
+      },
+      {
+        "x": 2,
+        "y": -12
+      },
+      {
+        "x": -1,
+        "y": -12
+      },
+      {
+        "x": -4,
+        "y": -11
+      },
       {
         "x": -6,
         "y": -10
@@ -76530,8 +85570,8 @@
         "y": 4
       }
     ],
-    "width": -7,
-    "height": 19
+    "width": 27,
+    "height": 21
   },
   {
     "id": 2274,
@@ -76654,18 +85694,27 @@
       {
         "x": 7,
         "y": 2
-      }
-    ],
-    "width": 20,
-    "height": 29
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
       {
         "x": -7,
         "y": 6
@@ -76687,8 +85736,8 @@
         "y": 6
       }
     ],
-    "width": 13,
-    "height": 2
+    "width": 20,
+    "height": 29
   },
   {
     "id": 2275,
@@ -76857,18 +85906,27 @@
         "x": 3,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 16,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 13,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": 4
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 11
+      },
+      {
+        "x": 4,
+        "y": 13
+      },
       {
         "x": 3,
         "y": 15
@@ -76906,8 +85964,8 @@
         "y": 13
       }
     ],
-    "width": 17,
-    "height": 5
+    "width": 16,
+    "height": 28
   },
   {
     "id": 2277,
@@ -77136,18 +86194,21 @@
       {
         "x": -6,
         "y": -5
-      }
-    ],
-    "width": 16,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": -5
+      },
+      {
+        "x": 6,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -5
+      },
       {
         "x": 4,
         "y": -4
@@ -77216,8 +86277,8 @@
         "y": 9
       }
     ],
-    "width": -3,
-    "height": 16
+    "width": 16,
+    "height": 28
   },
   {
     "id": 2279,
@@ -77392,25 +86453,31 @@
       {
         "x": 0,
         "y": -3
-      }
-    ],
-    "width": 27,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": -2
+      },
       {
         "x": 0,
         "y": -2
       }
     ],
-    "width": -1,
-    "height": 0
+    "width": 27,
+    "height": 21
   },
   {
     "id": 2282,
@@ -77530,18 +86597,24 @@
       {
         "x": 6,
         "y": -4
-      }
-    ],
-    "width": 17,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -6
+      },
+      {
+        "x": 4,
+        "y": -7
+      },
+      {
+        "x": 2,
+        "y": -8
+      },
+      {
+        "x": -1,
+        "y": -8
+      },
+      "PENUP",
       {
         "x": 0,
         "y": 3
@@ -77569,8 +86642,8 @@
         "y": 6
       }
     ],
-    "width": 50,
-    "height": 6
+    "width": 17,
+    "height": 21
   },
   {
     "id": 2283,
@@ -78256,18 +87329,27 @@
       {
         "x": -1,
         "y": 3
-      }
-    ],
-    "width": 19,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 1,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 1,
+        "y": 4
+      },
+      {
+        "x": 2,
+        "y": 3
+      },
+      {
+        "x": 2,
+        "y": 2
+      },
+      {
+        "x": 1,
+        "y": 1
+      },
       {
         "x": 0,
         "y": 1
@@ -78294,8 +87376,8 @@
         "y": 2
       }
     ],
-    "width": 2,
-    "height": 2
+    "width": 19,
+    "height": 21
   },
   {
     "id": 2289,
@@ -78412,20 +87494,27 @@
       {
         "x": 7,
         "y": -12
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 5
       }
     ],
     "width": 23,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 5,
-    "vertices": [],
-    "width": 10,
-    "height": null
   },
   {
     "id": 2290,
@@ -78928,18 +88017,27 @@
       {
         "x": 7,
         "y": 10
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      {
+        "x": 9,
+        "y": 9
+      },
+      {
+        "x": 10,
+        "y": 7
+      },
+      {
+        "x": 10,
+        "y": 6
+      },
+      {
+        "x": 9,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 3
+      },
       {
         "x": 6,
         "y": 3
@@ -78982,8 +88080,8 @@
         "y": -5
       }
     ],
-    "width": 10,
-    "height": 14
+    "width": 24,
+    "height": 21
   },
   {
     "id": 2295,
@@ -79115,18 +88213,27 @@
       {
         "x": 7,
         "y": -11
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 9,
+        "y": -10
+      },
+      {
+        "x": 10,
+        "y": -8
+      },
+      {
+        "x": 10,
+        "y": -7
+      },
+      {
+        "x": 9,
+        "y": -5
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
       {
         "x": 6,
         "y": -4
@@ -79169,8 +88276,8 @@
         "y": 4
       }
     ],
-    "width": 3,
-    "height": 14
+    "width": 24,
+    "height": 21
   },
   {
     "id": 2301,
@@ -79293,18 +88400,27 @@
         "x": 0,
         "y": -2
       },
-      "PENUP"
-    ],
-    "width": 25,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -8,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 10,
+        "y": -8
+      },
+      {
+        "x": 8,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
+      {
+        "x": 4,
+        "y": -9
+      },
+      {
+        "x": 3,
+        "y": -8
+      },
       {
         "x": 2,
         "y": -6
@@ -79318,8 +88434,8 @@
         "y": 9
       }
     ],
-    "width": -5,
-    "height": 15
+    "width": 25,
+    "height": 20
   },
   {
     "id": 2302,
@@ -79445,18 +88561,27 @@
       {
         "x": 1,
         "y": 9
-      }
-    ],
-    "width": 24,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -1,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 4
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": -1
+      },
       {
         "x": 4,
         "y": -2
@@ -79508,8 +88633,8 @@
         "y": -2
       }
     ],
-    "width": 4,
-    "height": 10
+    "width": 24,
+    "height": 20
   },
   {
     "id": 2303,
@@ -79744,18 +88869,27 @@
       {
         "x": 6,
         "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": 1,
+        "y": 3
+      },
+      {
+        "x": 2,
+        "y": 5
+      },
       {
         "x": -9,
         "y": 5
@@ -79795,8 +88929,8 @@
         "y": 6
       }
     ],
-    "width": 7,
-    "height": 8
+    "width": 24,
+    "height": 15
   },
   {
     "id": 2305,
@@ -79928,18 +89062,24 @@
       {
         "x": 7,
         "y": 8
-      }
-    ],
-    "width": 23,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": 1
+      },
+      {
+        "x": -7,
+        "y": -2
+      },
+      {
+        "x": -8,
+        "y": -4
+      },
       {
         "x": -8,
         "y": -7
@@ -79982,8 +89122,8 @@
         "y": 3
       }
     ],
-    "width": 4,
-    "height": 14
+    "width": 23,
+    "height": 20
   },
   {
     "id": 2306,
@@ -80097,18 +89237,27 @@
       {
         "x": 10,
         "y": -5
-      }
-    ],
-    "width": 24,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 10,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": 1
+      },
+      {
+        "x": 8,
+        "y": 3
+      },
+      {
+        "x": 6,
+        "y": 5
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
       {
         "x": -2,
         "y": 9
@@ -80151,8 +89300,8 @@
         "y": 9
       }
     ],
-    "width": 10,
-    "height": 18
+    "width": 24,
+    "height": 19
   },
   {
     "id": 2307,
@@ -80278,18 +89427,24 @@
       {
         "x": 6,
         "y": -3
-      }
-    ],
-    "width": 24,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 3,
+        "y": 2
+      },
+      {
+        "x": 9,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": 6
+      },
       {
         "x": 7,
         "y": 6
@@ -80304,8 +89459,8 @@
         "y": 7
       }
     ],
-    "width": 13,
-    "height": 1
+    "width": 24,
+    "height": 18
   },
   {
     "id": 2308,
@@ -80525,20 +89680,14 @@
       {
         "x": -2,
         "y": 4
+      },
+      {
+        "x": -1,
+        "y": 7
       }
     ],
     "width": 22,
     "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2310,
@@ -80664,20 +89813,14 @@
       {
         "x": 5,
         "y": 7
+      },
+      {
+        "x": 3,
+        "y": 8
       }
     ],
     "width": 24,
     "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2311,
@@ -80791,20 +89934,23 @@
       {
         "x": 7,
         "y": 2
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": 3
+      },
+      {
+        "x": 9,
+        "y": 0
       }
     ],
     "width": 24,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2312,
@@ -80924,18 +90070,24 @@
       {
         "x": 5,
         "y": 6
-      }
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -6,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -10
+      },
+      {
+        "x": 4,
+        "y": -8
+      },
+      {
+        "x": 2,
+        "y": -6
+      },
       {
         "x": 1,
         "y": -3
@@ -80975,8 +90127,8 @@
         "y": -1
       }
     ],
-    "width": -4,
-    "height": 10
+    "width": 24,
+    "height": 17
   },
   {
     "id": 2317,
@@ -81288,20 +90440,23 @@
       {
         "x": 1,
         "y": 4
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 0
       }
     ],
     "width": 20,
     "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2321,
@@ -81418,20 +90573,23 @@
       {
         "x": 1,
         "y": 4
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 0
       }
     ],
     "width": 20,
     "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2322,
@@ -81545,20 +90703,18 @@
         "x": 5,
         "y": 0
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 2
+      }
     ],
     "width": 17,
     "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2323,
@@ -82026,18 +91182,27 @@
       {
         "x": -4,
         "y": 4
-      }
-    ],
-    "width": 16,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": -5,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -2,
+        "y": 3
+      },
       "PENUP",
       {
         "x": 3,
@@ -82075,8 +91240,8 @@
         "y": 6
       }
     ],
-    "width": 5,
-    "height": 4
+    "width": 16,
+    "height": 14
   },
   {
     "id": 2329,
@@ -82304,18 +91469,27 @@
       {
         "x": -10,
         "y": -13
-      }
-    ],
-    "width": 29,
-    "height": 61
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -13,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -12,
+        "y": -10
+      },
+      {
+        "x": -13,
+        "y": -8
+      },
+      {
+        "x": -14,
+        "y": -4
+      },
+      {
+        "x": -14,
+        "y": 0
+      },
+      {
+        "x": -13,
+        "y": 4
+      },
       {
         "x": -11,
         "y": 7
@@ -82433,18 +91607,27 @@
       {
         "x": -9,
         "y": -12
-      }
-    ],
-    "width": 17,
-    "height": 42
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -12,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -11,
+        "y": -9
+      },
+      {
+        "x": -12,
+        "y": -7
+      },
+      {
+        "x": -13,
+        "y": -4
+      },
+      {
+        "x": -13,
+        "y": 0
+      },
+      {
+        "x": -12,
+        "y": 4
+      },
       {
         "x": -11,
         "y": 6
@@ -82495,370 +91678,423 @@
         "y": -10
       }
     ],
-    "width": 16,
-    "height": 20
+    "width": 29,
+    "height": 61
   },
   {
     "id": 2331,
     "mappedTo": null,
-    "vertexCount": 103,
-    "leftHandPosition": -13,
-    "rightHandPosition": 20,
+    "vertexCount": 10,
+    "leftHandPosition": -31,
+    "rightHandPosition": -13,
     "vertices": [
       {
-        "x": -4,
-        "y": 1
-      },
-      {
-        "x": -3,
-        "y": 3
-      },
-      {
-        "x": -1,
-        "y": 4
+        "x": 20,
+        "y": -4
       },
       {
         "x": 1,
-        "y": 4
+        "y": -3
       },
       {
         "x": 3,
-        "y": 3
-      },
-      {
-        "x": 4,
-        "y": 1
-      },
-      {
-        "x": 4,
         "y": -1
       },
       {
-        "x": 3,
-        "y": -3
-      },
-      {
-        "x": 1,
-        "y": -4
-      },
-      {
-        "x": -1,
-        "y": -4
-      },
-      {
-        "x": -3,
-        "y": -3
-      },
-      {
-        "x": -4,
-        "y": -2
-      },
-      {
-        "x": -5,
+        "x": 4,
         "y": 1
       },
       {
-        "x": -5,
+        "x": 4,
+        "y": 3
+      },
+      {
+        "x": 3,
         "y": 4
       },
       {
+        "x": 1,
+        "y": 4
+      },
+      {
+        "x": -1,
+        "y": 3
+      },
+      {
+        "x": -3,
+        "y": 1
+      },
+      {
         "x": -4,
-        "y": 7
+        "y": -1
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -3,
+        "y": -4
       },
       {
         "x": -2,
-        "y": 9
-      },
-      {
-        "x": 1,
-        "y": 10
-      },
-      {
-        "x": 4,
-        "y": 10
-      },
-      {
-        "x": 7,
-        "y": 9
-      },
-      {
-        "x": 9,
-        "y": 7
-      },
-      {
-        "x": 10,
-        "y": 5
-      },
-      {
-        "x": 11,
-        "y": 2
-      },
-      {
-        "x": 11,
-        "y": -2
-      },
-      {
-        "x": 10,
         "y": -5
       },
       {
-        "x": 8,
-        "y": -8
+        "x": 1,
+        "y": -5
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": 1
+      },
+      {
+        "x": 10,
+        "y": 4
+      },
+      {
+        "x": 10,
+        "y": 7
+      },
+      {
+        "x": 9,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 10
+      },
+      {
+        "x": 5,
+        "y": 11
+      },
+      {
+        "x": 2,
+        "y": 11
+      },
+      {
+        "x": -2,
+        "y": 10
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -9,
+        "y": 3
+      },
+      {
+        "x": -10,
+        "y": 0
+      },
+      {
+        "x": -10,
+        "y": -3
+      },
+      {
+        "x": -9,
+        "y": -5
+      },
+      {
+        "x": -8,
+        "y": -7
+      },
+      {
+        "x": -6,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -10
+      },
+      {
+        "x": 1,
+        "y": -10
       },
       {
         "x": 6,
         "y": -9
       },
       {
-        "x": 3,
-        "y": -10
-      },
-      {
-        "x": 0,
-        "y": -10
-      },
-      {
-        "x": -3,
-        "y": -9
-      },
-      {
-        "x": -5,
-        "y": -8
-      },
-      {
-        "x": -7,
-        "y": -6
-      }
-    ],
-    "width": 33,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 15,
-    "vertices": [
-      {
-        "x": -5,
-        "y": 17
-      },
-      {
-        "x": -2,
-        "y": 19
-      },
-      {
-        "x": 2,
-        "y": 20
-      },
-      {
-        "x": 7,
-        "y": 20
-      },
-      {
         "x": 11,
-        "y": 19
+        "y": -7
       },
       {
-        "x": 14,
-        "y": 17
+        "x": 15,
+        "y": -5
       },
       {
-        "x": 16,
-        "y": 15
-      },
-      "PENUP",
-      {
-        "x": -7,
-        "y": -6
+        "x": 17,
+        "y": -2
       },
       {
-        "x": -8,
-        "y": -4
+        "x": 19,
+        "y": 2
       },
       {
-        "x": -9,
-        "y": 0
+        "x": 20,
+        "y": 7
       },
       {
-        "x": -9,
-        "y": 6
+        "x": 20,
+        "y": 11
       },
       {
-        "x": -8,
-        "y": 10
-      },
-      {
-        "x": -6,
+        "x": 19,
         "y": 14
       },
       {
-        "x": -4,
+        "x": 17,
         "y": 16
       },
       {
+        "x": 15,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": -6,
+        "y": -8
+      },
+      {
+        "x": -4,
+        "y": -9
+      },
+      {
+        "x": 0,
+        "y": -9
+      },
+      {
+        "x": 6,
+        "y": -8
+      },
+      {
+        "x": 10,
+        "y": -6
+      },
+      {
+        "x": 14,
+        "y": -4
+      },
+      {
+        "x": 16,
+        "y": -1
+      },
+      {
+        "x": 18,
+        "y": 3
+      },
+      {
+        "x": 19,
+        "y": 7
+      },
+      {
+        "x": 19,
+        "y": 11
+      },
+      {
+        "x": 18,
+        "y": 13
+      },
+      {
+        "x": 17,
+        "y": 16
+      },
+      {
+        "x": 15,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": -3,
+        "y": 2
+      },
+      {
+        "x": -3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": -2,
+        "y": 3
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
         "x": -1,
-        "y": 18
+        "y": 4
+      },
+      {
+        "x": -1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 0,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": 1,
+        "y": 4
+      },
+      {
+        "x": 1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": 2,
+        "y": 3
+      },
+      {
+        "x": 2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -2
       },
       {
         "x": 3,
-        "y": 19
+        "y": 2
       },
       {
-        "x": 7,
-        "y": 19
+        "x": 3,
+        "y": -50
       },
       {
-        "x": 11,
-        "y": 18
+        "x": 0,
+        "y": 15
       },
       {
-        "x": 13,
+        "x": -6,
+        "y": 15
+      },
+      {
+        "x": -4,
         "y": 17
       },
       {
-        "x": 16,
+        "x": -4,
+        "y": 17
+      },
+      {
+        "x": -6,
         "y": 15
       },
-      "PENUP",
       {
-        "x": -2,
-        "y": -3
+        "x": -6,
+        "y": 0
       },
       {
-        "x": 2,
-        "y": -3
-      },
-      "PENUP",
-      {
-        "x": -3,
-        "y": -2
+        "x": 16,
+        "y": -6
       },
       {
-        "x": 3,
-        "y": -2
+        "x": 16,
+        "y": -4
       },
-      "PENUP",
       {
-        "x": -4,
-        "y": -1
+        "x": 0,
+        "y": 15
+      },
+      {
+        "x": -5,
+        "y": 17
+      },
+      {
+        "x": -5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 15
       },
       {
         "x": 4,
-        "y": -1
-      },
-      "PENUP"
-    ],
-    "width": 22,
-    "height": 26
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 1,
-    "vertices": [
-      "PENUP",
-      {
-        "x": -3,
-        "y": 2
+        "y": 15
       },
       {
-        "x": 3,
-        "y": 2
-      },
-      "PENUP",
-      {
-        "x": -2,
-        "y": 3
+        "x": 6,
+        "y": 17
       },
       {
-        "x": 2,
-        "y": 3
-      },
-      "PENUP",
-      {
-        "x": 15,
-        "y": -6
+        "x": 6,
+        "y": 17
       },
       {
-        "x": 15,
-        "y": -4
+        "x": 4,
+        "y": 15
       },
       {
-        "x": 17,
-        "y": -4
+        "x": 4,
+        "y": -50
       },
       {
-        "x": 17,
-        "y": -6
+        "x": 0,
+        "y": 16
       },
       {
-        "x": 15,
-        "y": -6
-      },
-      "PENUP",
-      {
-        "x": 16,
-        "y": -6
+        "x": 4,
+        "y": 16
       },
       {
-        "x": 16,
-        "y": -4
-      },
-      "PENUP",
-      {
-        "x": 15,
-        "y": -5
+        "x": 6,
+        "y": -50
       },
       {
-        "x": 17,
-        "y": -5
-      },
-      "PENUP",
-      {
-        "x": 15,
-        "y": 4
+        "x": 0,
+        "y": 15
       },
       {
-        "x": 15,
-        "y": 6
-      },
-      {
-        "x": 17,
-        "y": 6
-      },
-      {
-        "x": 17,
-        "y": 4
-      },
-      {
-        "x": 15,
-        "y": 4
-      },
-      "PENUP",
-      {
-        "x": 16,
-        "y": 4
-      },
-      {
-        "x": 16,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": 15,
-        "y": 5
-      },
-      {
-        "x": 17,
-        "y": 5
+        "x": 5,
+        "y": 17
       }
     ],
-    "width": 5,
-    "height": 12
+    "width": 18,
+    "height": 67
   },
   {
     "id": 2332,
@@ -83285,16 +92521,6 @@
     "height": 10
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2371,
     "mappedTo": null,
     "vertexCount": 36,
@@ -83409,20 +92635,23 @@
       {
         "x": 1,
         "y": 4
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 0
       }
     ],
     "width": 20,
     "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2372,
@@ -83536,20 +92765,18 @@
         "x": 5,
         "y": 0
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 2
+      }
     ],
     "width": 17,
     "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2373,
@@ -84023,20 +93250,23 @@
       {
         "x": 0,
         "y": 15
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": -4,
+        "y": 11
       }
     ],
     "width": 16,
     "height": 30
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2379,
@@ -84264,18 +93494,27 @@
       {
         "x": -10,
         "y": -13
-      }
-    ],
-    "width": 29,
-    "height": 61
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -13,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -12,
+        "y": -10
+      },
+      {
+        "x": -13,
+        "y": -8
+      },
+      {
+        "x": -14,
+        "y": -4
+      },
+      {
+        "x": -14,
+        "y": 0
+      },
+      {
+        "x": -13,
+        "y": 4
+      },
       {
         "x": -11,
         "y": 7
@@ -84393,18 +93632,27 @@
       {
         "x": -9,
         "y": -12
-      }
-    ],
-    "width": 17,
-    "height": 42
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -12,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -11,
+        "y": -9
+      },
+      {
+        "x": -12,
+        "y": -7
+      },
+      {
+        "x": -13,
+        "y": -4
+      },
+      {
+        "x": -13,
+        "y": 0
+      },
+      {
+        "x": -12,
+        "y": 4
+      },
       {
         "x": -11,
         "y": 6
@@ -84455,8 +93703,8 @@
         "y": -10
       }
     ],
-    "width": 16,
-    "height": 20
+    "width": 29,
+    "height": 61
   },
   {
     "id": 2381,
@@ -84585,18 +93833,27 @@
         "x": -5,
         "y": 25
       },
-      "PENUP"
-    ],
-    "width": 33,
-    "height": 35
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 14,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 5,
+        "y": -10
+      },
+      {
+        "x": 8,
+        "y": -9
+      },
+      {
+        "x": 11,
+        "y": -7
+      },
+      {
+        "x": 13,
+        "y": -4
+      },
+      {
+        "x": 14,
+        "y": 0
+      },
       {
         "x": 14,
         "y": 5
@@ -84696,18 +93953,24 @@
       {
         "x": 19,
         "y": -4
-      }
-    ],
-    "width": 14,
-    "height": 29
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 20,
-    "rightHandPosition": -6,
-    "vertices": [
+      },
+      {
+        "x": 21,
+        "y": -4
+      },
+      {
+        "x": 21,
+        "y": -6
+      },
+      {
+        "x": 19,
+        "y": -6
+      },
+      "PENUP",
+      {
+        "x": 20,
+        "y": -6
+      },
       {
         "x": 20,
         "y": -4
@@ -84761,8 +94024,8 @@
         "y": 5
       }
     ],
-    "width": 14,
-    "height": 11
+    "width": 33,
+    "height": 35
   },
   {
     "id": 2382,
@@ -84885,18 +94148,27 @@
       {
         "x": -3,
         "y": 1
-      }
-    ],
-    "width": 28,
-    "height": 40
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": 1,
+        "y": 4
+      },
+      {
+        "x": 3,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
       {
         "x": 7,
         "y": 4
@@ -85008,18 +94280,24 @@
       {
         "x": -2,
         "y": -1
-      }
-    ],
-    "width": 8,
-    "height": 39
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 0
+      },
+      {
+        "x": -2,
+        "y": 1
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      "PENUP",
       {
         "x": 7,
         "y": 4
@@ -85063,8 +94341,8 @@
         "y": 15
       }
     ],
-    "width": 50,
-    "height": 15
+    "width": 28,
+    "height": 40
   },
   {
     "id": 2401,
@@ -85690,18 +94968,24 @@
       {
         "x": -2,
         "y": 26
-      }
-    ],
-    "width": 18,
-    "height": 65
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": 30
+      },
+      {
+        "x": -1,
+        "y": 34
+      },
+      {
+        "x": 1,
+        "y": 37
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 2
+      },
       {
         "x": 2,
         "y": 5
@@ -85747,8 +95031,8 @@
         "y": 39
       }
     ],
-    "width": 2,
-    "height": 34
+    "width": 18,
+    "height": 78
   },
   {
     "id": 2408,
@@ -85877,18 +95161,24 @@
       {
         "x": 2,
         "y": 26
-      }
-    ],
-    "width": 18,
-    "height": 65
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": 30
+      },
+      {
+        "x": 1,
+        "y": 34
+      },
+      {
+        "x": -1,
+        "y": 37
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 2
+      },
       {
         "x": -2,
         "y": 5
@@ -85934,8 +95224,8 @@
         "y": 39
       }
     ],
-    "width": 2,
-    "height": 34
+    "width": 18,
+    "height": 78
   },
   {
     "id": 2409,
@@ -86070,16 +95360,6 @@
     "height": 72
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2410,
     "mappedTo": null,
     "vertexCount": 32,
@@ -86210,16 +95490,6 @@
     ],
     "width": 18,
     "height": 72
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2411,
@@ -86396,18 +95666,27 @@
       {
         "x": 3,
         "y": -36
-      }
-    ],
-    "width": 30,
-    "height": 75
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 31,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": -33
+      },
+      {
+        "x": 1,
+        "y": -24
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 0,
+        "y": 24
+      },
+      {
+        "x": -1,
+        "y": 31
+      },
       {
         "x": -2,
         "y": 34
@@ -86486,18 +95765,8 @@
         "y": 34
       }
     ],
-    "width": 32,
-    "height": 6
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 30,
+    "height": 78
   },
   {
     "id": 2501,
@@ -86689,18 +95958,24 @@
       {
         "x": 6,
         "y": 7
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": -1,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -1
+      },
       {
         "x": 2,
         "y": -1
@@ -86730,8 +96005,8 @@
         "y": 8
       }
     ],
-    "width": 4,
-    "height": 9
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2503,
@@ -86860,25 +96135,34 @@
       {
         "x": -3,
         "y": 7
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 6
+      },
+      {
+        "x": 7,
+        "y": 4
+      },
       {
         "x": 8,
         "y": 4
       }
     ],
-    "width": 11,
-    "height": 0
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2504,
@@ -87005,16 +96289,6 @@
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2505,
@@ -87313,18 +96587,27 @@
       {
         "x": -6,
         "y": -4
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 1
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
       {
         "x": 3,
         "y": 8
@@ -87354,8 +96637,8 @@
         "y": 0
       }
     ],
-    "width": 9,
-    "height": 8
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2508,
@@ -87980,18 +97263,27 @@
       {
         "x": 1,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -7
+      },
       {
         "x": 4,
         "y": -10
@@ -88005,8 +97297,8 @@
         "y": -11
       }
     ],
-    "width": -1,
-    "height": 1
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2516,
@@ -88241,18 +97533,27 @@
       {
         "x": 1,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -7
+      },
       {
         "x": 4,
         "y": -10
@@ -88292,8 +97593,8 @@
         "y": 11
       }
     ],
-    "width": -1,
-    "height": 22
+    "width": 22,
+    "height": 23
   },
   {
     "id": 2518,
@@ -88410,20 +97711,18 @@
         "x": 7,
         "y": 9
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 1,
+        "y": -1
+      },
+      {
+        "x": 7,
+        "y": 9
+      }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2519,
@@ -88552,18 +97851,27 @@
       {
         "x": -5,
         "y": -5
-      }
-    ],
-    "width": 20,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -1
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": 3
+      },
       {
         "x": 7,
         "y": 6
@@ -88589,8 +97897,8 @@
         "y": 6
       }
     ],
-    "width": 10,
-    "height": 3
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2520,
@@ -89215,25 +98523,34 @@
       {
         "x": -7,
         "y": 0
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 2
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
       {
         "x": 6,
         "y": 8
       }
     ],
-    "width": 13,
-    "height": 0
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2552,
@@ -89359,18 +98676,27 @@
       {
         "x": -5,
         "y": -10
-      }
-    ],
-    "width": 24,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": 0,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -12
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
+      {
+        "x": 9,
+        "y": -9
+      },
       {
         "x": 9,
         "y": -7
@@ -89485,20 +98811,18 @@
       {
         "x": 6,
         "y": 4
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 3,
+        "y": 9
       }
     ],
-    "width": 0,
+    "width": 24,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2553,
@@ -89627,18 +98951,27 @@
         "x": 0,
         "y": 3
       },
-      "PENUP"
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -1,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 3,
+        "y": -11
+      },
+      {
+        "x": 0,
+        "y": -8
+      },
+      {
+        "x": -2,
+        "y": -5
+      },
+      {
+        "x": -4,
+        "y": -1
+      },
       {
         "x": -5,
         "y": 3
@@ -89656,8 +98989,8 @@
         "y": 9
       }
     ],
-    "width": 3,
-    "height": 6
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2554,
@@ -89786,18 +99119,27 @@
       {
         "x": 7,
         "y": -9
-      }
-    ],
-    "width": 23,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -11
+      },
+      {
+        "x": 3,
+        "y": -12
+      },
+      {
+        "x": -2,
+        "y": -12
+      },
+      {
+        "x": -5,
+        "y": -11
+      },
+      {
+        "x": -7,
+        "y": -9
+      },
       {
         "x": -8,
         "y": -7
@@ -89823,8 +99165,8 @@
         "y": -7
       }
     ],
-    "width": -2,
-    "height": 3
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2555,
@@ -89950,18 +99292,27 @@
       {
         "x": -5,
         "y": 8
-      }
-    ],
-    "width": 19,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 4
+      },
       {
         "x": 6,
         "y": 2
@@ -90008,8 +99359,8 @@
         "y": 8
       }
     ],
-    "width": 10,
-    "height": 11
+    "width": 19,
+    "height": 21
   },
   {
     "id": 2556,
@@ -90138,18 +99489,24 @@
       {
         "x": -9,
         "y": 5
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -9,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -12
+      },
+      {
+        "x": 5,
+        "y": -11
+      },
       {
         "x": 6,
         "y": -11
@@ -90184,8 +99541,8 @@
         "y": 2
       }
     ],
-    "width": -6,
-    "height": 13
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2557,
@@ -90314,18 +99671,24 @@
       {
         "x": -1,
         "y": 0
-      }
-    ],
-    "width": 22,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -3
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
       {
         "x": 3,
         "y": 7
@@ -90388,8 +99751,8 @@
         "y": 9
       }
     ],
-    "width": 10,
-    "height": 8
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2558,
@@ -90515,18 +99878,27 @@
       {
         "x": 9,
         "y": -6
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      {
+        "x": 11,
+        "y": -8
+      },
+      {
+        "x": 12,
+        "y": -10
+      },
+      {
+        "x": 12,
+        "y": -11
+      },
+      {
+        "x": 11,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": -12
+      },
       {
         "x": 8,
         "y": -11
@@ -90597,7 +99969,7 @@
         "y": 9
       }
     ],
-    "width": -2,
+    "width": 24,
     "height": 21
   },
   {
@@ -90727,20 +100099,14 @@
       {
         "x": -7,
         "y": 6
+      },
+      {
+        "x": -8,
+        "y": 7
       }
     ],
     "width": 16,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2560,
@@ -90869,20 +100235,18 @@
       {
         "x": -3,
         "y": 5
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 4,
+        "y": 3
       }
     ],
     "width": 17,
     "height": 25
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2561,
@@ -91005,18 +100369,27 @@
         "x": -2,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 12,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 11,
+        "y": -11
+      },
+      {
+        "x": 10,
+        "y": -10
+      },
+      {
+        "x": 11,
+        "y": -9
+      },
+      {
+        "x": 12,
+        "y": -10
+      },
+      {
+        "x": 12,
+        "y": -11
+      },
       {
         "x": 11,
         "y": -12
@@ -91100,7 +100473,7 @@
         "y": 6
       }
     ],
-    "width": 1,
+    "width": 24,
     "height": 21
   },
   {
@@ -91230,18 +100603,27 @@
       {
         "x": -10,
         "y": 6
-      }
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -9,
+        "y": 5
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
       {
         "x": 3,
         "y": 9
@@ -91255,8 +100637,8 @@
         "y": 6
       }
     ],
-    "width": 9,
-    "height": 3
+    "width": 18,
+    "height": 21
   },
   {
     "id": 2563,
@@ -91379,18 +100761,24 @@
       {
         "x": -2,
         "y": 9
-      }
-    ],
-    "width": 28,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 9,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 6,
+        "y": -1
+      },
+      {
+        "x": 5,
+        "y": 4
+      },
       {
         "x": 5,
         "y": 8
@@ -91437,7 +100825,7 @@
         "y": 9
       }
     ],
-    "width": 9,
+    "width": 28,
     "height": 21
   },
   {
@@ -91561,25 +100949,34 @@
       {
         "x": 12,
         "y": -12
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 10,
+        "y": -11
+      },
+      {
+        "x": 8,
+        "y": -8
+      },
+      {
+        "x": 7,
+        "y": -6
+      },
+      {
+        "x": 5,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
       {
         "x": 2,
         "y": 9
       }
     ],
-    "width": 8,
-    "height": 0
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2565,
@@ -91708,20 +101105,18 @@
       {
         "x": -6,
         "y": 4
+      },
+      {
+        "x": -5,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 9
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2566,
@@ -91847,18 +101242,27 @@
       {
         "x": -5,
         "y": -10
-      }
-    ],
-    "width": 23,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": 0,
+        "y": -12
+      },
+      {
+        "x": 4,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
+      {
+        "x": 8,
+        "y": -10
+      },
       {
         "x": 9,
         "y": -8
@@ -91921,8 +101325,8 @@
         "y": -1
       }
     ],
-    "width": -2,
-    "height": 11
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2567,
@@ -92054,18 +101458,24 @@
       {
         "x": 6,
         "y": 8
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -11
+      },
+      {
+        "x": 7,
+        "y": -9
+      },
       {
         "x": 7,
         "y": -5
@@ -92091,8 +101501,8 @@
         "y": 9
       }
     ],
-    "width": -2,
-    "height": 14
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2568,
@@ -92218,18 +101628,27 @@
       {
         "x": -5,
         "y": -10
-      }
-    ],
-    "width": 24,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": 0,
+        "y": -12
+      },
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
+      {
+        "x": 9,
+        "y": -9
+      },
       {
         "x": 9,
         "y": -7
@@ -92334,7 +101753,7 @@
         "y": 6
       }
     ],
-    "width": 0,
+    "width": 24,
     "height": 21
   },
   {
@@ -92464,20 +101883,26 @@
       {
         "x": -10,
         "y": 6
+      },
+      {
+        "x": -10,
+        "y": 5
+      },
+      {
+        "x": -9,
+        "y": 4
+      },
+      {
+        "x": -8,
+        "y": 5
+      },
+      {
+        "x": -9,
+        "y": 6
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2570,
@@ -92606,25 +102031,31 @@
       {
         "x": -7,
         "y": 5
-      }
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
       {
         "x": 8,
         "y": -11
       }
     ],
-    "width": -4,
-    "height": 0
+    "width": 18,
+    "height": 21
   },
   {
     "id": 2571,
@@ -92750,18 +102181,24 @@
       {
         "x": 8,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": 10,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 9,
+        "y": -12
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 4,
+        "y": 4
+      },
       {
         "x": 4,
         "y": 7
@@ -92771,8 +102208,8 @@
         "y": 9
       }
     ],
-    "width": 8,
-    "height": 2
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2572,
@@ -92901,20 +102338,26 @@
       {
         "x": 4,
         "y": -6
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": -1
+      },
+      {
+        "x": 11,
+        "y": -1
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2573,
@@ -93034,18 +102477,24 @@
       {
         "x": 2,
         "y": 3
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 14,
+        "y": -12
+      },
+      {
+        "x": 12,
+        "y": -11
+      },
+      {
+        "x": 10,
+        "y": -9
+      },
       {
         "x": 8,
         "y": -6
@@ -93063,8 +102512,8 @@
         "y": 9
       }
     ],
-    "width": 1,
-    "height": 15
+    "width": 23,
+    "height": 21
   },
   {
     "id": 2574,
@@ -93193,18 +102642,24 @@
       {
         "x": -6,
         "y": 8
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 11,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 11,
+        "y": -11
+      },
+      {
+        "x": 10,
+        "y": -10
+      },
+      {
+        "x": 11,
+        "y": -9
+      },
       {
         "x": 12,
         "y": -10
@@ -93266,7 +102721,7 @@
         "y": 6
       }
     ],
-    "width": 2,
+    "width": 20,
     "height": 21
   },
   {
@@ -93390,18 +102845,27 @@
       {
         "x": 5,
         "y": 3
-      }
-    ],
-    "width": 22,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 6
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
       {
         "x": -9,
         "y": 6
@@ -93423,8 +102887,8 @@
         "y": 6
       }
     ],
-    "width": 16,
-    "height": 2
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2576,
@@ -93553,18 +103017,27 @@
       {
         "x": -11,
         "y": 6
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -10,
+        "y": 5
+      },
+      {
+        "x": -8,
+        "y": 5
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
       {
         "x": 2,
         "y": 9
@@ -93591,7 +103064,7 @@
         "y": -11
       }
     ],
-    "width": 10,
+    "width": 21,
     "height": 21
   },
   {
@@ -93715,20 +103188,26 @@
       {
         "x": -5,
         "y": 6
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
       }
     ],
     "width": 20,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2602,
@@ -93851,20 +103330,26 @@
       {
         "x": 5,
         "y": 6
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": -5,
+        "y": 6
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2603,
@@ -93999,16 +103484,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2604,
     "mappedTo": null,
     "vertexCount": 36,
@@ -94129,20 +103604,26 @@
       {
         "x": -5,
         "y": 6
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2605,
@@ -94271,20 +103752,26 @@
       {
         "x": -1,
         "y": 8
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 6
       }
     ],
     "width": 18,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2606,
@@ -94501,18 +103988,24 @@
       {
         "x": -2,
         "y": 9
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -2
+      },
       {
         "x": 1,
         "y": -4
@@ -94558,8 +104051,8 @@
         "y": 6
       }
     ],
-    "width": 3,
-    "height": 12
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2608,
@@ -95081,18 +104574,24 @@
       {
         "x": 12,
         "y": -1
-      }
-    ],
-    "width": 31,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 12,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -1
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
       {
         "x": 8,
         "y": -4
@@ -95114,8 +104613,8 @@
         "y": 9
       }
     ],
-    "width": 2,
-    "height": 13
+    "width": 31,
+    "height": 14
   },
   {
     "id": 2614,
@@ -95342,20 +104841,26 @@
       {
         "x": 6,
         "y": 1
+      },
+      {
+        "x": 5,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 2,
+        "y": -4
+      },
+      {
+        "x": -1,
+        "y": -4
       }
     ],
     "width": 19,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2616,
@@ -95478,20 +104983,26 @@
       {
         "x": 5,
         "y": 6
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": -5,
+        "y": 6
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2617,
@@ -95614,20 +105125,26 @@
       {
         "x": -5,
         "y": 6
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2618,
@@ -95826,18 +105343,24 @@
       {
         "x": 2,
         "y": -4
-      }
-    ],
-    "width": 17,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -2
+      },
       {
         "x": -3,
         "y": 0
@@ -95888,8 +105411,8 @@
         "y": 6
       }
     ],
-    "width": 2,
-    "height": 10
+    "width": 17,
+    "height": 14
   },
   {
     "id": 2620,
@@ -96516,20 +106039,14 @@
       {
         "x": 3,
         "y": 8
+      },
+      {
+        "x": 4,
+        "y": 9
       }
     ],
     "width": 16,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2652,
@@ -96837,20 +106354,14 @@
       {
         "x": 3,
         "y": 8
+      },
+      {
+        "x": 4,
+        "y": 9
       }
     ],
     "width": 16,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2655,
@@ -97181,25 +106692,34 @@
       {
         "x": -6,
         "y": 18
-      }
-    ],
-    "width": 16,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 15
+      },
+      {
+        "x": -3,
+        "y": 13
+      },
+      {
+        "x": 0,
+        "y": 11
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
       {
         "x": 9,
         "y": 4
       }
     ],
-    "width": 14,
-    "height": 0
+    "width": 16,
+    "height": 21
   },
   {
     "id": 2658,
@@ -97793,18 +107313,24 @@
       {
         "x": 7,
         "y": 3
-      }
-    ],
-    "width": 25,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": 0
+      },
       {
         "x": 6,
         "y": 1
@@ -97838,8 +107364,8 @@
         "y": 4
       }
     ],
-    "width": 5,
-    "height": 8
+    "width": 25,
+    "height": 9
   },
   {
     "id": 2664,
@@ -97966,16 +107492,6 @@
     ],
     "width": 18,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2665,
@@ -98333,20 +107849,22 @@
       {
         "x": 5,
         "y": 0
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 0,
+        "y": 14
+      },
+      {
+        "x": -2,
+        "y": 18
       }
     ],
     "width": 16,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2668,
@@ -98926,20 +108444,26 @@
       {
         "x": 6,
         "y": 0
+      },
+      {
+        "x": 7,
+        "y": 4
+      },
+      {
+        "x": 8,
+        "y": 5
+      },
+      {
+        "x": 9,
+        "y": 5
+      },
+      {
+        "x": 11,
+        "y": 4
       }
     ],
     "width": 21,
     "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2674,
@@ -99065,18 +108589,21 @@
       {
         "x": -1,
         "y": 1
-      }
-    ],
-    "width": 16,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": -1,
+        "y": 3
+      },
+      "PENUP",
       {
         "x": -2,
         "y": 6
@@ -99095,8 +108622,8 @@
         "y": 8
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 16,
+    "height": 9
   },
   {
     "id": 2675,
@@ -99225,16 +108752,6 @@
     "height": 21
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2676,
     "mappedTo": null,
     "vertexCount": 38,
@@ -99355,25 +108872,34 @@
         "x": 7,
         "y": 4
       },
-      "PENUP"
-    ],
-    "width": 13,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": 18,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 10
+      },
+      {
+        "x": -2,
+        "y": 12
+      },
+      {
+        "x": -2,
+        "y": 15
+      },
+      {
+        "x": -3,
+        "y": 18
+      },
       {
         "x": -4,
         "y": 20
       }
     ],
-    "width": 21,
-    "height": 0
+    "width": 13,
+    "height": 21
   },
   {
     "id": 2697,
@@ -99526,18 +109052,27 @@
       {
         "x": 3,
         "y": 8
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -8
+      },
+      {
+        "x": 3,
+        "y": -11
+      },
       "PENUP",
       {
         "x": 4,
@@ -99556,8 +109091,8 @@
         "y": -10
       }
     ],
-    "width": -8,
-    "height": 1
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2701,
@@ -99732,20 +109267,18 @@
         "x": 7,
         "y": 9
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": -7,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 9
+      }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2703,
@@ -99862,18 +109395,27 @@
         "x": 6,
         "y": 1
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -1
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      {
+        "x": 6,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 2,
         "y": 8
@@ -99913,8 +109455,8 @@
         "y": 6
       }
     ],
-    "width": 11,
-    "height": 4
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2704,
@@ -100098,18 +109640,24 @@
       {
         "x": -5,
         "y": -3
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": 1,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      "PENUP",
       {
         "x": 2,
         "y": -4
@@ -100169,8 +109717,8 @@
         "y": 6
       }
     ],
-    "width": 50,
-    "height": 12
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2706,
@@ -100296,18 +109844,27 @@
       {
         "x": -2,
         "y": -11
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": -8
+      },
+      {
+        "x": -5,
+        "y": -3
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
       "PENUP",
       {
         "x": -5,
@@ -100397,8 +109954,8 @@
         "y": 2
       }
     ],
-    "width": 9,
-    "height": 11
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2707,
@@ -100576,18 +110133,27 @@
       {
         "x": -4,
         "y": -11
-      }
-    ],
-    "width": 20,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -7
+      },
+      {
+        "x": -4,
+        "y": -5
+      },
+      {
+        "x": -2,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
       {
         "x": 4,
         "y": -2
@@ -100704,8 +110270,8 @@
         "y": 6
       }
     ],
-    "width": -1,
-    "height": 20
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2709,
@@ -100831,18 +110397,24 @@
       {
         "x": 3,
         "y": -1
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -1,
+        "y": 0
+      },
+      {
+        "x": -4,
+        "y": -1
+      },
+      {
+        "x": -6,
+        "y": -4
+      },
+      "PENUP",
       {
         "x": -2,
         "y": 0
@@ -100935,8 +110507,8 @@
         "y": 7
       }
     ],
-    "width": 50,
-    "height": 19
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2710,
@@ -101227,16 +110799,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2713,
     "mappedTo": null,
     "vertexCount": 40,
@@ -101357,18 +110919,24 @@
       {
         "x": 1,
         "y": 8
-      }
-    ],
-    "width": 11,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 10,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 2,
+        "y": 10
+      },
       "PENUP",
       {
         "x": 2,
@@ -101379,8 +110947,8 @@
         "y": 12
       }
     ],
-    "width": 12,
-    "height": 4
+    "width": 11,
+    "height": 18
   },
   {
     "id": 2714,
@@ -101597,18 +111165,24 @@
         "x": -2,
         "y": -11
       },
-      "PENUP"
-    ],
-    "width": 19,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 3,
+        "y": -11
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      "PENUP",
+      {
+        "x": 6,
+        "y": -5
+      },
+      {
+        "x": 2,
+        "y": -2
+      },
       "PENUP",
       {
         "x": 0,
@@ -101685,8 +111259,8 @@
         "y": 7
       }
     ],
-    "width": 0,
-    "height": 11
+    "width": 19,
+    "height": 21
   },
   {
     "id": 2716,
@@ -102003,18 +111577,24 @@
         "x": 10,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 25,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 10,
+        "y": -5
+      },
+      {
+        "x": 10,
+        "y": -4
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -3
+      },
+      "PENUP",
       {
         "x": 7,
         "y": -4
@@ -102132,20 +111712,22 @@
       {
         "x": 6,
         "y": 7
+      },
+      {
+        "x": 8,
+        "y": 8
+      },
+      {
+        "x": 10,
+        "y": 8
+      },
+      {
+        "x": 10,
+        "y": 9
       }
     ],
-    "width": 50,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 25,
+    "height": 21
   },
   {
     "id": 2719,
@@ -102268,18 +111850,27 @@
       {
         "x": 2,
         "y": -11
-      }
-    ],
-    "width": 19,
-    "height": 29
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": -11
+      },
+      {
+        "x": -4,
+        "y": -10
+      },
+      {
+        "x": -5,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -7
+      },
+      {
+        "x": -4,
+        "y": -5
+      },
       {
         "x": 4,
         "y": -1
@@ -102334,8 +111925,8 @@
         "y": 8
       }
     ],
-    "width": -1,
-    "height": 10
+    "width": 19,
+    "height": 29
   },
   {
     "id": 2720,
@@ -102682,18 +112273,24 @@
         "x": -5,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 16,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -8,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": 5,
+        "y": -8
+      },
       {
         "x": -5,
         "y": -4
@@ -102703,8 +112300,8 @@
         "y": -3
       }
     ],
-    "width": -3,
-    "height": 1
+    "width": 16,
+    "height": 12
   },
   {
     "id": 2724,
@@ -103269,18 +112866,24 @@
       {
         "x": -3,
         "y": 9
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
       {
         "x": 6,
         "y": 0
@@ -103302,8 +112905,8 @@
         "y": -12
       }
     ],
-    "width": 8,
-    "height": 12
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2751,
@@ -103487,18 +113090,24 @@
       {
         "x": -5,
         "y": 6
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 5
+      },
+      "PENUP",
       {
         "x": -5,
         "y": 6
@@ -103520,8 +113129,8 @@
         "y": 5
       }
     ],
-    "width": 50,
-    "height": 4
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2753,
@@ -103647,18 +113256,27 @@
       {
         "x": 4,
         "y": 8
-      }
-    ],
-    "width": 21,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -6,
+        "y": 8
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      {
+        "x": -8,
+        "y": 5
+      },
       {
         "x": -8,
         "y": 4
@@ -103709,8 +113327,8 @@
         "y": 9
       }
     ],
-    "width": 13,
-    "height": 11
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2754,
@@ -103871,18 +113489,27 @@
       {
         "x": 1,
         "y": -4
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
       {
         "x": 2,
         "y": 8
@@ -103892,8 +113519,8 @@
         "y": 9
       }
     ],
-    "width": 10,
-    "height": 1
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2756,
@@ -104022,18 +113649,27 @@
       {
         "x": 2,
         "y": -12
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 1,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": -11
+      },
+      {
+        "x": -2,
+        "y": -9
+      },
+      {
+        "x": -4,
+        "y": -6
+      },
+      {
+        "x": -5,
+        "y": -3
+      },
+      {
+        "x": -6,
+        "y": 1
+      },
       {
         "x": -6,
         "y": 6
@@ -104068,8 +113704,8 @@
         "y": -2
       }
     ],
-    "width": 7,
-    "height": 11
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2757,
@@ -104310,18 +113946,24 @@
       {
         "x": 4,
         "y": -12
-      }
-    ],
-    "width": 21,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -2
+      },
+      {
+        "x": -5,
+        "y": -1
+      },
+      {
+        "x": -7,
+        "y": 1
+      },
+      {
+        "x": -8,
+        "y": 3
+      },
       {
         "x": -8,
         "y": 6
@@ -104421,8 +114063,8 @@
         "y": -1
       }
     ],
-    "width": 11,
-    "height": 11
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2759,
@@ -104551,18 +114193,27 @@
       {
         "x": -3,
         "y": -1
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -4,
+        "y": -7
+      },
+      {
+        "x": -3,
+        "y": -9
+      },
+      {
+        "x": -1,
+        "y": -11
+      },
+      {
+        "x": 1,
+        "y": -12
+      },
       "PENUP",
       {
         "x": 6,
@@ -104597,8 +114248,8 @@
         "y": 9
       }
     ],
-    "width": -11,
-    "height": 20
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2760,
@@ -104968,20 +114619,18 @@
       {
         "x": -2,
         "y": 9
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 7
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2766,
@@ -105191,18 +114840,27 @@
       {
         "x": -1,
         "y": 3
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
+      {
+        "x": 8,
+        "y": 7
+      },
       {
         "x": 8,
         "y": 6
@@ -105270,8 +114928,8 @@
         "y": 7
       }
     ],
-    "width": 15,
-    "height": 15
+    "width": 26,
+    "height": 21
   },
   {
     "id": 2769,
@@ -105394,18 +115052,27 @@
       {
         "x": 4,
         "y": 8
-      }
-    ],
-    "width": 21,
-    "height": 29
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -6,
+        "y": 8
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      {
+        "x": -8,
+        "y": 5
+      },
       {
         "x": -8,
         "y": 4
@@ -105423,8 +115090,8 @@
         "y": 5
       }
     ],
-    "width": 13,
-    "height": 2
+    "width": 21,
+    "height": 29
   },
   {
     "id": 2770,
@@ -106163,18 +115830,24 @@
       {
         "x": 8,
         "y": 5
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 3,
         "y": -2
@@ -106208,8 +115881,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 11
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2804,
@@ -106573,18 +116246,24 @@
       {
         "x": 12,
         "y": -9
-      }
-    ],
-    "width": 31,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": -1,
-    "vertices": [
+      },
+      {
+        "x": 11,
+        "y": -10
+      },
+      {
+        "x": 12,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": -2
+      },
+      {
+        "x": -6,
+        "y": -1
+      },
       {
         "x": -7,
         "y": 1
@@ -106699,20 +116378,19 @@
       {
         "x": 14,
         "y": 6
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 9
       }
     ],
-    "width": 5,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 31,
+    "height": 21
   },
   {
     "id": 2808,
@@ -106838,18 +116516,27 @@
       {
         "x": -5,
         "y": 8
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      {
+        "x": -7,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 3
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
       {
         "x": -6,
         "y": 5
@@ -106880,8 +116567,8 @@
         "y": 9
       }
     ],
-    "width": 9,
-    "height": 10
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2809,
@@ -107077,20 +116764,30 @@
       {
         "x": -5,
         "y": -18
+      },
+      {
+        "x": -4,
+        "y": -16
+      },
+      {
+        "x": -2,
+        "y": -15
+      },
+      {
+        "x": 2,
+        "y": -15
+      },
+      {
+        "x": 4,
+        "y": -16
+      },
+      {
+        "x": 5,
+        "y": -18
       }
     ],
     "width": 24,
     "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -18,
-    "vertices": [],
-    "width": -13,
-    "height": null
   },
   {
     "id": 2811,
@@ -107207,18 +116904,27 @@
       {
         "x": 1,
         "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 1
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
       {
         "x": 8,
         "y": 9
@@ -107241,8 +116947,8 @@
         "y": 9
       }
     ],
-    "width": 15,
-    "height": 3
+    "width": 24,
+    "height": 21
   },
   {
     "id": 2812,
@@ -107657,18 +117363,24 @@
       {
         "x": -3,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 6,
         "y": 4
@@ -107698,8 +117410,8 @@
         "y": -12
       }
     ],
-    "width": 11,
-    "height": 16
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2816,
@@ -108018,16 +117730,6 @@
     "height": 21
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2819,
     "mappedTo": null,
     "vertexCount": 16,
@@ -108298,18 +118000,24 @@
       {
         "x": -8,
         "y": -3
-      }
-    ],
-    "width": 25,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 0
+      },
+      {
+        "x": -7,
+        "y": 3
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": -2,
+        "y": 6
+      },
+      "PENUP",
       {
         "x": 3,
         "y": 6
@@ -108352,8 +118060,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 18
+    "width": 25,
+    "height": 21
   },
   {
     "id": 2822,
@@ -108820,20 +118528,23 @@
       {
         "x": 14,
         "y": 9
+      },
+      {
+        "x": 15,
+        "y": 16
+      },
+      "PENUP",
+      {
+        "x": 15,
+        "y": 9
+      },
+      {
+        "x": 15,
+        "y": 16
       }
     ],
     "width": 33,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "height": 28
   },
   {
     "id": 2827,
@@ -109069,18 +118780,21 @@
       {
         "x": 9,
         "y": 9
-      }
-    ],
-    "width": 30,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 10,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 6,
+        "y": -12
+      },
       {
         "x": 13,
         "y": -12
@@ -109095,7 +118809,7 @@
         "y": 9
       }
     ],
-    "width": -6,
+    "width": 30,
     "height": 21
   },
   {
@@ -109336,18 +119050,24 @@
       {
         "x": 7,
         "y": 1
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 4
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -2,
         "y": -2
@@ -109357,8 +119077,8 @@
         "y": -2
       }
     ],
-    "width": 50,
-    "height": 0
+    "width": 21,
+    "height": 21
   },
   {
     "id": 2831,
@@ -109478,18 +119198,24 @@
       {
         "x": 9,
         "y": -11
-      }
-    ],
-    "width": 31,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -12
+      },
+      {
+        "x": 4,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -12
+      },
+      {
+        "x": 2,
+        "y": -11
+      },
       {
         "x": 0,
         "y": -9
@@ -109573,7 +119299,7 @@
         "y": -2
       }
     ],
-    "width": -9,
+    "width": 31,
     "height": 21
   },
   {
@@ -109694,18 +119420,24 @@
       {
         "x": -7,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": 1,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -9,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -1
+      },
+      {
+        "x": -3,
+        "y": 1
+      },
       {
         "x": -5,
         "y": 8
@@ -109736,8 +119468,8 @@
         "y": 9
       }
     ],
-    "width": 4,
-    "height": 3
+    "width": 22,
+    "height": 21
   },
   {
     "id": 2901,
@@ -109863,18 +119595,24 @@
       {
         "x": 5,
         "y": 6
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 1
+      },
+      {
+        "x": -4,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
       {
         "x": -4,
         "y": 8
@@ -109884,8 +119622,8 @@
         "y": 9
       }
     ],
-    "width": 11,
-    "height": 1
+    "width": 20,
+    "height": 14
   },
   {
     "id": 2902,
@@ -110011,18 +119749,27 @@
       {
         "x": -1,
         "y": -5
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -5,
+        "y": -2
+      },
+      {
+        "x": -6,
+        "y": 1
+      },
+      {
+        "x": -6,
+        "y": 3
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
       {
         "x": -3,
         "y": 8
@@ -110065,8 +119812,8 @@
         "y": -5
       }
     ],
-    "width": 11,
-    "height": 14
+    "width": 20,
+    "height": 21
   },
   {
     "id": 2903,
@@ -110183,20 +119930,30 @@
       {
         "x": 3,
         "y": 2
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
+      {
+        "x": 6,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
       }
     ],
     "width": 20,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 9,
-    "vertices": [],
-    "width": 12,
-    "height": null
   },
   {
     "id": 2904,
@@ -110578,18 +120335,24 @@
       {
         "x": -5,
         "y": 4
-      }
-    ],
-    "width": 27,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 8
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 2
+      },
+      {
+        "x": -4,
+        "y": 4
+      },
       {
         "x": -6,
         "y": 8
@@ -110670,8 +120433,8 @@
         "y": 9
       }
     ],
-    "width": 8,
-    "height": 7
+    "width": 27,
+    "height": 14
   },
   {
     "id": 2908,
@@ -110797,18 +120560,24 @@
       {
         "x": -6,
         "y": 5
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -4,
+        "y": 5
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 2
+      },
       {
         "x": 4,
         "y": 3
@@ -110830,8 +120599,8 @@
         "y": 9
       }
     ],
-    "width": 4,
-    "height": 6
+    "width": 18,
+    "height": 14
   },
   {
     "id": 2909,
@@ -111027,20 +120796,30 @@
       {
         "x": -4,
         "y": -11
+      },
+      {
+        "x": -3,
+        "y": -9
+      },
+      {
+        "x": -1,
+        "y": -8
+      },
+      {
+        "x": 1,
+        "y": -8
+      },
+      {
+        "x": 3,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -11
       }
     ],
     "width": 22,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -11,
-    "vertices": [],
-    "width": -7,
-    "height": null
   },
   {
     "id": 2911,
@@ -111157,25 +120936,31 @@
       {
         "x": 4,
         "y": 9
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 8
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 9
+      },
       {
         "x": -1,
         "y": 9
       }
     ],
-    "width": 17,
-    "height": 0
+    "width": 20,
+    "height": 14
   },
   {
     "id": 2912,
@@ -111575,20 +121360,26 @@
       {
         "x": 6,
         "y": 3
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 1,
+        "y": -5
       }
     ],
     "width": 20,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2916,
@@ -111781,20 +121572,23 @@
       {
         "x": -9,
         "y": -5
+      },
+      {
+        "x": -5,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": 16
+      },
+      {
+        "x": -2,
+        "y": 16
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2918,
@@ -112172,18 +121966,24 @@
       {
         "x": 6,
         "y": -4
-      }
-    ],
-    "width": 21,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -1
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 1,
         "y": -2
@@ -112242,8 +122042,8 @@
         "y": 16
       }
     ],
-    "width": 50,
-    "height": 21
+    "width": 21,
+    "height": 28
   },
   {
     "id": 2922,
@@ -112709,16 +122509,6 @@
     "height": 19
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 2927,
     "mappedTo": null,
     "vertexCount": 27,
@@ -112930,20 +122720,27 @@
         "x": 8,
         "y": 9
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 4,
+        "y": -5
+      },
+      {
+        "x": 11,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 11,
+        "y": 9
+      }
     ],
     "width": 26,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 11,
-    "rightHandPosition": 9,
-    "vertices": [],
-    "width": 20,
-    "height": null
   },
   {
     "id": 2929,
@@ -113164,20 +122961,18 @@
         "x": 1,
         "y": 9
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": 6,
+        "y": 2
+      }
     ],
     "width": 19,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 2931,
@@ -113294,18 +123089,27 @@
       {
         "x": 4,
         "y": -5
-      }
-    ],
-    "width": 29,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": -4
+      },
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": -1,
+        "y": 1
+      },
+      {
+        "x": -1,
+        "y": 3
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
       {
         "x": 2,
         "y": 8
@@ -113357,7 +123161,7 @@
         "y": 2
       }
     ],
-    "width": 6,
+    "width": 29,
     "height": 14
   },
   {
@@ -113475,18 +123279,27 @@
       {
         "x": -1,
         "y": 4
-      }
-    ],
-    "width": 21,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      {
+        "x": -7,
+        "y": 8
+      },
+      {
+        "x": -8,
+        "y": 6
+      },
       "PENUP",
       {
         "x": 1,
@@ -113497,8 +123310,8 @@
         "y": 9
       }
     ],
-    "width": 14,
-    "height": 0
+    "width": 21,
+    "height": 14
   },
   {
     "id": 3001,
@@ -113600,20 +123413,23 @@
       {
         "x": 5,
         "y": 7
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 8,
+        "y": 9
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3002,
@@ -113727,18 +123543,27 @@
         "x": 3,
         "y": -2
       },
-      "PENUP"
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": 2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": -1
+      },
+      {
+        "x": 7,
+        "y": 0
+      },
+      {
+        "x": 8,
+        "y": 2
+      },
       {
         "x": 8,
         "y": 5
@@ -113841,18 +123666,21 @@
       {
         "x": -6,
         "y": 8
-      }
-    ],
-    "width": 10,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -7,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -4,
         "y": 7
@@ -113871,8 +123699,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3003,
@@ -113998,20 +123826,30 @@
       {
         "x": -5,
         "y": -8
+      },
+      {
+        "x": -6,
+        "y": -4
+      },
+      {
+        "x": -6,
+        "y": 1
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 9
       }
     ],
     "width": 21,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 9,
-    "vertices": [],
-    "width": 10,
-    "height": null
   },
   {
     "id": 3004,
@@ -114128,18 +123966,27 @@
       {
         "x": 3,
         "y": -11
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -8
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
       {
         "x": 1,
         "y": 9
@@ -114217,7 +124064,7 @@
         "y": 9
       }
     ],
-    "width": 11,
+    "width": 22,
     "height": 21
   },
   {
@@ -114323,18 +124170,21 @@
       {
         "x": -4,
         "y": -10
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -12
+      },
+      {
+        "x": -4,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -12
+      },
       {
         "x": 7,
         "y": -11
@@ -114431,18 +124281,21 @@
       {
         "x": -3,
         "y": 9
-      }
-    ],
-    "width": -10,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 9
+      },
       {
         "x": 7,
         "y": 8
@@ -114475,8 +124328,8 @@
         "y": 3
       }
     ],
-    "width": 11,
-    "height": 6
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3006,
@@ -114578,18 +124431,24 @@
         "x": -4,
         "y": -10
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -2,
+        "y": -12
+      },
+      {
+        "x": -4,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
       "PENUP",
       {
         "x": 4,
@@ -114683,20 +124542,18 @@
         "x": -3,
         "y": 9
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      }
     ],
-    "width": -4,
+    "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3007,
@@ -114822,18 +124679,27 @@
       {
         "x": -3,
         "y": -11
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": -8
+      },
+      {
+        "x": -6,
+        "y": -4
+      },
+      {
+        "x": -6,
+        "y": 1
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
       {
         "x": -1,
         "y": 9
@@ -114906,8 +124772,8 @@
         "y": 2
       }
     ],
-    "width": 11,
-    "height": 8
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3008,
@@ -115009,18 +124875,21 @@
       {
         "x": 2,
         "y": 9
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 10,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": -12
+      },
+      {
+        "x": -7,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": -8,
         "y": -12
@@ -115114,18 +124983,21 @@
       {
         "x": -5,
         "y": 8
-      }
-    ],
-    "width": 50,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 5,
         "y": 7
@@ -115153,8 +125025,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3009,
@@ -115256,18 +125128,21 @@
       {
         "x": -1,
         "y": 7
-      }
-    ],
-    "width": 12,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 1,
         "y": 8
@@ -115277,8 +125152,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 1
+    "width": 12,
+    "height": 21
   },
   {
     "id": 3010,
@@ -115398,18 +125273,21 @@
       {
         "x": -2,
         "y": -12
-      }
-    ],
-    "width": 15,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -12
+      },
+      {
+        "x": 1,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": 0,
         "y": -12
@@ -115437,8 +125315,8 @@
         "y": -11
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 15,
+    "height": 21
   },
   {
     "id": 3011,
@@ -115540,18 +125418,21 @@
       {
         "x": 2,
         "y": 9
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 9,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": -12
+      },
+      {
+        "x": -7,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": -8,
         "y": -12
@@ -115645,20 +125526,14 @@
       {
         "x": 5,
         "y": 7
+      },
+      {
+        "x": 8,
+        "y": 9
       }
     ],
-    "width": 50,
+    "width": 22,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3012,
@@ -115760,18 +125635,24 @@
         "x": -6,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
       "PENUP",
       {
         "x": -2,
@@ -115818,8 +125699,8 @@
         "y": 3
       }
     ],
-    "width": 10,
-    "height": 6
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3013,
@@ -115921,18 +125802,21 @@
       {
         "x": -11,
         "y": 9
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 11,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -10,
         "y": -12
@@ -116014,7 +125898,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 26,
     "height": 21
   },
   {
@@ -116117,18 +126001,21 @@
       {
         "x": 9,
         "y": -12
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": 8
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -7,
         "y": 8
@@ -116138,8 +126025,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 1
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3015,
@@ -116265,18 +126152,24 @@
       {
         "x": 6,
         "y": 4
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -7
+      },
+      {
+        "x": 5,
+        "y": -9
+      },
+      "PENUP",
       {
         "x": -1,
         "y": -12
@@ -116343,7 +126236,7 @@
         "y": -12
       }
     ],
-    "width": 50,
+    "width": 22,
     "height": 21
   },
   {
@@ -116461,18 +126354,21 @@
       {
         "x": 3,
         "y": -1
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": 9
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": -12
+      },
       {
         "x": -6,
         "y": -11
@@ -116541,7 +126437,7 @@
         "y": 9
       }
     ],
-    "width": -4,
+    "width": 22,
     "height": 21
   },
   {
@@ -116668,18 +126564,24 @@
       {
         "x": 6,
         "y": 4
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -7
+      },
+      {
+        "x": 5,
+        "y": -9
+      },
+      "PENUP",
       {
         "x": -1,
         "y": -12
@@ -116794,18 +126696,24 @@
       {
         "x": 4,
         "y": 10
-      }
-    ],
-    "width": 50,
-    "height": 26
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 12
+      },
+      {
+        "x": 6,
+        "y": 13
+      },
+      {
+        "x": 7,
+        "y": 13
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 6
+      },
       {
         "x": 5,
         "y": 11
@@ -116823,8 +126731,8 @@
         "y": 11
       }
     ],
-    "width": 9,
-    "height": 1
+    "width": 22,
+    "height": 26
   },
   {
     "id": 3018,
@@ -116941,18 +126849,24 @@
       {
         "x": 3,
         "y": -2
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
       {
         "x": 6,
         "y": 9
@@ -117055,18 +126969,21 @@
       {
         "x": -4,
         "y": -11
-      }
-    ],
-    "width": 12,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": 8
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": 7
+      },
       {
         "x": -7,
         "y": 9
@@ -117090,8 +127007,8 @@
         "y": 9
       }
     ],
-    "width": 13,
-    "height": 2
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3019,
@@ -117217,18 +127134,27 @@
       {
         "x": 3,
         "y": -2
-      }
-    ],
-    "width": 20,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 2
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
       {
         "x": 2,
         "y": 9
@@ -117258,8 +127184,8 @@
         "y": 6
       }
     ],
-    "width": 13,
-    "height": 6
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3020,
@@ -117361,18 +127287,21 @@
       {
         "x": -3,
         "y": -12
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -12
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": 5,
         "y": -12
@@ -117436,7 +127365,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 20,
     "height": 21
   },
   {
@@ -117551,18 +127480,21 @@
       {
         "x": -8,
         "y": -12
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": -10
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": -12
+      },
+      {
+        "x": -5,
+        "y": -10
+      },
+      "PENUP",
       {
         "x": -3,
         "y": -12
@@ -117590,8 +127522,8 @@
         "y": -11
       }
     ],
-    "width": 50,
-    "height": 1
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3022,
@@ -117693,20 +127625,18 @@
         "x": 7,
         "y": -11
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 8,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -11
+      }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3023,
@@ -117811,18 +127741,24 @@
         "x": -3,
         "y": -12
       },
-      "PENUP"
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 11,
-    "rightHandPosition": -12,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 0,
+        "y": -12
+      },
+      {
+        "x": 2,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 11,
+        "y": -12
+      },
       "PENUP",
       {
         "x": -10,
@@ -117878,8 +127814,8 @@
         "y": -11
       }
     ],
-    "width": -1,
-    "height": 2
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3024,
@@ -117981,18 +127917,21 @@
       {
         "x": -3,
         "y": -12
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": 8,
         "y": -12
@@ -118047,7 +127986,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 20,
     "height": 21
   },
   {
@@ -118153,18 +128092,21 @@
       {
         "x": 5,
         "y": -12
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 9,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": -1,
         "y": 8
@@ -118201,8 +128143,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3026,
@@ -118307,18 +128249,21 @@
       {
         "x": 7,
         "y": 8
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": 9
+      },
       {
         "x": 7,
         "y": 6
@@ -118333,8 +128278,8 @@
         "y": 3
       }
     ],
-    "width": 14,
-    "height": 6
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3051,
@@ -118439,25 +128384,28 @@
       {
         "x": 0,
         "y": 9
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 7
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": 7
+      },
       {
         "x": 5,
         "y": 9
       }
     ],
-    "width": 11,
-    "height": 0
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3052,
@@ -118571,18 +128519,27 @@
         "x": 4,
         "y": -2
       },
-      "PENUP"
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 3,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": -1
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": 3
+      },
       {
         "x": 6,
         "y": 6
@@ -118685,18 +128642,21 @@
       {
         "x": -8,
         "y": 8
-      }
-    ],
-    "width": 10,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -11,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -10,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -7,
         "y": 7
@@ -118715,8 +128675,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3053,
@@ -118842,18 +128802,27 @@
         "x": -5,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -3,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": -12
+      },
+      {
+        "x": 0,
+        "y": -11
+      },
+      {
+        "x": -2,
+        "y": -8
+      },
+      {
+        "x": -3,
+        "y": -6
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
       {
         "x": -5,
         "y": 1
@@ -118871,8 +128840,8 @@
         "y": 9
       }
     ],
-    "width": 1,
-    "height": 8
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3054,
@@ -118989,18 +128958,27 @@
       {
         "x": 3,
         "y": -12
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": -7
+      },
+      {
+        "x": 6,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": 1
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
       {
         "x": 0,
         "y": 8
@@ -119082,7 +129060,7 @@
         "y": 9
       }
     ],
-    "width": 8,
+    "width": 23,
     "height": 21
   },
   {
@@ -119188,18 +129166,21 @@
       {
         "x": -2,
         "y": -10
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -12
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -12
+      },
       {
         "x": 8,
         "y": -11
@@ -119296,18 +129277,21 @@
       {
         "x": -6,
         "y": 9
-      }
-    ],
-    "width": -7,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 9
+      },
       {
         "x": 3,
         "y": 8
@@ -119331,8 +129315,8 @@
         "y": 4
       }
     ],
-    "width": 11,
-    "height": 5
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3056,
@@ -119434,18 +129418,24 @@
         "x": -2,
         "y": -10
       },
-      "PENUP"
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 1,
+        "y": -12
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
       "PENUP",
       {
         "x": 6,
@@ -119539,20 +129529,18 @@
         "x": -6,
         "y": 9
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -5,
+        "y": 9
+      }
     ],
-    "width": -3,
+    "width": 22,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3057,
@@ -119678,18 +129666,24 @@
         "x": -5,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -12,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 4,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -12
+      },
       {
         "x": 0,
         "y": -11
@@ -119785,8 +129779,8 @@
         "y": 3
       }
     ],
-    "width": -10,
-    "height": 20
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3058,
@@ -119888,18 +129882,21 @@
       {
         "x": -1,
         "y": 9
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": -12
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": -5,
         "y": -12
@@ -119993,18 +129990,21 @@
       {
         "x": -9,
         "y": 8
-      }
-    ],
-    "width": 50,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 3,
         "y": 7
@@ -120032,8 +130032,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3059,
@@ -120135,18 +130135,21 @@
       {
         "x": -3,
         "y": 7
-      }
-    ],
-    "width": 14,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -3,
         "y": 8
@@ -120156,8 +130159,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 1
+    "width": 14,
+    "height": 21
   },
   {
     "id": 3060,
@@ -120280,18 +130283,21 @@
       {
         "x": -7,
         "y": 4
-      }
-    ],
-    "width": 19,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -12
+      },
       {
         "x": 6,
         "y": -11
@@ -120324,8 +130330,8 @@
         "y": -11
       }
     ],
-    "width": -9,
-    "height": 2
+    "width": 19,
+    "height": 21
   },
   {
     "id": 3061,
@@ -120427,18 +130433,21 @@
       {
         "x": 0,
         "y": 9
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": -4,
         "y": -12
@@ -120532,20 +130541,23 @@
       {
         "x": 3,
         "y": 7
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 9
       }
     ],
-    "width": 50,
+    "width": 23,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3062,
@@ -120647,18 +130659,24 @@
         "x": -9,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
       "PENUP",
       {
         "x": -6,
@@ -120696,8 +130714,8 @@
         "y": 3
       }
     ],
-    "width": 13,
-    "height": 6
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3063,
@@ -120802,18 +130820,21 @@
       {
         "x": 14,
         "y": -12
-      }
-    ],
-    "width": 28,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -14,
+        "y": 9
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 9
+      },
       {
         "x": 8,
         "y": 9
@@ -120909,7 +130930,7 @@
         "y": 9
       }
     ],
-    "width": 9,
+    "width": 28,
     "height": 21
   },
   {
@@ -121012,18 +131033,24 @@
         "x": -2,
         "y": -10
       },
-      "PENUP"
-    ],
-    "width": 25,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 8,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 12,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": -11
+      },
       "PENUP",
       {
         "x": -9,
@@ -121043,8 +131070,8 @@
         "y": 9
       }
     ],
-    "width": -1,
-    "height": 1
+    "width": 25,
+    "height": 21
   },
   {
     "id": 3065,
@@ -121170,18 +131197,24 @@
       {
         "x": 5,
         "y": 3
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
+      "PENUP",
       {
         "x": 1,
         "y": -12
@@ -121256,7 +131289,7 @@
         "y": -12
       }
     ],
-    "width": 50,
+    "width": 22,
     "height": 21
   },
   {
@@ -121374,18 +131407,21 @@
       {
         "x": 5,
         "y": -2
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": -12,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -5,
         "y": -12
@@ -121458,7 +131494,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 23,
     "height": 21
   },
   {
@@ -121585,18 +131621,24 @@
       {
         "x": 5,
         "y": 3
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
+      "PENUP",
       {
         "x": 1,
         "y": -12
@@ -121711,18 +131753,24 @@
         "x": 5,
         "y": 11
       },
-      "PENUP"
-    ],
-    "width": 50,
-    "height": 24
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 6,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": 12
+      },
+      {
+        "x": 3,
+        "y": 13
+      },
+      {
+        "x": 4,
+        "y": 13
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 6
+      },
       {
         "x": 1,
         "y": 13
@@ -121744,8 +131792,8 @@
         "y": 10
       }
     ],
-    "width": 7,
-    "height": 4
+    "width": 22,
+    "height": 26
   },
   {
     "id": 3068,
@@ -121862,18 +131910,24 @@
       {
         "x": 4,
         "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 6,
         "y": 7
@@ -121973,18 +132027,21 @@
       {
         "x": -8,
         "y": 8
-      }
-    ],
-    "width": 11,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -11,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -10,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -7,
         "y": 7
@@ -122003,8 +132060,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3069,
@@ -122130,18 +132187,27 @@
       {
         "x": 6,
         "y": 2
-      }
-    ],
-    "width": 23,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
       {
         "x": -6,
         "y": 8
@@ -122171,8 +132237,8 @@
         "y": 7
       }
     ],
-    "width": 12,
-    "height": 6
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3070,
@@ -122274,18 +132340,21 @@
       {
         "x": 7,
         "y": -12
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 10,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": -10
+      },
+      "PENUP",
       {
         "x": 9,
         "y": -12
@@ -122340,7 +132409,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 22,
     "height": 21
   },
   {
@@ -122458,18 +132527,21 @@
       {
         "x": -6,
         "y": -12
-      }
-    ],
-    "width": 25,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": -4,
+        "y": -10
+      },
+      "PENUP",
       {
         "x": -1,
         "y": -12
@@ -122506,8 +132578,8 @@
         "y": -11
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 25,
+    "height": 21
   },
   {
     "id": 3072,
@@ -122612,20 +132684,19 @@
       {
         "x": 9,
         "y": -11
+      },
+      "PENUP",
+      {
+        "x": 11,
+        "y": -12
+      },
+      {
+        "x": 9,
+        "y": -11
       }
     ],
     "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3073,
@@ -122733,18 +132804,21 @@
       {
         "x": -8,
         "y": -12
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -12
+      },
+      {
+        "x": 5,
+        "y": -12
+      },
+      "PENUP",
       {
         "x": 8,
         "y": -12
@@ -122808,8 +132882,8 @@
         "y": -11
       }
     ],
-    "width": 50,
-    "height": 3
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3074,
@@ -122911,18 +132985,21 @@
       {
         "x": 0,
         "y": -12
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -12
+      },
+      {
+        "x": 9,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": 11,
         "y": -12
@@ -122977,7 +133054,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 22,
     "height": 21
   },
   {
@@ -123083,18 +133160,21 @@
       {
         "x": -1,
         "y": -12
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -12
+      },
+      {
+        "x": 10,
+        "y": -11
+      },
+      "PENUP",
       {
         "x": 12,
         "y": -12
@@ -123140,7 +133220,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 22,
     "height": 21
   },
   {
@@ -123246,20 +133326,19 @@
       {
         "x": 5,
         "y": 6
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 3
       }
     ],
     "width": 22,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3101,
@@ -123382,18 +133461,27 @@
       {
         "x": 3,
         "y": 1
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 3
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
       {
         "x": -2,
         "y": 9
@@ -123457,8 +133545,8 @@
         "y": 9
       }
     ],
-    "width": 13,
-    "height": 8
+    "width": 20,
+    "height": 14
   },
   {
     "id": 3102,
@@ -123578,18 +133666,24 @@
       {
         "x": 5,
         "y": 6
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -5
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
       {
         "x": 5,
         "y": 4
@@ -123625,7 +133719,7 @@
         "y": -10
       }
     ],
-    "width": 5,
+    "width": 21,
     "height": 21
   },
   {
@@ -123752,20 +133846,18 @@
       {
         "x": -4,
         "y": 7
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 9
       }
     ],
     "width": 19,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3104,
@@ -123882,18 +133974,27 @@
         "x": -5,
         "y": 6
       },
-      "PENUP"
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 4,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -5,
+        "y": 0
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
       {
         "x": -4,
         "y": 7
@@ -123943,7 +134044,7 @@
         "y": 9
       }
     ],
-    "width": 9,
+    "width": 21,
     "height": 21
   },
   {
@@ -124067,18 +134168,24 @@
       {
         "x": 1,
         "y": -5
-      }
-    ],
-    "width": 19,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -5,
+        "y": 0
+      },
       {
         "x": -5,
         "y": 4
@@ -124096,8 +134203,8 @@
         "y": 9
       }
     ],
-    "width": 5,
-    "height": 5
+    "width": 19,
+    "height": 14
   },
   {
     "id": 3106,
@@ -124211,18 +134318,24 @@
         "x": -4,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 14,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -2,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 0,
@@ -124233,8 +134346,8 @@
         "y": 9
       }
     ],
-    "width": 10,
-    "height": 1
+    "width": 14,
+    "height": 21
   },
   {
     "id": 3107,
@@ -124357,18 +134470,24 @@
         "x": -3,
         "y": 3
       },
-      "PENUP"
-    ],
-    "width": 19,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 3,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 1
+      },
+      {
+        "x": 4,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      "PENUP",
       {
         "x": -1,
         "y": -5
@@ -124480,18 +134599,27 @@
       {
         "x": -6,
         "y": 7
-      }
-    ],
-    "width": 50,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 12,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 10
+      },
+      {
+        "x": 7,
+        "y": 12
+      },
       {
         "x": 7,
         "y": 13
@@ -124555,7 +134683,7 @@
       }
     ],
     "width": 19,
-    "height": 7
+    "height": 21
   },
   {
     "id": 3108,
@@ -124669,18 +134797,21 @@
       {
         "x": -1,
         "y": 9
-      }
-    ],
-    "width": 23,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 10,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": -12
+      },
       {
         "x": -6,
         "y": -11
@@ -124767,7 +134898,7 @@
         "y": 9
       }
     ],
-    "width": -4,
+    "width": 23,
     "height": 21
   },
   {
@@ -124873,18 +135004,24 @@
         "x": -1,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 12,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 1,
@@ -124904,8 +135041,8 @@
         "y": 9
       }
     ],
-    "width": 11,
-    "height": 2
+    "width": 12,
+    "height": 21
   },
   {
     "id": 3110,
@@ -125022,18 +135159,24 @@
       {
         "x": -4,
         "y": 13
-      }
-    ],
-    "width": 13,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 15
+      },
+      {
+        "x": -5,
+        "y": 15
+      },
+      {
+        "x": -5,
+        "y": 14
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -5
+      },
       {
         "x": 0,
         "y": -4
@@ -125048,8 +135191,8 @@
         "y": -3
       }
     ],
-    "width": -3,
-    "height": 2
+    "width": 13,
+    "height": 28
   },
   {
     "id": 3111,
@@ -125151,18 +135294,24 @@
         "x": 9,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": -10,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -8,
+        "y": -12
+      },
+      {
+        "x": -6,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": -12
+      },
+      {
+        "x": -6,
+        "y": -10
+      },
       "PENUP",
       {
         "x": 3,
@@ -125236,8 +135385,8 @@
         "y": 9
       }
     ],
-    "width": -4,
-    "height": 14
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3112,
@@ -125455,18 +135604,27 @@
       {
         "x": 2,
         "y": -3
-      }
-    ],
-    "width": 34,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 11,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -5
+      },
+      {
+        "x": 8,
+        "y": -5
+      },
+      {
+        "x": 10,
+        "y": -4
+      },
+      {
+        "x": 11,
+        "y": -3
+      },
       {
         "x": 12,
         "y": 0
@@ -125563,18 +135721,21 @@
       {
         "x": -12,
         "y": 7
-      }
-    ],
-    "width": 8,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -13,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": 7
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": -10,
         "y": 8
@@ -125656,8 +135817,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 2
+    "width": 34,
+    "height": 14
   },
   {
     "id": 3114,
@@ -125771,18 +135932,21 @@
       {
         "x": -1,
         "y": 9
-      }
-    ],
-    "width": 23,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 10,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": -5
+      },
       {
         "x": -6,
         "y": -4
@@ -125869,7 +136033,7 @@
         "y": 9
       }
     ],
-    "width": 3,
+    "width": 23,
     "height": 14
   },
   {
@@ -125993,18 +136157,27 @@
       {
         "x": -4,
         "y": -3
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 0
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 1,
@@ -126039,7 +136212,7 @@
         "y": -5
       }
     ],
-    "width": 10,
+    "width": 20,
     "height": 14
   },
   {
@@ -126157,18 +136330,27 @@
       {
         "x": 1,
         "y": -5
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 5,
+        "y": 4
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
       {
         "x": 3,
         "y": 8
@@ -126241,7 +136423,7 @@
         "y": 16
       }
     ],
-    "width": 11,
+    "width": 21,
     "height": 21
   },
   {
@@ -126359,18 +136541,27 @@
         "x": -5,
         "y": 6
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 4,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -5,
+        "y": 0
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
       {
         "x": -4,
         "y": 7
@@ -126429,8 +136620,8 @@
         "y": 16
       }
     ],
-    "width": 9,
-    "height": 9
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3118,
@@ -126541,18 +136732,24 @@
         "x": -4,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 17,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
       "PENUP",
       {
         "x": -2,
@@ -126572,8 +136769,8 @@
         "y": 9
       }
     ],
-    "width": 14,
-    "height": 2
+    "width": 17,
+    "height": 14
   },
   {
     "id": 3119,
@@ -126693,18 +136890,27 @@
       {
         "x": 3,
         "y": 1
-      }
-    ],
-    "width": 17,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 2
+      },
+      {
+        "x": 6,
+        "y": 4
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
       {
         "x": -1,
         "y": 9
@@ -126730,8 +136936,8 @@
         "y": 7
       }
     ],
-    "width": 12,
-    "height": 4
+    "width": 17,
+    "height": 14
   },
   {
     "id": 3120,
@@ -126960,18 +137166,27 @@
       {
         "x": 9,
         "y": 9
-      }
-    ],
-    "width": 3,
-    "height": 2
-  },
-  {
-    "id": 3122,
-    "mappedTo": null,
-    "vertexCount": 31,
-    "leftHandPosition": -9,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -50,
+        "y": -31
+      },
+      {
+        "x": -33,
+        "y": -32
+      },
+      {
+        "x": -32,
+        "y": -50
+      },
+      {
+        "x": -31,
+        "y": -33
+      },
+      {
+        "x": -9,
+        "y": 9
+      },
       {
         "x": -6,
         "y": -5
@@ -127066,8 +137281,8 @@
         "y": -4
       }
     ],
-    "width": 18,
-    "height": 14
+    "width": 3,
+    "height": 59
   },
   {
     "id": 3123,
@@ -127172,18 +137387,21 @@
       {
         "x": 5,
         "y": -5
-      }
-    ],
-    "width": 24,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 11,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": -5
+      },
+      {
+        "x": -7,
+        "y": -4
+      },
+      "PENUP",
       {
         "x": -4,
         "y": -5
@@ -127211,8 +137429,8 @@
         "y": -4
       }
     ],
-    "width": 50,
-    "height": 1
+    "width": 24,
+    "height": 14
   },
   {
     "id": 3124,
@@ -127314,18 +137532,21 @@
       {
         "x": 3,
         "y": -5
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      "PENUP",
       {
         "x": -5,
         "y": 8
@@ -127362,8 +137583,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 1
+    "width": 20,
+    "height": 14
   },
   {
     "id": 3125,
@@ -127474,18 +137695,24 @@
         "x": -4,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 19,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -4,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -2,
+        "y": -5
+      },
+      {
+        "x": -4,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -5
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
       "PENUP",
       {
         "x": 7,
@@ -127496,8 +137723,8 @@
         "y": -4
       }
     ],
-    "width": 2,
-    "height": 1
+    "width": 19,
+    "height": 21
   },
   {
     "id": 3126,
@@ -127602,18 +137829,21 @@
       {
         "x": 6,
         "y": 8
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": 9
+      },
       {
         "x": 6,
         "y": 6
@@ -127628,8 +137858,8 @@
         "y": 5
       }
     ],
-    "width": 13,
-    "height": 4
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3151,
@@ -127752,18 +137982,24 @@
       {
         "x": -2,
         "y": 9
-      }
-    ],
-    "width": 22,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 5
+      },
+      {
+        "x": 3,
+        "y": 2
+      },
+      "PENUP",
       {
         "x": -4,
         "y": -4
@@ -127814,7 +138050,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 22,
     "height": 14
   },
   {
@@ -127941,18 +138177,24 @@
       {
         "x": 6,
         "y": -1
-      }
-    ],
-    "width": 19,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": 0,
+        "y": -12
+      },
+      {
+        "x": -2,
+        "y": -5
+      },
       {
         "x": -4,
         "y": 2
@@ -128005,7 +138247,7 @@
         "y": -10
       }
     ],
-    "width": -3,
+    "width": 19,
     "height": 21
   },
   {
@@ -128132,20 +138374,18 @@
       {
         "x": -4,
         "y": 5
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
       }
     ],
     "width": 18,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3154,
@@ -128268,18 +138508,27 @@
       {
         "x": -6,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 5
+      },
       {
         "x": 3,
         "y": 2
@@ -128353,7 +138602,7 @@
         "y": -10
       }
     ],
-    "width": 7,
+    "width": 22,
     "height": 21
   },
   {
@@ -128480,20 +138729,14 @@
       {
         "x": -3,
         "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
       }
     ],
     "width": 18,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3156,
@@ -128619,18 +138862,27 @@
       {
         "x": -2,
         "y": 11
-      }
-    ],
-    "width": 16,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -10,
-    "rightHandPosition": 15,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 13
+      },
+      {
+        "x": -5,
+        "y": 15
+      },
+      {
+        "x": -7,
+        "y": 16
+      },
+      {
+        "x": -9,
+        "y": 16
+      },
+      {
+        "x": -10,
+        "y": 15
+      },
       {
         "x": -10,
         "y": 13
@@ -128661,8 +138913,8 @@
         "y": -5
       }
     ],
-    "width": 25,
-    "height": 20
+    "width": 16,
+    "height": 28
   },
   {
     "id": 3157,
@@ -128785,18 +139037,27 @@
       {
         "x": -4,
         "y": -4
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": -1
+      },
+      {
+        "x": -7,
+        "y": 2
+      },
+      {
+        "x": -7,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 8
+      },
       {
         "x": -3,
         "y": 9
@@ -128872,8 +139133,8 @@
         "y": 9
       }
     ],
-    "width": 13,
-    "height": 14
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3158,
@@ -128990,18 +139251,24 @@
       {
         "x": 5,
         "y": 9
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 7
+      },
+      {
+        "x": 10,
+        "y": 5
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -12
+      },
       {
         "x": -2,
         "y": -11
@@ -129016,8 +139283,8 @@
         "y": -10
       }
     ],
-    "width": -7,
-    "height": 2
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3159,
@@ -129134,20 +139401,22 @@
       {
         "x": 0,
         "y": 9
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 5
       }
     ],
     "width": 13,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3160,
@@ -129270,18 +139539,24 @@
       {
         "x": -8,
         "y": 14
-      }
-    ],
-    "width": 13,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 11,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -4
+      },
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 11
+      },
       {
         "x": -3,
         "y": 13
@@ -129313,7 +139588,7 @@
       }
     ],
     "width": 13,
-    "height": 18
+    "height": 28
   },
   {
     "id": 3161,
@@ -129430,18 +139705,24 @@
         "x": 5,
         "y": 8
       },
-      "PENUP"
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": 1,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -1,
+        "y": 3
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": 1
+      },
       {
         "x": -2,
         "y": 2
@@ -129485,7 +139766,7 @@
         "y": -10
       }
     ],
-    "width": 4,
+    "width": 22,
     "height": 21
   },
   {
@@ -129705,18 +139986,24 @@
       {
         "x": -2,
         "y": 9
-      }
-    ],
-    "width": 35,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": -1,
+        "y": 2
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 1,
@@ -129805,7 +140092,7 @@
         "y": 5
       }
     ],
-    "width": 10,
+    "width": 35,
     "height": 14
   },
   {
@@ -129926,18 +140213,24 @@
       {
         "x": 5,
         "y": 4
-      }
-    ],
-    "width": 24,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 6,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
       {
         "x": 5,
         "y": 8
@@ -129959,8 +140252,8 @@
         "y": 5
       }
     ],
-    "width": 10,
-    "height": 4
+    "width": 24,
+    "height": 14
   },
   {
     "id": 3165,
@@ -130083,18 +140376,27 @@
       {
         "x": -1,
         "y": -5
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -3
+      },
+      {
+        "x": -4,
+        "y": -1
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
       {
         "x": -2,
         "y": 9
@@ -130129,7 +140431,7 @@
         "y": -5
       }
     ],
-    "width": 12,
+    "width": 20,
     "height": 14
   },
   {
@@ -130253,18 +140555,27 @@
       {
         "x": 5,
         "y": 8
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 2
+      },
       "PENUP",
       {
         "x": 6,
@@ -130361,7 +140672,7 @@
         "y": 16
       }
     ],
-    "width": 5,
+    "width": 22,
     "height": 21
   },
   {
@@ -130482,18 +140793,24 @@
       {
         "x": -7,
         "y": 2
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -5
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
       {
         "x": -5,
         "y": -1
@@ -130560,8 +140877,8 @@
         "y": 16
       }
     ],
-    "width": 1,
-    "height": 17
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3168,
@@ -130799,18 +141116,27 @@
       {
         "x": -3,
         "y": -1
-      }
-    ],
-    "width": 17,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 0
+      },
+      {
+        "x": 2,
+        "y": 1
+      },
+      {
+        "x": 4,
+        "y": 2
+      },
+      {
+        "x": 5,
+        "y": 4
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 4,
         "y": 8
@@ -130852,8 +141178,8 @@
         "y": 6
       }
     ],
-    "width": 11,
-    "height": 4
+    "width": 17,
+    "height": 14
   },
   {
     "id": 3170,
@@ -131066,18 +141392,24 @@
       {
         "x": 10,
         "y": 7
-      }
-    ],
-    "width": 24,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 11,
+        "y": 5
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
       "PENUP",
       {
         "x": 6,
@@ -131096,8 +141428,8 @@
         "y": 6
       }
     ],
-    "width": 13,
-    "height": 11
+    "width": 24,
+    "height": 14
   },
   {
     "id": 3172,
@@ -131337,18 +141669,27 @@
       {
         "x": 7,
         "y": 8
-      }
-    ],
-    "width": 30,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 11,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      {
+        "x": 11,
+        "y": 3
+      },
+      {
+        "x": 12,
+        "y": -1
+      },
+      {
+        "x": 12,
+        "y": -5
+      },
+      {
+        "x": 11,
+        "y": -5
+      },
       {
         "x": 11,
         "y": -4
@@ -131388,8 +141729,8 @@
         "y": 6
       }
     ],
-    "width": 6,
-    "height": 13
+    "width": 30,
+    "height": 14
   },
   {
     "id": 3174,
@@ -131512,18 +141853,27 @@
       {
         "x": 7,
         "y": -4
-      }
-    ],
-    "width": 22,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": -4
+      },
+      {
+        "x": 8,
+        "y": -5
+      },
+      {
+        "x": 6,
+        "y": -5
+      },
       {
         "x": 4,
         "y": -4
@@ -131578,8 +141928,8 @@
         "y": 5
       }
     ],
-    "width": 1,
-    "height": 13
+    "width": 22,
+    "height": 14
   },
   {
     "id": 3175,
@@ -131699,18 +142049,24 @@
       {
         "x": 8,
         "y": -5
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 2,
+        "y": 13
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 9,
+        "y": -5
+      },
       {
         "x": 5,
         "y": 9
@@ -131760,8 +142116,8 @@
         "y": 13
       }
     ],
-    "width": 4,
-    "height": 7
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3176,
@@ -131878,18 +142234,24 @@
       {
         "x": 3,
         "y": 8
-      }
-    ],
-    "width": 20,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
       {
         "x": 5,
         "y": 7
@@ -131899,8 +142261,8 @@
         "y": 4
       }
     ],
-    "width": 12,
-    "height": 3
+    "width": 20,
+    "height": 14
   },
   {
     "id": 3197,
@@ -131930,16 +142292,6 @@
     "rightHandPosition": 8,
     "vertices": [],
     "width": 16,
-    "height": null
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
     "height": null
   },
   {
@@ -132066,18 +142418,24 @@
       {
         "x": 4,
         "y": -10
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -12
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": -4,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -4
+      },
       {
         "x": -5,
         "y": 1
@@ -132128,7 +142486,7 @@
         "y": -12
       }
     ],
-    "width": 1,
+    "width": 20,
     "height": 21
   },
   {
@@ -132350,18 +142708,24 @@
       {
         "x": 5,
         "y": -10
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -8
+      },
+      {
+        "x": 6,
+        "y": -6
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -12
+      },
       {
         "x": 4,
         "y": -11
@@ -132454,8 +142818,8 @@
         "y": 4
       }
     ],
-    "width": -10,
-    "height": 20
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3203,
@@ -132578,18 +142942,24 @@
       {
         "x": 3,
         "y": -11
-      }
-    ],
-    "width": 20,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -6
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 1,
+        "y": -3
+      },
+      "PENUP",
       {
         "x": -1,
         "y": -3
@@ -132707,18 +143077,24 @@
       {
         "x": 5,
         "y": 5
-      }
-    ],
-    "width": 50,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
       {
         "x": -5,
         "y": 5
@@ -132732,8 +143108,8 @@
         "y": 4
       }
     ],
-    "width": 11,
-    "height": 1
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3204,
@@ -132954,18 +143330,27 @@
       {
         "x": 3,
         "y": -4
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 5,
+        "y": 4
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
       {
         "x": 1,
         "y": 9
@@ -133027,7 +143412,7 @@
         "y": -12
       }
     ],
-    "width": 11,
+    "width": 20,
     "height": 21
   },
   {
@@ -133157,18 +143542,27 @@
       {
         "x": 6,
         "y": -1
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 1,
+        "y": -4
+      },
+      {
+        "x": -1,
+        "y": -4
+      },
+      {
+        "x": -3,
+        "y": -3
+      },
+      {
+        "x": -4,
+        "y": -2
+      },
       {
         "x": -5,
         "y": 0
@@ -133280,20 +143674,14 @@
       {
         "x": 3,
         "y": -3
+      },
+      {
+        "x": 1,
+        "y": -4
       }
     ],
-    "width": 2,
+    "width": 20,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3207,
@@ -133413,18 +143801,24 @@
       {
         "x": 7,
         "y": -12
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -10
+      },
+      {
+        "x": -4,
+        "y": -11
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
       "PENUP",
       {
         "x": -7,
@@ -133447,8 +143841,8 @@
         "y": -9
       }
     ],
-    "width": -10,
-    "height": 2
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3208,
@@ -133568,18 +143962,27 @@
         "x": -2,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -6
+      },
+      {
+        "x": 4,
+        "y": -9
+      },
+      {
+        "x": 3,
+        "y": -11
+      },
       {
         "x": 2,
         "y": -12
@@ -133691,18 +144094,24 @@
       {
         "x": -4,
         "y": -2
-      }
-    ],
-    "width": -8,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 1
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 2,
         "y": 9
@@ -133728,8 +144137,8 @@
         "y": -3
       }
     ],
-    "width": 50,
-    "height": 12
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3209,
@@ -133858,18 +144267,27 @@
       {
         "x": -6,
         "y": 5
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -4,
+        "y": 4
+      },
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
       {
         "x": -5,
         "y": 7
@@ -133981,20 +144399,14 @@
       {
         "x": 2,
         "y": 8
+      },
+      {
+        "x": 0,
+        "y": 9
       }
     ],
-    "width": 11,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3210,
@@ -134285,16 +144697,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3213,
     "mappedTo": null,
     "vertexCount": 40,
@@ -134415,18 +144817,24 @@
       {
         "x": 1,
         "y": 8
-      }
-    ],
-    "width": 11,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 10,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 2,
+        "y": 10
+      },
       "PENUP",
       {
         "x": 2,
@@ -134437,8 +144845,8 @@
         "y": 12
       }
     ],
-    "width": 12,
-    "height": 4
+    "width": 11,
+    "height": 18
   },
   {
     "id": 3214,
@@ -134555,20 +144963,18 @@
       {
         "x": 1,
         "y": 8
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 7
       }
     ],
     "width": 11,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3215,
@@ -134691,18 +145097,24 @@
       {
         "x": 0,
         "y": -1
-      }
-    ],
-    "width": 19,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": 1,
+        "y": 2
+      },
+      {
+        "x": 1,
+        "y": -1
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      "PENUP",
       {
         "x": 0,
         "y": 6
@@ -134761,8 +145173,8 @@
         "y": 7
       }
     ],
-    "width": 50,
-    "height": 3
+    "width": 19,
+    "height": 21
   },
   {
     "id": 3216,
@@ -135082,18 +145494,27 @@
       {
         "x": 2,
         "y": 5
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 9
+      },
+      {
+        "x": 10,
+        "y": 7
+      },
+      {
+        "x": 10,
+        "y": 6
+      },
       "PENUP",
       {
         "x": -7,
@@ -135196,25 +145617,34 @@
       {
         "x": -4,
         "y": -5
-      }
-    ],
-    "width": 16,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 8,
+        "y": 8
+      },
+      {
+        "x": 9,
+        "y": 8
+      },
       {
         "x": 10,
         "y": 7
       }
     ],
-    "width": 17,
-    "height": 0
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3219,
@@ -135337,18 +145767,24 @@
       {
         "x": 3,
         "y": -1
-      }
-    ],
-    "width": 20,
-    "height": 29
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -11
+      },
+      {
+        "x": -6,
+        "y": -9
+      },
       {
         "x": -6,
         "y": -7
@@ -135426,8 +145862,8 @@
         "y": 4
       }
     ],
-    "width": -3,
-    "height": 16
+    "width": 20,
+    "height": 29
   },
   {
     "id": 3220,
@@ -135792,18 +146228,24 @@
         "x": -5,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 16,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -8,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": 5,
+        "y": -8
+      },
       {
         "x": -5,
         "y": -4
@@ -135813,8 +146255,8 @@
         "y": -3
       }
     ],
-    "width": -3,
-    "height": 1
+    "width": 16,
+    "height": 12
   },
   {
     "id": 3224,
@@ -136376,18 +146818,27 @@
       {
         "x": 2,
         "y": 7
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -8,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
       {
         "x": 6,
         "y": -10
@@ -136467,7 +146918,7 @@
         "y": -12
       }
     ],
-    "width": -1,
+    "width": 21,
     "height": 21
   },
   {
@@ -136669,18 +147120,24 @@
       {
         "x": 5,
         "y": -5
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": -5,
+        "y": 3
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -7,
+        "y": 6
+      },
       {
         "x": -5,
         "y": 6
@@ -136736,8 +147193,8 @@
         "y": 5
       }
     ],
-    "width": 13,
-    "height": 4
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3253,
@@ -136863,18 +147320,24 @@
       {
         "x": 1,
         "y": -2
-      }
-    ],
-    "width": 21,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -2
+      },
+      {
+        "x": 1,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -1
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
       {
         "x": 6,
         "y": 2
@@ -136978,8 +147441,8 @@
         "y": 9
       }
     ],
-    "width": 5,
-    "height": 11
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3254,
@@ -137157,18 +147620,24 @@
       {
         "x": -6,
         "y": 3
-      }
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      {
+        "x": -7,
+        "y": 4
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -2
+      },
       {
         "x": 5,
         "y": 0
@@ -137215,8 +147684,8 @@
         "y": 9
       }
     ],
-    "width": 2,
-    "height": 13
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3256,
@@ -137345,18 +147814,27 @@
         "x": -5,
         "y": 1
       },
-      "PENUP"
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 5,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -2,
+        "y": -9
+      },
+      {
+        "x": -4,
+        "y": -6
+      },
+      {
+        "x": -5,
+        "y": -3
+      },
+      {
+        "x": -6,
+        "y": 1
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
       {
         "x": -5,
         "y": 7
@@ -137445,7 +147923,7 @@
         "y": -3
       }
     ],
-    "width": 11,
+    "width": 21,
     "height": 21
   },
   {
@@ -137560,18 +148038,27 @@
         "x": 5,
         "y": -9
       },
-      "PENUP"
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -5,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -10
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -9
+      },
       {
         "x": 8,
         "y": -10
@@ -137581,371 +148068,431 @@
         "y": -12
       }
     ],
-    "width": -2,
-    "height": 2
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3258,
     "mappedTo": null,
-    "vertexCount": 104,
-    "leftHandPosition": -10,
-    "rightHandPosition": 11,
+    "vertexCount": 10,
+    "leftHandPosition": -30,
+    "rightHandPosition": -10,
     "vertices": [
       {
-        "x": 1,
-        "y": -12
+        "x": 11,
+        "y": 1
       },
       {
-        "x": -2,
-        "y": -11
+        "x": -12,
+        "y": -2
+      },
+      {
+        "x": -11,
+        "y": -3
+      },
+      {
+        "x": -10,
+        "y": -4
+      },
+      {
+        "x": -8,
+        "y": -4
+      },
+      {
+        "x": -5,
+        "y": -3
       },
       {
         "x": -3,
-        "y": -10
+        "y": -1
+      },
+      {
+        "x": -2,
+        "y": 2
+      },
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 7
       },
       {
         "x": -4,
-        "y": -8
+        "y": 8
+      },
+      {
+        "x": -6,
+        "y": 8
+      },
+      {
+        "x": -9,
+        "y": 7
+      },
+      {
+        "x": -11,
+        "y": 5
+      },
+      {
+        "x": -12,
+        "y": 1
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -12,
+        "y": -2
+      },
+      {
+        "x": -11,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": -10,
+        "y": -3
+      },
+      {
+        "x": -8,
+        "y": -3
       },
       {
         "x": -4,
+        "y": -2
+      },
+      {
+        "x": -3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": -3,
+        "y": 0
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": -2,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -9,
+        "y": 6
+      },
+      {
+        "x": -11,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": -11,
+        "y": 3
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": -12,
+        "y": -1
+      },
+      {
+        "x": -10,
+        "y": -2
+      },
+      {
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": -4,
+        "y": -1
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": -2,
+        "y": 4
+      },
+      {
+        "x": -3,
+        "y": 5
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -10,
+        "y": 5
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": -2,
         "y": -5
       },
       {
-        "x": -3,
-        "y": -3
-      },
-      {
         "x": -1,
-        "y": -2
-      },
-      {
-        "x": 2,
-        "y": -2
-      },
-      {
-        "x": 5,
-        "y": -3
-      },
-      {
-        "x": 7,
-        "y": -4
-      },
-      {
-        "x": 8,
-        "y": -6
-      },
-      {
-        "x": 8,
-        "y": -9
-      },
-      {
-        "x": 7,
-        "y": -11
-      },
-      {
-        "x": 5,
-        "y": -12
+        "y": -7
       },
       {
         "x": 1,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": 3,
-        "y": -12
-      },
-      {
-        "x": -2,
-        "y": -11
-      },
-      "PENUP",
-      {
-        "x": -2,
-        "y": -10
-      },
-      {
-        "x": -3,
         "y": -8
       },
       {
-        "x": -3,
+        "x": 3,
+        "y": -8
+      },
+      {
+        "x": 6,
+        "y": -7
+      },
+      {
+        "x": 8,
         "y": -4
       },
       {
-        "x": -2,
-        "y": -3
+        "x": 9,
+        "y": 0
       },
-      "PENUP",
       {
-        "x": -3,
-        "y": -3
+        "x": 9,
+        "y": 4
+      },
+      {
+        "x": 8,
+        "y": 5
+      },
+      {
+        "x": 7,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 5
       },
       {
         "x": 0,
-        "y": -2
+        "y": 4
       },
-      "PENUP",
+      {
+        "x": -1,
+        "y": 2
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -2,
+        "y": -5
+      },
+      {
+        "x": -1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": -1,
+        "y": -6
+      },
       {
         "x": 1,
-        "y": -2
+        "y": -7
       },
-      {
-        "x": 5,
-        "y": -3
-      },
-      "PENUP",
-      {
-        "x": 6,
-        "y": -4
-      }
-    ],
-    "width": 21,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -11,
-    "vertices": [
       {
         "x": 3,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": 1,
-        "y": -12
-      },
-      {
-        "x": -1,
-        "y": -10
-      },
-      {
-        "x": -2,
-        "y": -8
-      },
-      {
-        "x": -2,
-        "y": -4
-      },
-      {
-        "x": -1,
-        "y": -2
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": -2
-      },
-      {
-        "x": 4,
-        "y": -3
-      },
-      {
-        "x": 5,
-        "y": -4
+        "y": -7
       },
       {
         "x": 6,
         "y": -6
       },
       {
-        "x": 6,
-        "y": -10
-      },
-      {
-        "x": 5,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -1,
-        "y": -2
-      },
-      {
-        "x": -5,
-        "y": -1
-      },
-      {
-        "x": -7,
-        "y": 1
-      },
-      {
-        "x": -8,
-        "y": 3
-      },
-      {
-        "x": -8,
-        "y": 6
-      },
-      {
-        "x": -7,
-        "y": 8
-      },
-      {
-        "x": -4,
-        "y": 9
+        "x": 8,
+        "y": -50
       },
       {
         "x": 0,
-        "y": 9
+        "y": -7
       },
       {
-        "x": 4,
-        "y": 8
+        "x": 8,
+        "y": -2
       },
       {
-        "x": 5,
-        "y": 7
+        "x": 9,
+        "y": 4
       },
       {
-        "x": 6,
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 7,
         "y": 5
       },
       {
-        "x": 6,
-        "y": 2
-      },
-      {
         "x": 5,
-        "y": 0
-      },
-      {
-        "x": 4,
-        "y": -1
+        "y": 5
       },
       {
         "x": 2,
-        "y": -2
-      },
-      "PENUP"
-    ],
-    "width": -4,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 1,
-    "vertices": [
-      {
-        "x": -7,
-        "y": 3
+        "y": 4
       },
       {
-        "x": -7,
-        "y": 6
+        "x": 0,
+        "y": -50
       },
       {
-        "x": -6,
-        "y": 8
+        "x": 0,
+        "y": 4
       },
-      "PENUP",
       {
-        "x": -7,
-        "y": 8
+        "x": -1,
+        "y": 1
       },
       {
         "x": -2,
-        "y": 9
+        "y": -50
       },
       {
-        "x": 4,
-        "y": 8
-      },
-      "PENUP",
-      {
-        "x": 4,
-        "y": 7
-      },
-      {
-        "x": 5,
-        "y": 5
-      },
-      {
-        "x": 5,
-        "y": 2
-      },
-      {
-        "x": 4,
-        "y": 0
-      },
-      "PENUP",
-      {
-        "x": 4,
+        "x": 0,
         "y": -1
+      },
+      {
+        "x": -2,
+        "y": -3
+      },
+      {
+        "x": -1,
+        "y": -5
       },
       {
         "x": 1,
-        "y": -2
-      },
-      "PENUP",
-      {
-        "x": -1,
-        "y": -2
+        "y": -6
       },
       {
-        "x": -3,
-        "y": -1
+        "x": 3,
+        "y": -6
       },
       {
-        "x": -5,
-        "y": 1
+        "x": 6,
+        "y": -5
       },
       {
-        "x": -6,
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 9,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": 9,
+        "y": 2
+      },
+      {
+        "x": 8,
         "y": 3
       },
       {
-        "x": -6,
-        "y": 6
+        "x": 7,
+        "y": 4
       },
       {
-        "x": -5,
-        "y": 8
+        "x": 5,
+        "y": 4
       },
       {
-        "x": -4,
-        "y": 9
-      },
-      "PENUP",
-      {
-        "x": 0,
-        "y": 9
+        "x": 1,
+        "y": 3
       },
       {
-        "x": 2,
-        "y": 8
-      },
-      {
-        "x": 3,
-        "y": 7
-      },
-      {
-        "x": 4,
-        "y": 5
-      },
-      {
-        "x": 4,
-        "y": 1
-      },
-      {
-        "x": 3,
-        "y": -1
-      },
-      {
-        "x": 2,
-        "y": -2
+        "x": -1,
+        "y": 2
       }
     ],
-    "width": 7,
-    "height": 11
+    "width": 20,
+    "height": 58
   },
   {
     "id": 3259,
@@ -138074,18 +148621,24 @@
         "x": -6,
         "y": 5
       },
-      "PENUP"
-    ],
-    "width": 21,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -3,
+        "y": -2
+      },
+      {
+        "x": -4,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -7
+      },
+      {
+        "x": -3,
+        "y": -9
+      },
+      "PENUP",
       {
         "x": 6,
         "y": -10
@@ -138177,7 +148730,7 @@
         "y": 9
       }
     ],
-    "width": 50,
+    "width": 21,
     "height": 21
   },
   {
@@ -138464,16 +149017,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3263,
     "mappedTo": null,
     "vertexCount": 38,
@@ -138594,25 +149137,31 @@
       {
         "x": -1,
         "y": 8
-      }
-    ],
-    "width": 11,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 10,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": 9
+      },
+      {
+        "x": -1,
+        "y": 10
+      },
       {
         "x": -2,
         "y": 12
       }
     ],
     "width": 11,
-    "height": 0
+    "height": 18
   },
   {
     "id": 3264,
@@ -138729,20 +149278,18 @@
       {
         "x": -1,
         "y": 8
+      },
+      {
+        "x": -1,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 7
       }
     ],
     "width": 11,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3265,
@@ -138868,18 +149415,24 @@
       {
         "x": 4,
         "y": -3
-      }
-    ],
-    "width": 21,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -11
+      },
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -7
+      },
       {
         "x": 6,
         "y": -5
@@ -138963,8 +149516,8 @@
         "y": 7
       }
     ],
-    "width": 0,
-    "height": 14
+    "width": 21,
+    "height": 21
   },
   {
     "id": 3266,
@@ -139274,18 +149827,27 @@
       {
         "x": -2,
         "y": 0
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 3
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
       {
         "x": 7,
         "y": 7
@@ -139394,20 +149956,26 @@
       {
         "x": 1,
         "y": 4
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 7,
+        "y": 7
       }
     ],
-    "width": 15,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3269,
@@ -139527,18 +150095,27 @@
         "x": 5,
         "y": 2
       },
-      "PENUP"
-    ],
-    "width": 21,
-    "height": 29
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": -4,
+        "y": -9
+      },
+      {
+        "x": -4,
+        "y": -7
+      },
+      {
+        "x": -3,
+        "y": -5
+      },
+      {
+        "x": 3,
+        "y": -2
+      },
       {
         "x": 5,
         "y": 0
@@ -139600,8 +150177,8 @@
         "y": 4
       }
     ],
-    "width": 1,
-    "height": 9
+    "width": 21,
+    "height": 29
   },
   {
     "id": 3270,
@@ -139766,16 +150343,6 @@
     "height": 32
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3272,
     "mappedTo": null,
     "vertexCount": 32,
@@ -139902,16 +150469,6 @@
     "height": 32
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3273,
     "mappedTo": null,
     "vertexCount": 39,
@@ -140020,18 +150577,24 @@
         "x": -3,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 17,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -8,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
       {
         "x": -3,
         "y": -4
@@ -140041,8 +150604,8 @@
         "y": -3
       }
     ],
-    "width": -1,
-    "height": 1
+    "width": 17,
+    "height": 12
   },
   {
     "id": 3274,
@@ -140568,18 +151131,24 @@
         "x": -3,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 24,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -7,
+        "y": 4
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": 4
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
       {
         "x": 3,
         "y": 4
@@ -140672,365 +151241,419 @@
         "y": 7
       }
     ],
-    "width": 13,
+    "width": 24,
     "height": 21
   },
   {
     "id": 3302,
     "mappedTo": null,
-    "vertexCount": 101,
-    "leftHandPosition": -13,
-    "rightHandPosition": 13,
+    "vertexCount": 10,
+    "leftHandPosition": -33,
+    "rightHandPosition": -13,
     "vertices": [
       {
-        "x": -11,
-        "y": -1
-      },
-      {
-        "x": -11,
-        "y": 0
-      },
-      {
-        "x": -10,
-        "y": 1
-      },
-      {
-        "x": -8,
-        "y": 1
-      },
-      {
-        "x": -6,
-        "y": 0
-      },
-      {
-        "x": -6,
-        "y": -3
-      },
-      {
-        "x": -7,
-        "y": -5
-      },
-      {
-        "x": -9,
-        "y": -8
-      },
-      {
-        "x": -9,
-        "y": -10
-      },
-      {
-        "x": -7,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -7,
-        "y": -3
-      },
-      {
-        "x": -9,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": -8,
-        "y": 1
-      },
-      {
-        "x": -7,
-        "y": 0
-      },
-      {
-        "x": -7,
-        "y": -2
-      },
-      {
-        "x": -9,
-        "y": -5
-      },
-      {
-        "x": -10,
-        "y": -7
-      },
-      {
-        "x": -10,
-        "y": -9
-      },
-      {
-        "x": -9,
-        "y": -11
-      },
-      {
-        "x": -7,
-        "y": -12
-      },
-      {
-        "x": -4,
-        "y": -12
-      },
-      {
-        "x": -2,
+        "x": 13,
         "y": -11
       },
       {
         "x": -1,
+        "y": -11
+      },
+      {
+        "x": 0,
         "y": -10
-      },
-      {
-        "x": 0,
-        "y": -8
-      },
-      {
-        "x": 0,
-        "y": 0
-      },
-      {
-        "x": -1,
-        "y": 3
-      },
-      {
-        "x": -3,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": -2,
-        "y": -10
-      }
-    ],
-    "width": 26,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -11,
-    "vertices": [
-      {
-        "x": -2,
-        "y": -8
-      },
-      {
-        "x": -2,
-        "y": 3
-      },
-      {
-        "x": -3,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": 0,
-        "y": -9
       },
       {
         "x": 1,
-        "y": -11
-      },
-      {
-        "x": 3,
-        "y": -12
-      },
-      {
-        "x": 5,
-        "y": -12
-      },
-      {
-        "x": 7,
-        "y": -11
-      },
-      {
-        "x": 8,
-        "y": -10
-      },
-      {
-        "x": 9,
         "y": -8
       },
       {
-        "x": 10,
+        "x": 1,
+        "y": -6
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -3,
         "y": -7
       },
-      "PENUP",
       {
-        "x": 7,
-        "y": -10
+        "x": -5,
+        "y": -9
       },
       {
-        "x": 8,
+        "x": -8,
+        "y": -9
+      },
+      {
+        "x": -10,
+        "y": -7
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": -3,
+        "y": -9
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": -8
       },
-      "PENUP",
       {
-        "x": 5,
-        "y": -12
-      },
-      {
-        "x": 6,
-        "y": -11
-      },
-      {
-        "x": 7,
-        "y": -8
-      },
-      {
-        "x": 8,
-        "y": -7
-      },
-      {
-        "x": 10,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": 10,
+        "x": 1,
         "y": -7
       },
       {
         "x": 0,
+        "y": -7
+      },
+      {
+        "x": -2,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -10
+      },
+      {
+        "x": -7,
+        "y": -10
+      },
+      {
+        "x": -9,
+        "y": -9
+      },
+      {
+        "x": -11,
+        "y": -7
+      },
+      {
+        "x": -12,
+        "y": -4
+      },
+      {
+        "x": -12,
         "y": -2
       },
-      "PENUP",
       {
-        "x": 7,
-        "y": -5
-      },
-      {
-        "x": 9,
-        "y": -3
-      },
-      {
-        "x": 10,
-        "y": 0
-      },
-      {
-        "x": 10,
-        "y": 3
-      },
-      {
-        "x": 9,
-        "y": 6
-      },
-      {
-        "x": 7,
-        "y": 8
-      }
-    ],
-    "width": -8,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -9,
-    "rightHandPosition": 5,
-    "vertices": [
-      {
-        "x": -10,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": 6,
-        "y": -4
-      },
-      {
-        "x": 7,
-        "y": -4
-      },
-      {
-        "x": 9,
-        "y": -2
-      },
-      "PENUP",
-      {
-        "x": 4,
-        "y": -4
-      },
-      {
-        "x": 7,
-        "y": -3
-      },
-      {
-        "x": 9,
+        "x": -11,
         "y": -1
       },
       {
-        "x": 10,
-        "y": 1
+        "x": -10,
+        "y": 0
       },
-      "PENUP",
       {
-        "x": 2,
-        "y": 8
+        "x": -8,
+        "y": 0
       },
       {
         "x": 0,
-        "y": 8
-      },
-      {
-        "x": -6,
-        "y": 5
-      },
-      {
-        "x": -7,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": 8,
-        "y": 7
-      },
-      {
-        "x": 6,
-        "y": 8
+        "y": -1
       },
       {
         "x": 3,
-        "y": 8
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -50
       },
       {
         "x": 0,
-        "y": 7
+        "y": -2
       },
       {
-        "x": -4,
+        "x": -10,
+        "y": -1
+      },
+      {
+        "x": -8,
+        "y": -1
+      },
+      {
+        "x": 2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": -12,
+        "y": -3
+      },
+      {
+        "x": -11,
+        "y": -2
+      },
+      {
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -9,
+        "y": 1
+      },
+      {
+        "x": -11,
+        "y": 3
+      },
+      {
+        "x": -12,
         "y": 5
       },
       {
-        "x": -7,
-        "y": 4
+        "x": -12,
+        "y": 7
       },
       {
-        "x": -9,
-        "y": 4
-      },
-      {
-        "x": -10,
-        "y": 6
-      },
-      {
-        "x": -10,
+        "x": -11,
         "y": 8
       },
       {
-        "x": -9,
+        "x": -10,
         "y": 9
       },
       {
         "x": -8,
+        "y": 10
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": -10,
         "y": 8
       },
       {
-        "x": -9,
+        "x": -8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -12,
+        "y": 6
+      },
+      {
+        "x": -11,
         "y": 7
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -7,
+        "y": 10
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      {
+        "x": -7,
+        "y": 0
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 10
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 8,
+        "y": 4
+      },
+      {
+        "x": 9,
+        "y": 1
+      },
+      {
+        "x": 9,
+        "y": -2
+      },
+      {
+        "x": 8,
+        "y": -8
+      },
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": 5,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -1,
+        "y": 10
+      },
+      {
+        "x": 1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": 8,
+        "y": 0
+      },
+      {
+        "x": 8,
+        "y": -6
+      },
+      {
+        "x": 5,
+        "y": -7
+      },
+      {
+        "x": 5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 7,
+        "y": 6
+      },
+      {
+        "x": 8,
+        "y": 3
+      },
+      {
+        "x": 8,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -7
+      },
+      {
+        "x": 4,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
+      {
+        "x": 8,
+        "y": -9
+      },
+      {
+        "x": 9,
+        "y": -8
+      },
+      {
+        "x": 8,
+        "y": -9
       }
     ],
-    "width": 14,
-    "height": 13
+    "width": 20,
+    "height": 60
   },
   {
     "id": 3303,
@@ -141156,18 +151779,27 @@
       {
         "x": -5,
         "y": 5
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 9,
+        "y": 5
+      },
       "PENUP",
       {
         "x": 3,
@@ -141279,18 +151911,24 @@
       {
         "x": 6,
         "y": -10
-      }
-    ],
-    "width": 14,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": -10
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -11
+      },
+      {
+        "x": 4,
+        "y": -10
+      },
+      {
+        "x": 5,
+        "y": -10
+      },
       "PENUP",
       {
         "x": 2,
@@ -141313,8 +151951,8 @@
         "y": -11
       }
     ],
-    "width": -5,
-    "height": 2
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3304,
@@ -141440,18 +152078,24 @@
       {
         "x": 0,
         "y": 8
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": -7
+      },
+      {
+        "x": -8,
+        "y": -9
+      },
       {
         "x": -5,
         "y": -10
@@ -141566,18 +152210,24 @@
       {
         "x": -4,
         "y": -1
-      }
-    ],
-    "width": -1,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -1,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 0
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -7
+      },
+      {
+        "x": -5,
+        "y": -5
+      },
+      {
+        "x": -3,
+        "y": -1
+      },
       {
         "x": -3,
         "y": 1
@@ -141603,8 +152253,8 @@
         "y": 2
       }
     ],
-    "width": 2,
-    "height": 3
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3305,
@@ -141730,18 +152380,27 @@
       {
         "x": -5,
         "y": 5
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 9,
+        "y": 5
+      },
       "PENUP",
       {
         "x": 3,
@@ -141853,18 +152512,24 @@
       {
         "x": 6,
         "y": -10
-      }
-    ],
-    "width": 14,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": -10
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -11
+      },
+      {
+        "x": 4,
+        "y": -10
+      },
+      {
+        "x": 5,
+        "y": -10
+      },
       "PENUP",
       {
         "x": 2,
@@ -141939,8 +152604,8 @@
         "y": -6
       }
     ],
-    "width": -5,
-    "height": 7
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3306,
@@ -142063,18 +152728,27 @@
       {
         "x": 0,
         "y": -3
-      }
-    ],
-    "width": 24,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 11,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": 4
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 4,
+        "y": 10
+      },
+      {
+        "x": 3,
+        "y": 11
+      },
       {
         "x": 1,
         "y": 12
@@ -142186,18 +152860,27 @@
         "x": -6,
         "y": 3
       },
-      "PENUP"
-    ],
-    "width": 14,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -3,
+        "y": 12
+      },
+      {
+        "x": -5,
+        "y": 11
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
       {
         "x": -5,
         "y": 0
@@ -142271,8 +152954,8 @@
         "y": -5
       }
     ],
-    "width": 7,
-    "height": 7
+    "width": 24,
+    "height": 24
   },
   {
     "id": 3307,
@@ -142398,18 +153081,24 @@
       {
         "x": 8,
         "y": 5
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 9,
+        "y": 3
+      },
+      {
+        "x": 9,
+        "y": -1
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -5
+      },
+      "PENUP",
       {
         "x": -4,
         "y": -12
@@ -142521,18 +153210,27 @@
         "x": 2,
         "y": 0
       },
-      "PENUP"
-    ],
-    "width": 50,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -1,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -2,
+        "y": -8
+      },
+      {
+        "x": -2,
+        "y": -7
+      },
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -1
+      },
       {
         "x": 3,
         "y": 1
@@ -142626,8 +153324,8 @@
         "y": -12
       }
     ],
-    "width": 2,
-    "height": 16
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3308,
@@ -142753,18 +153451,24 @@
       {
         "x": -8,
         "y": -1
-      }
-    ],
-    "width": 25,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      {
+        "x": -9,
+        "y": 0
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -12
+      },
+      {
+        "x": 2,
+        "y": -10
+      },
+      {
+        "x": 4,
+        "y": -10
+      },
       {
         "x": 6,
         "y": -11
@@ -142870,18 +153574,27 @@
       {
         "x": 5,
         "y": -5
-      }
-    ],
-    "width": -6,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -3
+      },
+      {
+        "x": 8,
+        "y": 0
+      },
+      {
+        "x": 8,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
       {
         "x": 4,
         "y": 8
@@ -142950,8 +153663,8 @@
         "y": 8
       }
     ],
-    "width": 13,
-    "height": 6
+    "width": 25,
+    "height": 25
   },
   {
     "id": 3309,
@@ -143077,18 +153790,24 @@
       {
         "x": 9,
         "y": -11
-      }
-    ],
-    "width": 25,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
       {
         "x": -9,
         "y": 7
@@ -143203,18 +153922,24 @@
       {
         "x": 7,
         "y": 6
-      }
-    ],
-    "width": 16,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 11,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 4,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": 6,
+        "y": 11
+      },
       {
         "x": 7,
         "y": 9
@@ -143256,8 +153981,8 @@
         "y": -2
       }
     ],
-    "width": 17,
-    "height": 13
+    "width": 25,
+    "height": 24
   },
   {
     "id": 3310,
@@ -143383,18 +154108,24 @@
       {
         "x": 9,
         "y": -11
-      }
-    ],
-    "width": 25,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
       {
         "x": -9,
         "y": 7
@@ -143509,18 +154240,24 @@
       {
         "x": 7,
         "y": 6
-      }
-    ],
-    "width": 16,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": 11,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 4,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": 6,
+        "y": 11
+      },
       {
         "x": 7,
         "y": 9
@@ -143562,8 +154299,8 @@
         "y": -2
       }
     ],
-    "width": 17,
-    "height": 13
+    "width": 25,
+    "height": 24
   },
   {
     "id": 3311,
@@ -143686,18 +154423,24 @@
         "x": -8,
         "y": 8
       },
-      "PENUP"
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 5,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -10,
+        "y": 4
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -11,
+        "y": 7
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
       "PENUP",
       {
         "x": -10,
@@ -143803,18 +154546,24 @@
         "x": -2,
         "y": -1
       },
-      "PENUP"
-    ],
-    "width": 12,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 7,
+        "y": 6
+      },
+      {
+        "x": 8,
+        "y": 7
+      },
+      {
+        "x": 9,
+        "y": 7
+      },
+      "PENUP",
       {
         "x": 2,
         "y": -2
@@ -143845,8 +154594,8 @@
         "y": 6
       }
     ],
-    "width": 50,
-    "height": 11
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3312,
@@ -143972,18 +154721,24 @@
       {
         "x": -6,
         "y": -4
-      }
-    ],
-    "width": 23,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": -1
+      },
+      {
+        "x": -3,
+        "y": 1
+      },
+      {
+        "x": -3,
+        "y": 2
+      },
+      {
+        "x": -4,
+        "y": 4
+      },
+      "PENUP",
       {
         "x": -6,
         "y": -7
@@ -144095,476 +154850,549 @@
       {
         "x": -1,
         "y": 8
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 8
+      },
+      {
+        "x": 8,
+        "y": 7
+      },
+      {
+        "x": 9,
+        "y": 5
       }
     ],
-    "width": 50,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 5,
-    "vertices": [],
-    "width": 14,
-    "height": null
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3313,
     "mappedTo": null,
-    "vertexCount": 128,
-    "leftHandPosition": -16,
-    "rightHandPosition": 16,
+    "vertexCount": 12,
+    "leftHandPosition": -26,
+    "rightHandPosition": -16,
     "vertices": [
       {
-        "x": -13,
-        "y": -1
+        "x": 16,
+        "y": -13
       },
       {
-        "x": -13,
-        "y": 0
+        "x": -1,
+        "y": -13
       },
       {
-        "x": -12,
-        "y": 1
+        "x": 0,
+        "y": -12
+      },
+      {
+        "x": 1,
+        "y": -10
+      },
+      {
+        "x": 1,
+        "y": -8
+      },
+      {
+        "x": 0,
+        "y": -8
+      },
+      {
+        "x": -3,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -11
+      },
+      {
+        "x": -8,
+        "y": -11
       },
       {
         "x": -10,
-        "y": 1
+        "y": -9
       },
       {
-        "x": -8,
-        "y": 0
+        "x": -12,
+        "y": -50
       },
       {
-        "x": -8,
-        "y": -3
+        "x": 0,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
+      {
+        "x": 1,
+        "y": -9
+      },
+      {
+        "x": 0,
+        "y": -9
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": -7,
+        "y": -12
       },
       {
         "x": -9,
+        "y": -11
+      },
+      {
+        "x": -11,
+        "y": -9
+      },
+      {
+        "x": -12,
+        "y": -7
+      },
+      {
+        "x": -12,
         "y": -5
       },
       {
         "x": -11,
-        "y": -8
-      },
-      {
-        "x": -11,
-        "y": -10
-      },
-      {
-        "x": -9,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -9,
         "y": -3
-      },
-      {
-        "x": -11,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": -10,
-        "y": 1
-      },
-      {
-        "x": -9,
-        "y": 0
       },
       {
         "x": -9,
         "y": -2
       },
       {
-        "x": -11,
+        "x": -6,
+        "y": -2
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -6
+      },
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 9,
+        "y": -10
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": -9,
+        "y": -3
+      },
+      {
+        "x": -6,
+        "y": -3
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": 3,
         "y": -5
       },
       {
-        "x": -12,
+        "x": 5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -8
+      },
+      {
+        "x": 8,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -10
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": -7
       },
       {
         "x": -12,
-        "y": -9
-      },
-      {
-        "x": -11,
-        "y": -11
-      },
-      {
-        "x": -9,
-        "y": -12
-      },
-      {
-        "x": -7,
-        "y": -12
-      },
-      {
-        "x": -5,
-        "y": -11
-      },
-      {
-        "x": -3,
-        "y": -9
-      },
-      {
-        "x": -2,
-        "y": -6
-      },
-      {
-        "x": -2,
-        "y": 0
-      },
-      {
-        "x": -3,
-        "y": 3
-      },
-      {
-        "x": -4,
-        "y": 5
-      },
-      {
-        "x": -6,
-        "y": 7
-      },
-      {
-        "x": -9,
-        "y": 9
-      }
-    ],
-    "width": 32,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -6,
-    "vertices": [
-      {
-        "x": -3,
-        "y": 0
-      },
-      {
-        "x": -4,
-        "y": 3
-      },
-      {
-        "x": -5,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": -8,
-        "y": 8
-      },
-      {
-        "x": -9,
-        "y": 7
+        "y": -5
       },
       {
         "x": -10,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": -7,
-        "y": -12
-      },
-      {
-        "x": -5,
-        "y": -10
-      },
-      {
-        "x": -4,
-        "y": -7
-      },
-      {
-        "x": -4,
-        "y": 0
-      },
-      {
-        "x": -5,
-        "y": 4
-      },
-      {
-        "x": -6,
-        "y": 6
+        "y": -4
       },
       {
         "x": -7,
-        "y": 7
-      },
-      {
-        "x": -8,
-        "y": 6
-      },
-      {
-        "x": -9,
-        "y": 6
-      },
-      {
-        "x": -12,
-        "y": 9
-      },
-      "PENUP",
-      {
-        "x": -4,
-        "y": -11
-      },
-      {
-        "x": -2,
-        "y": -12
+        "y": -4
       },
       {
         "x": 0,
-        "y": -12
-      },
-      {
-        "x": 2,
-        "y": -11
+        "y": -5
       },
       {
         "x": 4,
-        "y": -9
-      },
-      {
-        "x": 5,
         "y": -6
       },
       {
-        "x": 5,
-        "y": 0
-      },
-      {
-        "x": 4,
-        "y": 3
-      },
-      {
-        "x": 3,
-        "y": 5
-      },
-      {
-        "x": 1,
-        "y": 7
-      },
-      {
-        "x": -1,
-        "y": 9
-      },
-      {
-        "x": -2,
-        "y": 8
-      }
-    ],
-    "width": -3,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 0,
-    "vertices": [
-      {
-        "x": 3,
-        "y": 4
-      },
-      "PENUP",
-      {
-        "x": 0,
-        "y": 8
-      },
-      {
-        "x": -1,
-        "y": 7
-      },
-      {
-        "x": -2,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": 0,
-        "y": -12
-      },
-      {
-        "x": 2,
-        "y": -10
-      },
-      {
-        "x": 3,
+        "x": 6,
         "y": -7
       },
       {
-        "x": 3,
-        "y": 1
+        "x": 7,
+        "y": -8
       },
       {
-        "x": 2,
-        "y": 5
-      },
-      {
-        "x": 1,
-        "y": 7
-      },
-      {
-        "x": 0,
-        "y": 6
-      },
-      {
-        "x": -1,
-        "y": 6
-      },
-      {
-        "x": -4,
-        "y": 9
-      },
-      "PENUP",
-      {
-        "x": 3,
-        "y": -10
-      },
-      {
-        "x": 4,
-        "y": -11
+        "x": 6,
+        "y": -9
       },
       {
         "x": 6,
         "y": -12
       },
       {
-        "x": 8,
-        "y": -12
-      },
-      {
-        "x": 10,
-        "y": -11
-      },
-      {
-        "x": 11,
-        "y": -10
-      },
-      {
-        "x": 12,
-        "y": -8
-      },
-      {
-        "x": 13,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": 10,
-        "y": -10
-      },
-      {
-        "x": 11,
-        "y": -8
-      },
-      "PENUP",
-      {
-        "x": 8,
-        "y": -12
-      },
-      {
         "x": 9,
-        "y": -11
+        "y": -50
       },
       {
-        "x": 10,
-        "y": -8
-      }
-    ],
-    "width": 4,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": -5,
-    "vertices": [
-      {
-        "x": 9,
+        "x": 0,
         "y": -4
       },
       {
-        "x": 8,
-        "y": -1
+        "x": -11,
+        "y": -2
       },
       {
-        "x": 8,
+        "x": -12,
+        "y": 0
+      },
+      {
+        "x": -12,
         "y": 2
       },
       {
-        "x": 9,
-        "y": 6
+        "x": -11,
+        "y": 4
       },
       {
-        "x": 11,
-        "y": 9
+        "x": -9,
+        "y": 5
       },
       {
-        "x": 14,
-        "y": 6
+        "x": -6,
+        "y": 5
       },
-      "PENUP",
       {
-        "x": 10,
-        "y": -4
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 3,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 1
+      },
+      {
+        "x": 7,
+        "y": -1
       },
       {
         "x": 9,
         "y": -2
       },
       {
-        "x": 9,
-        "y": 2
-      },
-      {
-        "x": 10,
-        "y": 5
-      },
-      {
-        "x": 12,
-        "y": 8
-      },
-      "PENUP",
-      {
-        "x": 13,
-        "y": -7
-      },
-      {
-        "x": 11,
-        "y": -5
-      },
-      {
-        "x": 10,
+        "x": 8,
         "y": -3
       },
       {
-        "x": 10,
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -9,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 4
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": 8,
+        "y": -1
+      },
+      {
+        "x": 7,
+        "y": -2
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -12,
+        "y": 2
+      },
+      {
+        "x": -10,
+        "y": 3
+      },
+      {
+        "x": -7,
+        "y": 3
+      },
+      {
+        "x": 1,
+        "y": 2
+      },
+      {
+        "x": 5,
         "y": 1
       },
       {
-        "x": 11,
-        "y": 5
+        "x": 7,
+        "y": 0
       },
       {
-        "x": 13,
-        "y": 7
+        "x": 6,
+        "y": -1
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
+      {
+        "x": 9,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -10,
+        "y": 4
+      },
+      {
+        "x": -11,
+        "y": 6
+      },
+      {
+        "x": -12,
+        "y": 8
+      },
+      {
+        "x": -12,
+        "y": 10
+      },
+      {
+        "x": -11,
+        "y": 11
+      },
+      {
+        "x": -10,
+        "y": 12
+      },
+      {
+        "x": -8,
+        "y": 13
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      {
+        "x": -10,
+        "y": 11
+      },
+      {
+        "x": -8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": -12,
+        "y": 9
+      },
+      {
+        "x": -11,
+        "y": 10
+      },
+      {
+        "x": -8,
+        "y": 11
+      },
+      {
+        "x": -7,
+        "y": 13
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 13
+      },
+      {
+        "x": -7,
+        "y": 10
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 11
+      },
+      {
+        "x": 9,
+        "y": 14
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": 2,
+        "y": 10
+      },
+      {
+        "x": 5,
+        "y": 12
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 13
+      },
+      {
+        "x": -7,
+        "y": 11
+      },
+      {
+        "x": -5,
+        "y": 10
+      },
+      {
+        "x": -3,
+        "y": 10
+      },
+      {
+        "x": 1,
+        "y": 11
+      },
+      {
+        "x": 5,
+        "y": 13
       }
     ],
-    "width": 5,
-    "height": 16
+    "width": 10,
+    "height": 64
   },
   {
     "id": 3314,
@@ -144690,18 +155518,24 @@
       {
         "x": -6,
         "y": 9
-      }
-    ],
-    "width": 28,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 8
+      },
+      {
+        "x": -9,
+        "y": 8
+      },
+      {
+        "x": -11,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -9
+      },
       {
         "x": 0,
         "y": -7
@@ -144813,18 +155647,24 @@
       {
         "x": 8,
         "y": -8
-      }
-    ],
-    "width": -8,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -11
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
+      {
+        "x": 8,
+        "y": -7
+      },
       {
         "x": 10,
         "y": -7
@@ -144909,8 +155749,8 @@
         "y": 7
       }
     ],
-    "width": 1,
-    "height": 16
+    "width": 28,
+    "height": 21
   },
   {
     "id": 3315,
@@ -145033,18 +155873,27 @@
       {
         "x": 9,
         "y": 4
-      }
-    ],
-    "width": 28,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 8
+      },
       {
         "x": -9,
         "y": 5
@@ -145156,30 +156005,192 @@
       {
         "x": -11,
         "y": 6
+      },
+      {
+        "x": -11,
+        "y": 8
+      },
+      {
+        "x": -10,
+        "y": 9
+      },
+      {
+        "x": -9,
+        "y": 8
+      },
+      {
+        "x": -10,
+        "y": 7
       }
     ],
-    "width": 11,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 28,
+    "height": 21
   },
   {
     "id": 3316,
     "mappedTo": null,
-    "vertexCount": 100,
-    "leftHandPosition": -13,
-    "rightHandPosition": 14,
+    "vertexCount": 10,
+    "leftHandPosition": -34,
+    "rightHandPosition": -13,
     "vertices": [
       {
+        "x": 14,
+        "y": -10
+      },
+      {
+        "x": -1,
+        "y": -10
+      },
+      {
+        "x": 0,
+        "y": -9
+      },
+      {
+        "x": 1,
+        "y": -7
+      },
+      {
+        "x": 1,
+        "y": -5
+      },
+      {
+        "x": 0,
+        "y": -5
+      },
+      {
+        "x": -3,
+        "y": -6
+      },
+      {
+        "x": -5,
+        "y": -8
+      },
+      {
+        "x": -8,
+        "y": -8
+      },
+      {
         "x": -10,
+        "y": -6
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -3,
+        "y": -8
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": 1,
+        "y": -6
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -2,
+        "y": -8
+      },
+      {
+        "x": -5,
+        "y": -9
+      },
+      {
+        "x": -7,
+        "y": -9
+      },
+      {
+        "x": -9,
+        "y": -8
+      },
+      {
+        "x": -11,
+        "y": -6
+      },
+      {
+        "x": -12,
+        "y": -3
+      },
+      {
+        "x": -12,
+        "y": -1
+      },
+      {
+        "x": -11,
+        "y": 0
+      },
+      {
+        "x": -10,
+        "y": 1
+      },
+      {
+        "x": -8,
+        "y": 1
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": 1
+      },
+      {
+        "x": 10,
+        "y": 0
+      },
+      {
+        "x": 12,
+        "y": -2
+      },
+      {
+        "x": 13,
+        "y": -5
+      },
+      {
+        "x": 13,
+        "y": -6
+      },
+      {
+        "x": 12,
+        "y": -6
+      },
+      {
+        "x": 10,
+        "y": -5
+      },
+      {
+        "x": 9,
+        "y": -4
+      },
+      {
+        "x": 10,
+        "y": -5
+      },
+      {
+        "x": 11,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": -1
       },
       {
@@ -145187,336 +156198,240 @@
         "y": 0
       },
       {
-        "x": -9,
-        "y": 1
-      },
-      {
-        "x": -7,
-        "y": 1
-      },
-      {
-        "x": -5,
+        "x": -8,
         "y": 0
-      },
-      {
-        "x": -5,
-        "y": -3
-      },
-      {
-        "x": -6,
-        "y": -5
-      },
-      {
-        "x": -8,
-        "y": -8
-      },
-      {
-        "x": -8,
-        "y": -10
-      },
-      {
-        "x": -6,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -6,
-        "y": -3
-      },
-      {
-        "x": -8,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": -7,
-        "y": 1
-      },
-      {
-        "x": -6,
-        "y": 0
-      },
-      {
-        "x": -6,
-        "y": -2
-      },
-      {
-        "x": -8,
-        "y": -5
-      },
-      {
-        "x": -9,
-        "y": -7
-      },
-      {
-        "x": -9,
-        "y": -9
-      },
-      {
-        "x": -8,
-        "y": -11
-      },
-      {
-        "x": -6,
-        "y": -12
-      },
-      {
-        "x": -3,
-        "y": -12
-      },
-      {
-        "x": -1,
-        "y": -11
-      },
-      {
-        "x": 0,
-        "y": -10
-      },
-      {
-        "x": 1,
-        "y": -8
-      },
-      {
-        "x": 1,
-        "y": 3
-      },
-      "PENUP",
-      {
-        "x": 1,
-        "y": 5
-      },
-      {
-        "x": 1,
-        "y": 10
-      },
-      {
-        "x": 0,
-        "y": 12
-      }
-    ],
-    "width": 27,
-    "height": 24
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": 9,
-    "vertices": [
-      {
-        "x": -4,
-        "y": 10
-      },
-      {
-        "x": -5,
-        "y": 11
-      },
-      "PENUP",
-      {
-        "x": -1,
-        "y": -10
-      },
-      {
-        "x": 0,
-        "y": -8
-      },
-      {
-        "x": 0,
-        "y": 10
-      },
-      {
-        "x": -1,
-        "y": 12
-      },
-      "PENUP",
-      {
-        "x": -3,
-        "y": -12
-      },
-      {
-        "x": -2,
-        "y": -11
-      },
-      {
-        "x": -1,
-        "y": -8
-      },
-      {
-        "x": -1,
-        "y": 3
-      },
-      "PENUP",
-      {
-        "x": -1,
-        "y": 5
-      },
-      {
-        "x": -1,
-        "y": 10
-      },
-      {
-        "x": -2,
-        "y": 12
-      },
-      {
-        "x": -3,
-        "y": 13
-      },
-      "PENUP",
-      {
-        "x": 1,
-        "y": -8
-      },
-      {
-        "x": 6,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": 6,
-        "y": -12
-      },
-      {
-        "x": 8,
-        "y": -9
-      },
-      {
-        "x": 9,
-        "y": -7
       },
       {
         "x": 10,
+        "y": -1
+      },
+      {
+        "x": 12,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": -3
       },
       {
-        "x": 10,
-        "y": 0
-      },
-      {
-        "x": 9,
-        "y": 3
-      },
-      {
-        "x": 7,
-        "y": 6
-      },
-      {
-        "x": 4,
-        "y": 9
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": -11
-      }
-    ],
-    "width": 14,
-    "height": 25
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -10,
-    "vertices": [
-      {
-        "x": 6,
-        "y": -8
-      },
-      {
-        "x": 8,
-        "y": -5
-      },
-      {
-        "x": 9,
+        "x": -12,
         "y": -2
       },
       {
-        "x": 9,
-        "y": 1
+        "x": -11,
+        "y": -1
       },
       {
-        "x": 8,
-        "y": 4
-      },
-      {
-        "x": 7,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": 7
+        "x": -8,
+        "y": -1
       },
       {
         "x": 3,
-        "y": 4
+        "y": -50
       },
       {
-        "x": 1,
-        "y": 3
+        "x": 0,
+        "y": -1
       },
-      "PENUP",
-      {
-        "x": -1,
-        "y": 3
-      },
-      {
-        "x": -3,
-        "y": 4
-      },
-      {
-        "x": -5,
-        "y": 6
-      },
-      "PENUP",
       {
         "x": 5,
+        "y": -1
+      },
+      {
+        "x": 10,
+        "y": -2
+      },
+      {
+        "x": 12,
+        "y": -3
+      },
+      {
+        "x": 13,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": -12,
         "y": 8
       },
       {
-        "x": 3,
-        "y": 5
-      },
-      {
-        "x": 1,
-        "y": 4
-      },
-      {
-        "x": -2,
-        "y": 4
-      },
-      "PENUP",
-      {
-        "x": 4,
+        "x": -9,
         "y": 9
       },
       {
-        "x": 2,
-        "y": 6
-      },
-      {
-        "x": 1,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": -1,
-        "y": 5
+        "x": -7,
+        "y": 10
       },
       {
         "x": -3,
+        "y": 10
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 4
+      },
+      {
+        "x": 9,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": 5
       },
       {
-        "x": -5,
+        "x": -11,
+        "y": 8
+      },
+      {
+        "x": -7,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": -10,
         "y": 6
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": 7,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 1
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": -5
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": 8,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 1
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 9,
+        "y": 2
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -5
       }
     ],
-    "width": -6,
-    "height": 17
+    "width": 21,
+    "height": 60
   },
   {
     "id": 3317,
@@ -145639,18 +156554,24 @@
       {
         "x": 9,
         "y": 4
-      }
-    ],
-    "width": 28,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 6,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
       {
         "x": -3,
         "y": 8
@@ -145762,18 +156683,24 @@
       {
         "x": -11,
         "y": 6
-      }
-    ],
-    "width": 9,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -11,
+        "y": 8
+      },
+      {
+        "x": -10,
+        "y": 9
+      },
+      {
+        "x": -9,
+        "y": 8
+      },
+      {
+        "x": -10,
+        "y": 7
+      },
+      "PENUP",
       {
         "x": 2,
         "y": 6
@@ -145829,8 +156756,8 @@
         "y": 7
       }
     ],
-    "width": 50,
-    "height": 5
+    "width": 28,
+    "height": 21
   },
   {
     "id": 3318,
@@ -145956,18 +156883,24 @@
       {
         "x": -7,
         "y": 9
-      }
-    ],
-    "width": 28,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -9,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -10
+      },
+      {
+        "x": -1,
+        "y": -8
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
       {
         "x": -2,
         "y": 6
@@ -146076,18 +157009,24 @@
       {
         "x": 8,
         "y": -10
-      }
-    ],
-    "width": 5,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -8,
-    "vertices": [
+      },
+      {
+        "x": 9,
+        "y": -8
+      },
+      {
+        "x": 10,
+        "y": -7
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -10
+      },
+      {
+        "x": 8,
+        "y": -8
+      },
       "PENUP",
       {
         "x": 5,
@@ -146166,7 +157105,7 @@
         "y": 7
       }
     ],
-    "width": 0,
+    "width": 28,
     "height": 21
   },
   {
@@ -146293,18 +157232,27 @@
       {
         "x": -9,
         "y": 3
-      }
-    ],
-    "width": 27,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 5
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
       {
         "x": 6,
         "y": 8
@@ -146419,18 +157367,24 @@
       {
         "x": 5,
         "y": -3
-      }
-    ],
-    "width": 12,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": 0,
+        "y": 1
+      },
+      "PENUP",
+      {
+        "x": 11,
+        "y": -1
+      },
+      {
+        "x": 9,
+        "y": -3
+      },
       {
         "x": 7,
         "y": -3
@@ -146472,8 +157426,8 @@
         "y": -6
       }
     ],
-    "width": 6,
-    "height": 8
+    "width": 27,
+    "height": 21
   },
   {
     "id": 3320,
@@ -146596,18 +157550,27 @@
         "x": 9,
         "y": -10
       },
-      "PENUP"
-    ],
-    "width": 25,
-    "height": 8
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 3,
+        "y": -9
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -1,
+        "y": -4
+      },
+      {
+        "x": -1,
+        "y": -2
+      },
+      {
+        "x": 1,
+        "y": 2
+      },
       {
         "x": 1,
         "y": 4
@@ -146719,18 +157682,24 @@
       {
         "x": -6,
         "y": 5
-      }
-    ],
-    "width": 3,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -9,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": 6
+      },
       {
         "x": -8,
         "y": 5
@@ -146764,8 +157733,8 @@
         "y": 6
       }
     ],
-    "width": 15,
-    "height": 4
+    "width": 25,
+    "height": 21
   },
   {
     "id": 3321,
@@ -146885,911 +157854,1042 @@
       {
         "x": 9,
         "y": 6
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -11
+      },
+      {
+        "x": 5,
+        "y": -10
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 7,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 6,
+        "y": 6
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      {
+        "x": 8,
+        "y": 7
       }
     ],
     "width": 22,
     "height": 21
   },
   {
-    "id": null,
+    "id": 3322,
     "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 8,
+    "vertexCount": 10,
+    "leftHandPosition": -34,
+    "rightHandPosition": -14,
     "vertices": [
-      "PENUP",
       {
-        "x": 1,
-        "y": -9
+        "x": 14,
+        "y": -11
       },
       {
-        "x": 4,
-        "y": -12
+        "x": -1,
+        "y": -11
       },
       {
-        "x": 7,
+        "x": 0,
         "y": -10
       },
       {
-        "x": 6,
+        "x": 1,
+        "y": -8
+      },
+      {
+        "x": 1,
+        "y": -6
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -3,
+        "y": -7
+      },
+      {
+        "x": -5,
         "y": -9
       },
       {
-        "x": 6,
-        "y": 6
+        "x": -8,
+        "y": -9
       },
       {
-        "x": 7,
-        "y": 7
+        "x": -10,
+        "y": -7
       },
       {
-        "x": 8,
-        "y": 7
-      }
-    ],
-    "width": 15,
-    "height": 19
-  },
-  {
-    "id": 3322,
-    "mappedTo": null,
-    "vertexCount": 100,
-    "leftHandPosition": -14,
-    "rightHandPosition": 14,
-    "vertices": [
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": -3,
+        "y": -9
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -8
+      },
+      {
+        "x": 1,
+        "y": -7
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": -2,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -10
+      },
+      {
+        "x": -7,
+        "y": -10
+      },
+      {
+        "x": -9,
+        "y": -9
+      },
+      {
+        "x": -11,
+        "y": -7
+      },
+      {
+        "x": -12,
+        "y": -4
+      },
+      {
+        "x": -12,
+        "y": -2
+      },
       {
         "x": -11,
         "y": -1
       },
       {
-        "x": -11,
-        "y": 0
-      },
-      {
         "x": -10,
-        "y": 1
+        "y": 0
       },
       {
         "x": -8,
-        "y": 1
-      },
-      {
-        "x": -6,
         "y": 0
       },
       {
-        "x": -6,
-        "y": -3
-      },
-      {
-        "x": -7,
-        "y": -5
-      },
-      {
-        "x": -9,
-        "y": -8
-      },
-      {
-        "x": -9,
-        "y": -10
-      },
-      {
-        "x": -7,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -7,
-        "y": -3
-      },
-      {
-        "x": -9,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": -8,
-        "y": 1
-      },
-      {
-        "x": -7,
-        "y": 0
-      },
-      {
-        "x": -7,
-        "y": -2
-      },
-      {
-        "x": -9,
-        "y": -5
-      },
-      {
-        "x": -10,
-        "y": -7
-      },
-      {
-        "x": -10,
-        "y": -9
-      },
-      {
-        "x": -9,
-        "y": -11
-      },
-      {
-        "x": -7,
-        "y": -12
-      },
-      {
-        "x": -4,
-        "y": -12
-      },
-      {
-        "x": -2,
-        "y": -11
-      },
-      {
-        "x": -1,
-        "y": -10
-      },
-      {
         "x": 0,
-        "y": -8
-      },
-      {
-        "x": 0,
-        "y": 0
-      },
-      {
-        "x": -1,
-        "y": 3
-      },
-      {
-        "x": -3,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": -2,
-        "y": -10
-      }
-    ],
-    "width": 28,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -11,
-    "vertices": [
-      {
-        "x": -2,
-        "y": -8
-      },
-      {
-        "x": -2,
-        "y": 3
-      },
-      {
-        "x": -3,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": 0,
-        "y": -9
-      },
-      {
-        "x": 1,
-        "y": -11
+        "y": -1
       },
       {
         "x": 3,
-        "y": -12
+        "y": -3
       },
       {
         "x": 5,
-        "y": -12
+        "y": -50
       },
       {
-        "x": 7,
-        "y": -11
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": -10,
+        "y": -1
+      },
+      {
+        "x": -8,
+        "y": -1
+      },
+      {
+        "x": 2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": -12,
+        "y": -3
+      },
+      {
+        "x": -11,
+        "y": -2
+      },
+      {
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -9,
+        "y": 1
+      },
+      {
+        "x": -11,
+        "y": 3
+      },
+      {
+        "x": -12,
+        "y": 5
+      },
+      {
+        "x": -12,
+        "y": 7
+      },
+      {
+        "x": -11,
+        "y": 9
+      },
+      {
+        "x": -8,
+        "y": 10
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": -10,
+        "y": 8
+      },
+      {
+        "x": -8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -12,
+        "y": 6
+      },
+      {
+        "x": -11,
+        "y": 7
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -7,
+        "y": 10
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": -7,
+        "y": 6
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -2,
+        "y": 9
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      {
+        "x": 2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 10
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 8,
+        "y": 5
       },
       {
         "x": 9,
+        "y": 1
+      },
+      {
+        "x": 9,
+        "y": -2
+      },
+      {
+        "x": 8,
         "y": -8
       },
       {
-        "x": 10,
-        "y": -7
+        "x": 5,
+        "y": -9
       },
-      "PENUP",
       {
-        "x": 7,
+        "x": 5,
         "y": -10
       },
       {
-        "x": 8,
-        "y": -8
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": -12
-      },
-      {
         "x": 6,
-        "y": -11
+        "y": -50
       },
       {
-        "x": 7,
-        "y": -8
+        "x": 0,
+        "y": 2
       },
       {
         "x": 8,
-        "y": -7
+        "y": 0
       },
-      {
-        "x": 10,
-        "y": -7
-      },
-      "PENUP",
       {
         "x": 8,
-        "y": -7
-      },
-      {
-        "x": 6,
-        "y": -7
-      },
-      {
-        "x": 5,
         "y": -6
       },
       {
         "x": 5,
-        "y": -4
-      },
-      {
-        "x": 6,
-        "y": -2
-      },
-      {
-        "x": 9,
-        "y": 0
-      },
-      {
-        "x": 10,
-        "y": 2
-      },
-      "PENUP",
-      {
-        "x": 6,
-        "y": -3
-      },
-      {
-        "x": 9,
-        "y": -1
-      }
-    ],
-    "width": -8,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": 0,
-    "vertices": [
-      {
-        "x": 10,
-        "y": 4
-      },
-      {
-        "x": 9,
-        "y": 6
-      },
-      {
-        "x": 7,
-        "y": 8
+        "y": -7
       },
       {
         "x": 5,
-        "y": 9
-      },
-      {
-        "x": 1,
-        "y": 9
-      },
-      {
-        "x": -2,
-        "y": 8
-      },
-      {
-        "x": -8,
-        "y": 5
-      },
-      {
-        "x": -9,
-        "y": 5
-      },
-      {
-        "x": -10,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": 8
+        "y": -50
       },
       {
         "x": 0,
         "y": 8
       },
       {
-        "x": -6,
-        "y": 5
+        "x": 7,
+        "y": 6
       },
-      {
-        "x": -7,
-        "y": 5
-      },
-      "PENUP",
       {
         "x": 8,
-        "y": 7
+        "y": 3
+      },
+      {
+        "x": 8,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -7
+      },
+      {
+        "x": 4,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -10
       },
       {
         "x": 6,
-        "y": 8
+        "y": -10
       },
       {
-        "x": 3,
-        "y": 8
+        "x": 8,
+        "y": -9
       },
       {
-        "x": 0,
-        "y": 7
+        "x": 9,
+        "y": -8
       },
       {
-        "x": -4,
-        "y": 5
-      },
-      {
-        "x": -7,
-        "y": 4
-      },
-      {
-        "x": -9,
-        "y": 4
-      },
-      {
-        "x": -10,
-        "y": 6
-      },
-      {
-        "x": -10,
-        "y": 8
-      },
-      {
-        "x": -9,
-        "y": 9
-      },
-      {
-        "x": -8,
-        "y": 8
-      },
-      {
-        "x": -9,
-        "y": 7
+        "x": 8,
+        "y": -9
       }
     ],
-    "width": 10,
-    "height": 5
+    "width": 20,
+    "height": 60
   },
   {
     "id": 3323,
     "mappedTo": null,
-    "vertexCount": 143,
-    "leftHandPosition": -16,
-    "rightHandPosition": 17,
+    "vertexCount": 14,
+    "leftHandPosition": -31,
+    "rightHandPosition": -16,
     "vertices": [
       {
-        "x": -13,
-        "y": -1
+        "x": 17,
+        "y": -13
       },
       {
-        "x": -13,
-        "y": 0
+        "x": -1,
+        "y": -13
       },
       {
-        "x": -12,
-        "y": 1
+        "x": 0,
+        "y": -12
       },
       {
-        "x": -10,
-        "y": 1
-      },
-      {
-        "x": -8,
-        "y": 0
-      },
-      {
-        "x": -8,
-        "y": -3
-      },
-      {
-        "x": -9,
-        "y": -5
-      },
-      {
-        "x": -11,
-        "y": -8
-      },
-      {
-        "x": -11,
+        "x": 1,
         "y": -10
       },
       {
-        "x": -9,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -9,
-        "y": -3
+        "x": 1,
+        "y": -8
       },
       {
-        "x": -11,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": -10,
-        "y": 1
-      },
-      {
-        "x": -9,
-        "y": 0
-      },
-      {
-        "x": -9,
-        "y": -2
-      },
-      {
-        "x": -11,
-        "y": -5
-      },
-      {
-        "x": -12,
-        "y": -7
-      },
-      {
-        "x": -12,
-        "y": -9
-      },
-      {
-        "x": -11,
-        "y": -11
-      },
-      {
-        "x": -9,
-        "y": -12
-      },
-      {
-        "x": -6,
-        "y": -12
-      },
-      {
-        "x": -4,
-        "y": -11
+        "x": 0,
+        "y": -8
       },
       {
         "x": -3,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -11
+      },
+      {
+        "x": -8,
+        "y": -11
+      },
+      {
+        "x": -10,
+        "y": -9
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": -10
       },
       {
-        "x": -2,
-        "y": -8
+        "x": 1,
+        "y": -9
+      },
+      {
+        "x": 0,
+        "y": -9
       },
       {
         "x": -2,
+        "y": -11
+      },
+      {
+        "x": -5,
+        "y": -12
+      },
+      {
+        "x": -7,
+        "y": -12
+      },
+      {
+        "x": -9,
+        "y": -11
+      },
+      {
+        "x": -11,
+        "y": -9
+      },
+      {
+        "x": -12,
+        "y": -6
+      },
+      {
+        "x": -12,
+        "y": -4
+      },
+      {
+        "x": -11,
+        "y": -3
+      },
+      {
+        "x": -10,
+        "y": -2
+      },
+      {
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": 2,
+        "y": -7
+      },
+      {
+        "x": 4,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": -10,
+        "y": -3
+      },
+      {
+        "x": -8,
+        "y": -3
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": 0,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -12,
+        "y": -5
+      },
+      {
+        "x": -11,
+        "y": -4
+      },
+      {
+        "x": -8,
         "y": -4
       },
       {
         "x": -3,
-        "y": -1
-      },
-      {
-        "x": -5,
-        "y": 2
-      },
-      {
-        "x": -7,
-        "y": 4
-      },
-      "PENUP"
-    ],
-    "width": 33,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
-      {
-        "x": -6,
-        "y": -12
-      },
-      {
-        "x": -5,
-        "y": -11
-      },
-      {
-        "x": -4,
-        "y": -8
-      },
-      {
-        "x": -4,
-        "y": -3
-      },
-      {
-        "x": -5,
-        "y": 1
-      },
-      {
-        "x": -7,
-        "y": 4
-      },
-      "PENUP",
-      {
-        "x": -4,
-        "y": -11
-      },
-      {
-        "x": -2,
-        "y": -12
-      },
-      {
-        "x": 1,
-        "y": -12
-      },
-      {
-        "x": 3,
-        "y": -11
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": -12
-      },
-      {
-        "x": 2,
-        "y": -11
-      },
-      {
-        "x": 1,
-        "y": -9
-      },
-      {
-        "x": 1,
         "y": -5
       },
       {
-        "x": 2,
-        "y": -2
+        "x": 1,
+        "y": -7
       },
       {
         "x": 4,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": -11,
+        "y": -2
+      },
+      {
+        "x": -12,
         "y": 1
       },
       {
-        "x": 5,
+        "x": -12,
         "y": 3
       },
       {
-        "x": 5,
+        "x": -11,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": 5
       },
       {
-        "x": 4,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": -5
+        "x": -12,
+        "y": 2
       },
       {
-        "x": 2,
-        "y": -4
-      },
-      {
-        "x": 5,
+        "x": -11,
         "y": 1
       },
       {
-        "x": 5,
-        "y": 2
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": -12
-      },
-      {
-        "x": 3,
-        "y": -11
-      },
-      {
-        "x": 2,
-        "y": -9
-      },
-      {
-        "x": 2,
-        "y": -6
-      }
-    ],
-    "width": 50,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
-      {
-        "x": 3,
-        "y": 8
-      },
-      {
-        "x": 1,
-        "y": 9
-      },
-      {
-        "x": -3,
-        "y": 9
+        "x": -9,
+        "y": 1
       },
       {
         "x": -5,
-        "y": 8
+        "y": 2
       },
       {
-        "x": -7,
-        "y": 6
+        "x": -2,
+        "y": 4
+      },
+      {
+        "x": 1,
+        "y": 5
+      },
+      {
+        "x": 3,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -4,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 5
+      },
+      {
+        "x": 2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -12,
+        "y": 3
+      },
+      {
+        "x": -11,
+        "y": 2
       },
       {
         "x": -9,
-        "y": 5
-      },
-      {
-        "x": -11,
-        "y": 5
-      },
-      {
-        "x": -12,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": -4,
-        "y": 8
-      },
-      {
-        "x": -7,
-        "y": 5
-      },
-      {
-        "x": -8,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": -1,
-        "y": 9
-      },
-      {
-        "x": -3,
-        "y": 8
+        "y": 2
       },
       {
         "x": -6,
+        "y": 3
+      },
+      {
+        "x": -4,
         "y": 5
       },
       {
-        "x": -8,
-        "y": 4
-      },
-      {
-        "x": -11,
-        "y": 4
-      },
-      {
-        "x": -12,
+        "x": -1,
         "y": 6
       },
       {
-        "x": -12,
-        "y": 8
+        "x": 2,
+        "y": 6
       },
       {
-        "x": -11,
-        "y": 9
+        "x": 4,
+        "y": 5
       },
       {
-        "x": -10,
-        "y": 8
-      },
-      {
-        "x": -11,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": -12
+        "x": 6,
+        "y": 3
       },
       {
         "x": 8,
-        "y": -12
+        "y": 1
       },
-      {
-        "x": 10,
-        "y": -11
-      },
-      {
-        "x": 12,
-        "y": -8
-      },
-      {
-        "x": 13,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": 10,
-        "y": -10
-      }
-    ],
-    "width": 11,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": -8,
-    "vertices": [
-      {
-        "x": 11,
-        "y": -7
-      },
-      {
-        "x": 13,
-        "y": -7
-      },
-      "PENUP",
-      {
-        "x": 11,
-        "y": -7
-      },
-      {
-        "x": 9,
-        "y": -7
-      },
-      {
-        "x": 8,
-        "y": -6
-      },
-      {
-        "x": 8,
-        "y": -4
-      },
-      {
-        "x": 9,
-        "y": -2
-      },
-      {
-        "x": 12,
-        "y": 0
-      },
-      {
-        "x": 13,
-        "y": 2
-      },
-      "PENUP",
       {
         "x": 9,
         "y": -3
       },
       {
-        "x": 12,
-        "y": -1
-      },
-      "PENUP",
-      {
-        "x": 8,
+        "x": 9,
         "y": -5
       },
       {
-        "x": 9,
+        "x": 8,
+        "y": -7
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 5,
+        "y": -11
+      },
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": -4
       },
       {
-        "x": 12,
-        "y": -2
+        "x": 8,
+        "y": -7
       },
       {
-        "x": 13,
-        "y": 0
+        "x": 5,
+        "y": -8
       },
       {
-        "x": 13,
-        "y": 5
+        "x": 5,
+        "y": -50
       },
       {
-        "x": 12,
-        "y": 7
-      },
-      {
-        "x": 11,
-        "y": 8
+        "x": 0,
+        "y": -1
       },
       {
         "x": 9,
-        "y": 9
+        "y": -3
       },
       {
-        "x": 6,
-        "y": 9
+        "x": 8,
+        "y": -6
       },
       {
-        "x": 3,
-        "y": 8
-      },
-      "PENUP",
-      {
-        "x": 7,
-        "y": 8
-      },
-      {
-        "x": 6,
-        "y": 8
+        "x": 5,
+        "y": -8
       },
       {
         "x": 4,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": 12,
-        "y": 7
+        "y": -11
       },
       {
-        "x": 10,
+        "x": 4,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -12
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
+      {
+        "x": 9,
+        "y": -10
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -12,
         "y": 8
+      },
+      {
+        "x": -12,
+        "y": 10
+      },
+      {
+        "x": -11,
+        "y": 12
+      },
+      {
+        "x": -8,
+        "y": 13
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 10
+      },
+      {
+        "x": -10,
+        "y": 11
+      },
+      {
+        "x": -8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": -12,
+        "y": 9
+      },
+      {
+        "x": -11,
+        "y": 10
+      },
+      {
+        "x": -8,
+        "y": 11
+      },
+      {
+        "x": -7,
+        "y": 13
+      },
+      {
+        "x": -7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 11
+      },
+      {
+        "x": -7,
+        "y": 9
+      },
+      {
+        "x": -7,
+        "y": 8
+      },
+      {
+        "x": -6,
+        "y": 8
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 12
+      },
+      {
+        "x": 0,
+        "y": 13
+      },
+      {
+        "x": 2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 12
+      },
+      {
+        "x": -1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 12
+      },
+      {
+        "x": -2,
+        "y": 13
+      },
+      {
+        "x": 0,
+        "y": 13
+      },
+      {
+        "x": 5,
+        "y": 12
+      },
+      {
+        "x": 7,
+        "y": 11
+      },
+      {
+        "x": 8,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      {
+        "x": 9,
+        "y": 3
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      {
+        "x": 8,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 12
+      },
+      {
+        "x": 7,
+        "y": 10
+      },
+      {
+        "x": 8,
+        "y": 8
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      {
+        "x": 7,
+        "y": 5
       }
     ],
-    "width": 2,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 15,
+    "height": 63
   },
   {
     "id": 3324,
@@ -147909,18 +159009,24 @@
       {
         "x": 5,
         "y": 8
-      }
-    ],
-    "width": 24,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": -9
+      },
+      {
+        "x": -4,
+        "y": -12
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      {
+        "x": 0,
+        "y": -9
+      },
       {
         "x": 1,
         "y": -6
@@ -148026,18 +159132,24 @@
         "x": 9,
         "y": -12
       },
-      "PENUP"
-    ],
-    "width": -9,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -3,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -7,
+        "y": 1
+      },
+      {
+        "x": -5,
+        "y": -3
+      },
+      {
+        "x": -1,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -3
+      },
       {
         "x": 5,
         "y": -3
@@ -148082,8 +159194,8 @@
         "y": -5
       }
     ],
-    "width": -2,
-    "height": 6
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3325,
@@ -148209,18 +159321,24 @@
       {
         "x": 1,
         "y": 5
-      }
-    ],
-    "width": 26,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": 5
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -10
+      },
+      {
+        "x": 0,
+        "y": -8
+      },
+      {
+        "x": 0,
+        "y": -2
+      },
       {
         "x": -1,
         "y": 1
@@ -148329,25 +159447,34 @@
       {
         "x": -2,
         "y": 13
-      }
-    ],
-    "width": -2,
-    "height": 25
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 12
+      },
+      {
+        "x": -7,
+        "y": 10
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      {
+        "x": -6,
+        "y": 8
+      },
       {
         "x": -7,
         "y": 9
       }
     ],
-    "width": 14,
-    "height": 0
+    "width": 26,
+    "height": 25
   },
   {
     "id": 3326,
@@ -148467,18 +159594,27 @@
       {
         "x": -3,
         "y": 0
-      }
-    ],
-    "width": 24,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": -1
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 2
+      },
+      {
+        "x": 8,
+        "y": 4
+      },
       {
         "x": 8,
         "y": 8
@@ -148590,25 +159726,34 @@
       {
         "x": -5,
         "y": 8
-      }
-    ],
-    "width": 12,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -9,
-    "rightHandPosition": 11,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -9,
+        "y": 7
+      },
+      {
+        "x": -10,
+        "y": 8
+      },
+      {
+        "x": -10,
+        "y": 10
+      },
+      {
+        "x": -9,
+        "y": 11
+      },
       {
         "x": -8,
         "y": 11
       }
     ],
-    "width": 20,
-    "height": 0
+    "width": 24,
+    "height": 25
   },
   {
     "id": 3401,
@@ -148728,18 +159873,24 @@
       {
         "x": 4,
         "y": 6
-      }
-    ],
-    "width": 17,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -5
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
       {
         "x": 6,
         "y": -3
@@ -148771,8 +159922,8 @@
         "y": 7
       }
     ],
-    "width": 2,
-    "height": 10
+    "width": 17,
+    "height": 14
   },
   {
     "id": 3402,
@@ -148889,18 +160040,27 @@
       {
         "x": -2,
         "y": -2
-      }
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       {
         "x": 4,
         "y": 7
@@ -148948,8 +160108,8 @@
         "y": 8
       }
     ],
-    "width": 11,
-    "height": 12
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3403,
@@ -149178,18 +160338,24 @@
       {
         "x": -4,
         "y": 6
-      }
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -5,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -2
+      },
+      {
+        "x": -3,
+        "y": 6
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
       "PENUP",
       {
         "x": -2,
@@ -149225,8 +160391,8 @@
         "y": 9
       }
     ],
-    "width": 8,
-    "height": 12
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3405,
@@ -149452,18 +160618,21 @@
       {
         "x": -4,
         "y": -2
-      }
-    ],
-    "width": 13,
-    "height": 10
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": -2
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      "PENUP",
       {
         "x": -2,
         "y": -2
@@ -149507,8 +160676,8 @@
         "y": 14
       }
     ],
-    "width": 50,
-    "height": 18
+    "width": 13,
+    "height": 26
   },
   {
     "id": 3407,
@@ -149628,18 +160797,24 @@
       {
         "x": 4,
         "y": -2
-      }
-    ],
-    "width": 17,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -5
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
       {
         "x": 6,
         "y": -3
@@ -149699,8 +160874,8 @@
         "y": 12
       }
     ],
-    "width": 2,
-    "height": 17
+    "width": 17,
+    "height": 19
   },
   {
     "id": 3408,
@@ -149817,18 +160992,27 @@
       {
         "x": 4,
         "y": -5
-      }
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 10,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": 5
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 10
+      },
       {
         "x": 2,
         "y": 12
@@ -149876,8 +161060,8 @@
         "y": 12
       }
     ],
-    "width": 14,
-    "height": 18
+    "width": 17,
+    "height": 26
   },
   {
     "id": 3409,
@@ -149991,18 +161175,24 @@
         "x": 2,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 10,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 6,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 1,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -2
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
       {
         "x": 2,
         "y": 7
@@ -150012,8 +161202,8 @@
         "y": 7
       }
     ],
-    "width": 7,
-    "height": 0
+    "width": 10,
+    "height": 21
   },
   {
     "id": 3410,
@@ -150130,18 +161320,21 @@
       {
         "x": 2,
         "y": -3
-      }
-    ],
-    "width": 10,
-    "height": 26
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -2
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -2
+      },
       {
         "x": 1,
         "y": 9
@@ -150172,8 +161365,8 @@
         "y": 12
       }
     ],
-    "width": -1,
-    "height": 5
+    "width": 10,
+    "height": 26
   },
   {
     "id": 3411,
@@ -150287,18 +161480,24 @@
         "x": 0,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 14,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 7
+      },
+      "PENUP",
       {
         "x": -3,
         "y": 7
@@ -150389,8 +161588,8 @@
         "y": -2
       }
     ],
-    "width": 50,
-    "height": 18
+    "width": 14,
+    "height": 21
   },
   {
     "id": 3412,
@@ -150621,18 +161820,27 @@
       {
         "x": -1,
         "y": -3
-      }
-    ],
-    "width": 26,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": -1,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
       {
         "x": 0,
         "y": 6
@@ -150741,25 +161949,31 @@
       {
         "x": 9,
         "y": -2
-      }
-    ],
-    "width": 8,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 10,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 10,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 9,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      {
+        "x": 10,
+        "y": 7
+      },
       {
         "x": 11,
         "y": 7
       }
     ],
-    "width": 17,
-    "height": 0
+    "width": 26,
+    "height": 14
   },
   {
     "id": 3414,
@@ -150879,18 +162093,24 @@
       {
         "x": 4,
         "y": -2
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -2
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
       {
         "x": 2,
         "y": -5
@@ -150934,8 +162154,8 @@
         "y": 7
       }
     ],
-    "width": -4,
-    "height": 12
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3415,
@@ -151052,18 +162272,24 @@
       {
         "x": 3,
         "y": -4
-      }
-    ],
-    "width": 17,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
       {
         "x": 5,
         "y": 1
@@ -151081,8 +162307,8 @@
         "y": 8
       }
     ],
-    "width": 2,
-    "height": 7
+    "width": 17,
+    "height": 14
   },
   {
     "id": 3416,
@@ -151196,18 +162422,24 @@
       {
         "x": 2,
         "y": 8
-      }
-    ],
-    "width": 17,
-    "height": 22
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": -2,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -6,
+        "y": 8
+      },
       "PENUP",
       {
         "x": -2,
@@ -151280,8 +162512,8 @@
         "y": 8
       }
     ],
-    "width": 14,
-    "height": 13
+    "width": 17,
+    "height": 22
   },
   {
     "id": 3417,
@@ -151398,18 +162630,24 @@
         "x": 4,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 17,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": -5
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": -3
+      },
+      "PENUP",
       {
         "x": 5,
         "y": -2
@@ -151432,8 +162670,8 @@
         "y": 14
       }
     ],
-    "width": 50,
-    "height": 17
+    "width": 17,
+    "height": 19
   },
   {
     "id": 3418,
@@ -151556,16 +162794,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3419,
     "mappedTo": null,
     "vertexCount": 42,
@@ -151680,18 +162908,24 @@
       {
         "x": -1,
         "y": -3
-      }
-    ],
-    "width": 11,
-    "height": 26
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": -2,
+        "y": -3
+      },
+      {
+        "x": -1,
+        "y": -4
+      },
+      {
+        "x": -1,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -2
+      },
       {
         "x": 0,
         "y": 2
@@ -151710,8 +162944,8 @@
         "y": -2
       }
     ],
-    "width": -2,
-    "height": 16
+    "width": 11,
+    "height": 26
   },
   {
     "id": 3420,
@@ -151825,20 +163059,27 @@
       {
         "x": 3,
         "y": 7
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 9
+      },
+      {
+        "x": 4,
+        "y": 6
       }
     ],
     "width": 12,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 6,
-    "vertices": [],
-    "width": 10,
-    "height": null
+    "height": 18
   },
   {
     "id": 3421,
@@ -151958,18 +163199,24 @@
       {
         "x": 8,
         "y": 6
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
       {
         "x": 4,
         "y": -2
@@ -152008,8 +163255,8 @@
         "y": 7
       }
     ],
-    "width": 0,
-    "height": 13
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3422,
@@ -152129,18 +163376,24 @@
       {
         "x": 6,
         "y": 0
-      }
-    ],
-    "width": 17,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      "PENUP",
       {
         "x": 3,
         "y": -4
@@ -152179,8 +163432,8 @@
         "y": 8
       }
     ],
-    "width": 50,
-    "height": 12
+    "width": 17,
+    "height": 16
   },
   {
     "id": 3423,
@@ -152300,18 +163553,27 @@
         "x": -1,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 25,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 8,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -1,
+        "y": -4
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": 1,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
       "PENUP",
       {
         "x": -6,
@@ -152420,20 +163682,26 @@
       {
         "x": 8,
         "y": -2
+      },
+      {
+        "x": 9,
+        "y": 1
+      },
+      {
+        "x": 9,
+        "y": 3
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 8
       }
     ],
-    "width": 12,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 25,
+    "height": 16
   },
   {
     "id": 3424,
@@ -152556,18 +163824,24 @@
       {
         "x": 1,
         "y": 8
-      }
-    ],
-    "width": 15,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 7
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -4
+      },
       {
         "x": 4,
         "y": -2
@@ -152594,8 +163868,8 @@
         "y": -3
       }
     ],
-    "width": -1,
-    "height": 3
+    "width": 15,
+    "height": 19
   },
   {
     "id": 3425,
@@ -152715,18 +163989,24 @@
       {
         "x": 6,
         "y": 5
-      }
-    ],
-    "width": 17,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 10
+      },
+      {
+        "x": 2,
+        "y": 12
+      },
+      {
+        "x": -1,
+        "y": 14
+      },
+      "PENUP",
       {
         "x": 3,
         "y": -4
@@ -152765,8 +164045,8 @@
         "y": 12
       }
     ],
-    "width": 50,
-    "height": 16
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3426,
@@ -152889,18 +164169,21 @@
       {
         "x": 5,
         "y": 4
-      }
-    ],
-    "width": 14,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 2,
+        "y": 5
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
+      "PENUP",
       {
         "x": -1,
         "y": 4
@@ -152926,8 +164209,8 @@
         "y": 14
       }
     ],
-    "width": 50,
-    "height": 10
+    "width": 14,
+    "height": 19
   },
   {
     "id": 3427,
@@ -153041,18 +164324,27 @@
         "x": 4,
         "y": -4
       },
-      "PENUP"
-    ],
-    "width": 16,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 7,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": 3
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 5,
+        "y": 3
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
       {
         "x": 0,
         "y": 9
@@ -153135,8 +164427,8 @@
         "y": 9
       }
     ],
-    "width": 11,
-    "height": 8
+    "width": 16,
+    "height": 17
   },
   {
     "id": 3428,
@@ -153253,18 +164545,24 @@
       {
         "x": -3,
         "y": -3
-      }
-    ],
-    "width": 17,
-    "height": 26
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -2
+      },
       {
         "x": -2,
         "y": 2
@@ -153373,18 +164671,21 @@
       {
         "x": 0,
         "y": 14
-      }
-    ],
-    "width": 0,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 4
+      },
+      {
+        "x": 5,
+        "y": 5
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 4
+      },
       {
         "x": 2,
         "y": 4
@@ -153406,8 +164707,8 @@
         "y": 12
       }
     ],
-    "width": 5,
-    "height": 8
+    "width": 17,
+    "height": 26
   },
   {
     "id": 3429,
@@ -153527,18 +164828,24 @@
       {
         "x": 6,
         "y": 0
-      }
-    ],
-    "width": 17,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 2
+      },
+      {
+        "x": 1,
+        "y": 4
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
       "PENUP",
       {
         "x": 2,
@@ -153628,8 +164935,8 @@
         "y": 12
       }
     ],
-    "width": 2,
-    "height": 18
+    "width": 17,
+    "height": 23
   },
   {
     "id": 3501,
@@ -153749,18 +165056,24 @@
         "x": -1,
         "y": -6
       },
-      "PENUP"
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -6,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -2,
+        "y": -6
+      },
+      {
+        "x": -2,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -6
+      },
+      {
+        "x": -3,
+        "y": -6
+      },
       {
         "x": -2,
         "y": -4
@@ -153839,8 +165152,8 @@
         "y": 1
       }
     ],
-    "width": -3,
-    "height": 17
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3502,
@@ -153957,18 +165270,24 @@
       {
         "x": -6,
         "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -7
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -6,
+        "y": 4
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
       "PENUP",
       {
         "x": 0,
@@ -154074,18 +165393,24 @@
       {
         "x": 5,
         "y": -4
-      }
-    ],
-    "width": 12,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -4
+      },
+      {
+        "x": 8,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": 0
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
       "PENUP",
       {
         "x": 7,
@@ -154191,25 +165516,28 @@
       {
         "x": 3,
         "y": 6
-      }
-    ],
-    "width": 15,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 3,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 0
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 3
+      },
       {
         "x": 7,
         "y": 3
       }
     ],
-    "width": 6,
-    "height": 0
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3503,
@@ -154335,18 +165663,27 @@
       {
         "x": -7,
         "y": 3
-      }
-    ],
-    "width": 24,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 7
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
       {
         "x": 9,
         "y": 3
@@ -154449,20 +165786,14 @@
       {
         "x": 5,
         "y": -9
+      },
+      {
+        "x": 5,
+        "y": 6
       }
     ],
-    "width": 12,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3504,
@@ -154582,18 +165913,21 @@
       {
         "x": -4,
         "y": 2
-      }
-    ],
-    "width": 23,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": -2
+      },
+      {
+        "x": -4,
+        "y": -2
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -7
+      },
       {
         "x": -3,
         "y": 1
@@ -154699,20 +166033,26 @@
         "x": 6,
         "y": -5
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": 2,
+        "y": 0
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 1
+      }
     ],
-    "width": -4,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3505,
@@ -154829,18 +166169,24 @@
       {
         "x": -5,
         "y": -2
-      }
-    ],
-    "width": 22,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": -7
+      },
+      {
+        "x": -4,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
       "PENUP",
       {
         "x": -1,
@@ -154949,18 +166295,24 @@
       {
         "x": 5,
         "y": -1
-      }
-    ],
-    "width": 11,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": 1,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": -1
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
       {
         "x": 6,
         "y": -2
@@ -155034,8 +166386,8 @@
         "y": 6
       }
     ],
-    "width": 4,
-    "height": 14
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3506,
@@ -155152,18 +166504,24 @@
       {
         "x": -3,
         "y": -2
-      }
-    ],
-    "width": 23,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -7
+      },
+      {
+        "x": -2,
+        "y": 1
+      },
+      {
+        "x": -3,
+        "y": 3
+      },
+      {
+        "x": -4,
+        "y": 4
+      },
       "PENUP",
       {
         "x": 1,
@@ -155269,18 +166627,24 @@
       {
         "x": -4,
         "y": 9
-      }
-    ],
-    "width": 8,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -8,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 8
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
+      {
+        "x": -11,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -8
+      },
       {
         "x": 3,
         "y": -9
@@ -155345,8 +166709,8 @@
         "y": 5
       }
     ],
-    "width": -7,
-    "height": 17
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3507,
@@ -155472,18 +166836,24 @@
       {
         "x": -8,
         "y": 1
-      }
-    ],
-    "width": 25,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -7,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": 6
+      },
       {
         "x": 8,
         "y": 5
@@ -155589,18 +166959,24 @@
         "x": 8,
         "y": -12
       },
-      "PENUP"
-    ],
-    "width": 13,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -10,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 2,
+        "y": -11
+      },
+      {
+        "x": 4,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -10
+      },
       {
         "x": 3,
         "y": -9
@@ -155649,7 +167025,7 @@
         "y": 4
       }
     ],
-    "width": -9,
+    "width": 25,
     "height": 21
   },
   {
@@ -155767,18 +167143,24 @@
       {
         "x": -6,
         "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -5,
+        "y": -7
+      },
+      {
+        "x": -5,
+        "y": 2
+      },
+      {
+        "x": -6,
+        "y": 4
+      },
+      {
+        "x": -7,
+        "y": 5
+      },
       "PENUP",
       {
         "x": -8,
@@ -155881,18 +167263,27 @@
         "x": -2,
         "y": 3
       },
-      "PENUP"
-    ],
-    "width": 12,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 0,
+        "y": -9
+      },
+      {
+        "x": 2,
+        "y": -11
+      },
+      {
+        "x": 4,
+        "y": -12
+      },
+      {
+        "x": 6,
+        "y": -12
+      },
+      {
+        "x": 8,
+        "y": -11
+      },
       "PENUP",
       {
         "x": 5,
@@ -155998,18 +167389,24 @@
         "x": 6,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": -3,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 0
+      },
       "PENUP",
       {
         "x": 3,
@@ -156020,8 +167417,8 @@
         "y": 3
       }
     ],
-    "width": 7,
-    "height": 0
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3509,
@@ -156138,18 +167535,24 @@
       {
         "x": 0,
         "y": -2
-      }
-    ],
-    "width": 19,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -7
+      },
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
       "PENUP",
       {
         "x": 7,
@@ -156259,8 +167662,8 @@
         "y": 9
       }
     ],
-    "width": 5,
-    "height": 19
+    "width": 19,
+    "height": 21
   },
   {
     "id": 3510,
@@ -156377,18 +167780,24 @@
       {
         "x": 0,
         "y": -2
-      }
-    ],
-    "width": 20,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -7
+      },
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
       "PENUP",
       {
         "x": 7,
@@ -156490,388 +167899,475 @@
         "y": 4
       }
     ],
-    "width": 5,
-    "height": 19
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3511,
     "mappedTo": null,
-    "vertexCount": 115,
-    "leftHandPosition": -12,
-    "rightHandPosition": 12,
+    "vertexCount": 11,
+    "leftHandPosition": -29,
+    "rightHandPosition": -12,
     "vertices": [
       {
-        "x": -10,
+        "x": 12,
         "y": -10
       },
       {
-        "x": -8,
-        "y": -12
-      },
-      {
-        "x": -5,
-        "y": -12
-      },
-      {
-        "x": -3,
-        "y": -11
-      },
-      {
-        "x": -1,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -7,
-        "y": -11
-      },
-      {
-        "x": -4,
-        "y": -11
-      },
-      "PENUP",
-      {
         "x": -10,
-        "y": -10
-      },
-      {
-        "x": -8,
-        "y": -11
-      },
-      {
-        "x": -6,
-        "y": -10
-      },
-      {
-        "x": -3,
-        "y": -10
-      },
-      {
-        "x": -1,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -5,
-        "y": -7
-      },
-      {
-        "x": -6,
-        "y": -6
-      },
-      {
-        "x": -7,
-        "y": -4
-      },
-      {
-        "x": -7,
-        "y": -3
-      },
-      {
-        "x": -9,
-        "y": -3
-      },
-      {
-        "x": -10,
-        "y": -2
-      },
-      {
-        "x": -10,
-        "y": 0
-      },
-      {
-        "x": -9,
-        "y": -1
-      },
-      {
-        "x": -7,
-        "y": -1
-      },
-      {
-        "x": -7,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": -6,
-        "y": -5
-      },
-      {
-        "x": -6,
-        "y": 3
-      },
-      "PENUP",
-      {
-        "x": -9,
-        "y": -2
-      },
-      {
-        "x": -6,
-        "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 5,
-    "vertices": [
-      "PENUP",
-      {
-        "x": -8,
-        "y": 9
-      },
-      {
-        "x": -5,
-        "y": 7
-      },
-      {
-        "x": -2,
-        "y": 6
-      },
-      {
-        "x": 1,
-        "y": 6
-      },
-      {
-        "x": 3,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": -6,
-        "y": 8
-      },
-      {
-        "x": -4,
-        "y": 7
-      },
-      {
-        "x": 0,
-        "y": 7
-      },
-      {
-        "x": 2,
-        "y": 8
-      },
-      "PENUP",
-      {
-        "x": -8,
-        "y": 9
-      },
-      {
-        "x": -4,
-        "y": 8
-      },
-      {
-        "x": -1,
-        "y": 8
-      },
-      {
-        "x": 1,
-        "y": 9
-      },
-      {
-        "x": 3,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": 0,
-        "y": -9
-      },
-      {
-        "x": -1,
         "y": -8
       },
       {
-        "x": -2,
+        "x": -12,
+        "y": -5
+      },
+      {
+        "x": -12,
+        "y": -3
+      },
+      {
+        "x": -11,
+        "y": -1
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": -11,
+        "y": -4
+      },
+      {
+        "x": -11,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
+      {
+        "x": -10,
+        "y": -8
+      },
+      {
+        "x": -11,
         "y": -6
       },
       {
-        "x": -2,
-        "y": 3
+        "x": -10,
+        "y": -3
       },
-      "PENUP",
+      {
+        "x": -10,
+        "y": -1
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -5
+      },
+      {
+        "x": -7,
+        "y": -6
+      },
+      {
+        "x": -6,
+        "y": -7
+      },
+      {
+        "x": -4,
+        "y": -7
+      },
+      {
+        "x": -3,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -10
+      },
+      {
+        "x": -2,
+        "y": -10
+      },
+      {
+        "x": 0,
+        "y": -9
+      },
       {
         "x": -1,
         "y": -7
       },
       {
         "x": -1,
-        "y": 1
+        "y": -7
       },
-      "PENUP",
+      {
+        "x": 5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -5,
+        "y": -6
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
       {
         "x": 0,
         "y": -9
+      },
+      {
+        "x": -2,
+        "y": -6
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -5
+      },
+      {
+        "x": -7,
+        "y": -5
+      },
+      {
+        "x": 2,
+        "y": -6
+      },
+      {
+        "x": 4,
+        "y": -7
+      },
+      {
+        "x": 5,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -8
+      },
+      {
+        "x": 9,
+        "y": -5
+      },
+      {
+        "x": 7,
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": 3
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 2
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -8
+      },
+      {
+        "x": 9,
+        "y": -4
+      },
+      {
+        "x": 8,
+        "y": -1
+      },
+      {
+        "x": 8,
+        "y": 1
+      },
+      {
+        "x": 9,
+        "y": 3
+      },
+      {
+        "x": 7,
+        "y": -50
       },
       {
         "x": 0,
         "y": 0
       },
       {
-        "x": -1,
-        "y": 2
-      },
-      {
-        "x": -2,
-        "y": 3
-      },
-      "PENUP"
-    ],
-    "width": 12,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -11,
-    "vertices": [
-      "PENUP",
-      {
-        "x": 5,
-        "y": -11
-      },
-      {
-        "x": 6,
-        "y": -11
-      },
-      {
-        "x": 7,
-        "y": -10
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": -11
-      },
-      {
-        "x": 4,
-        "y": -11
-      },
-      {
-        "x": 6,
-        "y": -9
-      },
-      {
-        "x": 8,
-        "y": -11
-      },
-      "PENUP",
-      {
-        "x": 3,
-        "y": -3
-      },
-      {
-        "x": 6,
-        "y": -6
-      },
-      {
-        "x": 7,
-        "y": -5
-      },
-      {
-        "x": 9,
-        "y": -4
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": -5
-      },
-      {
-        "x": 7,
-        "y": -4
-      },
-      {
-        "x": 9,
-        "y": -4
-      },
-      "PENUP",
-      {
-        "x": 9,
-        "y": -4
-      },
-      {
-        "x": 7,
+        "x": -9,
         "y": -1
       },
       {
-        "x": 5,
-        "y": 1
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": -6,
+        "y": -2
       },
       {
         "x": 3,
-        "y": 3
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": 1
+        "y": -50
       },
       {
-        "x": 7,
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": -7,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -9,
+        "y": 0
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 2,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -9,
         "y": 2
       },
       {
-        "x": 8,
+        "x": -11,
+        "y": 4
+      },
+      {
+        "x": -12,
         "y": 6
       },
       {
-        "x": 9,
+        "x": -12,
         "y": 8
       },
       {
-        "x": 10,
-        "y": 8
+        "x": -11,
+        "y": -50
       },
-      "PENUP",
       {
-        "x": 7,
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -11,
+        "y": 6
+      },
+      {
+        "x": -11,
+        "y": 7
+      },
+      {
+        "x": -10,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": -11,
         "y": 4
-      }
-    ],
-    "width": -3,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -11,
+        "y": 6
+      },
+      {
+        "x": -9,
+        "y": 8
+      },
+      {
+        "x": -11,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -3,
+        "y": 6
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -5,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 3
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
       {
         "x": 8,
-        "y": 9
+        "y": 10
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 7
+      },
+      {
+        "x": 8,
+        "y": 8
       },
       {
         "x": 9,
         "y": 9
       },
       {
-        "x": 10,
-        "y": 8
-      },
-      "PENUP",
-      {
-        "x": 3,
-        "y": -3
+        "x": 9,
+        "y": 10
       },
       {
-        "x": 3,
-        "y": 7
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -3,
+        "y": 3
       }
     ],
-    "width": 15,
-    "height": 12
+    "width": 17,
+    "height": 60
   },
   {
     "id": 3512,
@@ -156988,18 +168484,24 @@
       {
         "x": -5,
         "y": -2
-      }
-    ],
-    "width": 22,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": -7
+      },
+      {
+        "x": -4,
+        "y": 2
+      },
+      {
+        "x": -5,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 5
+      },
       "PENUP",
       {
         "x": -7,
@@ -157102,18 +168604,27 @@
         "x": -1,
         "y": 3
       },
-      "PENUP"
-    ],
-    "width": 11,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 1,
+        "y": -9
+      },
+      {
+        "x": 3,
+        "y": -11
+      },
+      {
+        "x": 5,
+        "y": -12
+      },
+      {
+        "x": 7,
+        "y": -12
+      },
+      {
+        "x": 9,
+        "y": -11
+      },
       "PENUP",
       {
         "x": 6,
@@ -157154,375 +168665,443 @@
         "y": 6
       }
     ],
-    "width": -2,
-    "height": 17
+    "width": 22,
+    "height": 21
   },
   {
     "id": 3513,
     "mappedTo": null,
-    "vertexCount": 107,
-    "leftHandPosition": -14,
-    "rightHandPosition": 14,
+    "vertexCount": 10,
+    "leftHandPosition": -27,
+    "rightHandPosition": -14,
     "vertices": [
       {
-        "x": -6,
-        "y": -8
-      },
-      {
-        "x": -7,
-        "y": -7
-      },
-      {
-        "x": -8,
-        "y": -5
-      },
-      {
-        "x": -8,
-        "y": -3
-      },
-      {
-        "x": -10,
-        "y": -3
-      },
-      {
-        "x": -11,
-        "y": -2
-      },
-      {
-        "x": -11,
-        "y": 0
-      },
-      {
-        "x": -10,
-        "y": -1
-      },
-      {
-        "x": -8,
-        "y": -1
-      },
-      {
-        "x": -8,
-        "y": 3
-      },
-      "PENUP",
-      {
-        "x": -7,
+        "x": 14,
         "y": -6
       },
       {
-        "x": -7,
-        "y": 1
-      },
-      "PENUP",
-      {
-        "x": -10,
-        "y": -2
+        "x": -8,
+        "y": -7
       },
       {
         "x": -7,
-        "y": -2
-      },
-      "PENUP",
-      {
-        "x": -6,
         "y": -8
       },
       {
-        "x": -6,
-        "y": 0
+        "x": -5,
+        "y": -8
       },
       {
-        "x": -7,
+        "x": -3,
+        "y": -10
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": -2,
+        "y": -11
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
+      {
+        "x": -1,
+        "y": -8
+      },
+      {
+        "x": -1,
+        "y": -8
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": -6,
+        "y": -7
+      },
+      {
+        "x": 1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
+      {
+        "x": -2,
+        "y": -7
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -8,
+        "y": -6
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": 2,
+        "y": -8
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -13
+      },
+      {
+        "x": 9,
+        "y": -11
+      },
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 6,
+        "y": -7
+      },
+      {
+        "x": 6,
+        "y": -5
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
+      {
+        "x": 7,
+        "y": -7
+      },
+      {
+        "x": 7,
+        "y": -5
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -13
+      },
+      {
+        "x": 9,
+        "y": -11
+      },
+      {
+        "x": 8,
+        "y": -8
+      },
+      {
+        "x": 8,
+        "y": -6
+      },
+      {
+        "x": 9,
+        "y": -5
+      },
+      {
+        "x": 9,
+        "y": -4
+      },
+      {
+        "x": 8,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": -12,
         "y": 2
       },
       {
         "x": -8,
+        "y": 2
+      },
+      {
+        "x": 5,
         "y": 3
       },
-      "PENUP",
       {
-        "x": -13,
-        "y": 9
+        "x": 7,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -2
       },
       {
         "x": -11,
-        "y": 7
+        "y": 1
       },
       {
-        "x": -9,
-        "y": 6
+        "x": -8,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 8,
+        "y": 2
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": -2,
+        "y": 1
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": -10,
+        "y": -3
+      },
+      {
+        "x": -10,
+        "y": 0
       },
       {
         "x": -7,
-        "y": 6
-      },
-      {
-        "x": -5,
-        "y": 7
-      },
-      {
-        "x": -4,
-        "y": 7
+        "y": 0
       },
       {
         "x": -3,
-        "y": 6
+        "y": -3
       },
-      "PENUP",
       {
-        "x": -10,
-        "y": 7
-      }
-    ],
-    "width": 28,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -11,
-    "rightHandPosition": 8,
-    "vertices": [
+        "x": -3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": -1,
+        "y": 0
+      },
+      {
+        "x": -1,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": -1
+      },
+      {
+        "x": 7,
+        "y": 1
+      },
+      {
+        "x": 9,
+        "y": 4
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 6,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
       {
         "x": -8,
-        "y": 8
-      },
-      {
-        "x": -6,
-        "y": 9
-      },
-      {
-        "x": -5,
-        "y": 9
-      },
-      {
-        "x": -4,
-        "y": 8
-      },
-      {
-        "x": -3,
         "y": 6
       },
-      "PENUP",
       {
-        "x": -6,
-        "y": -8
+        "x": -12,
+        "y": 10
+      },
+      {
+        "x": -8,
+        "y": 10
+      },
+      {
+        "x": 5,
+        "y": 11
+      },
+      {
+        "x": 7,
+        "y": 12
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": -11,
+        "y": 9
+      },
+      {
+        "x": -8,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 11
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 6
       },
       {
         "x": -2,
-        "y": -12
+        "y": 9
       },
       {
-        "x": 2,
-        "y": -8
+        "x": -2,
+        "y": -50
       },
       {
-        "x": 2,
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": -10,
         "y": 5
       },
       {
-        "x": 3,
-        "y": 7
-      },
-      {
-        "x": 4,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": -2,
-        "y": -11
-      },
-      {
-        "x": 1,
-        "y": -8
-      },
-      {
-        "x": 1,
-        "y": 6
-      },
-      {
-        "x": 0,
-        "y": 7
-      },
-      {
-        "x": 1,
+        "x": -10,
         "y": 8
       },
       {
-        "x": 2,
-        "y": 7
-      },
-      {
-        "x": 1,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": -2,
-        "y": -2
-      },
-      {
-        "x": 1,
-        "y": -2
-      },
-      "PENUP",
-      {
-        "x": -4,
-        "y": -10
+        "x": -7,
+        "y": 8
       },
       {
         "x": -3,
-        "y": -10
-      },
-      {
-        "x": 0,
-        "y": -7
-      },
-      {
-        "x": 0,
-        "y": -3
-      },
-      {
-        "x": -3,
-        "y": -3
-      },
-      "PENUP",
-      {
-        "x": -3,
-        "y": -1
-      }
-    ],
-    "width": 19,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 7,
-    "vertices": [
-      {
-        "x": 5,
-        "y": 6
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": -8
-      },
-      {
-        "x": 6,
-        "y": -12
-      },
-      {
-        "x": 10,
-        "y": -8
-      },
-      {
-        "x": 10,
         "y": 5
       },
       {
-        "x": 11,
-        "y": 7
+        "x": -3,
+        "y": -50
       },
       {
-        "x": 12,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": 6,
-        "y": -11
+        "x": 0,
+        "y": 5
       },
       {
-        "x": 9,
-        "y": -8
-      },
-      {
-        "x": 9,
-        "y": 6
-      },
-      {
-        "x": 11,
+        "x": -1,
         "y": 8
       },
-      "PENUP",
       {
-        "x": 6,
-        "y": -2
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": 7,
+        "y": 10
       },
       {
         "x": 9,
-        "y": -2
-      },
-      "PENUP",
-      {
-        "x": 4,
-        "y": -10
+        "y": 12
       },
       {
-        "x": 5,
-        "y": -10
+        "x": 7,
+        "y": -50
       },
       {
-        "x": 8,
-        "y": -7
-      },
-      {
-        "x": 8,
+        "x": 0,
         "y": -3
       },
       {
-        "x": 5,
+        "x": -10,
         "y": -3
       },
-      "PENUP",
       {
-        "x": 5,
-        "y": -1
+        "x": 6,
+        "y": -50
       },
       {
-        "x": 8,
-        "y": -1
+        "x": 0,
+        "y": 5
       },
       {
-        "x": 8,
-        "y": 7
-      },
-      {
-        "x": 10,
-        "y": 9
-      },
-      {
-        "x": 12,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": -3,
-        "y": -10
-      },
-      {
-        "x": -3,
-        "y": 6
+        "x": -10,
+        "y": 5
       }
     ],
-    "width": 11,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 13,
+    "height": 62
   },
   {
     "id": 3514,
@@ -157642,18 +169221,24 @@
         "x": 11,
         "y": -12
       },
-      "PENUP"
-    ],
-    "width": 25,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -10,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 5,
+        "y": -11
+      },
+      {
+        "x": 7,
+        "y": -10
+      },
+      {
+        "x": 9,
+        "y": -10
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -10
+      },
       {
         "x": 6,
         "y": -12
@@ -157759,18 +169344,24 @@
         "x": -2,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": -6,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": 9,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -7,
+        "y": -11
+      },
+      {
+        "x": -7,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 0,
@@ -157810,8 +169401,8 @@
         "y": 2
       }
     ],
-    "width": 16,
-    "height": 8
+    "width": 25,
+    "height": 21
   },
   {
     "id": 3515,
@@ -157937,18 +169528,27 @@
         "x": -8,
         "y": 4
       },
-      "PENUP"
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 1,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": -12
+      },
+      {
+        "x": -6,
+        "y": -10
+      },
+      {
+        "x": -7,
+        "y": -8
+      },
+      {
+        "x": -8,
+        "y": -5
+      },
+      {
+        "x": -8,
+        "y": 1
+      },
       {
         "x": -7,
         "y": 4
@@ -158054,18 +169654,24 @@
       {
         "x": 3,
         "y": -11
-      }
-    ],
-    "width": 9,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
       {
         "x": 8,
         "y": -5
@@ -158088,8 +169694,8 @@
         "y": 1
       }
     ],
-    "width": 2,
-    "height": 6
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3516,
@@ -158209,18 +169815,24 @@
       {
         "x": 4,
         "y": -12
-      }
-    ],
-    "width": 22,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -8,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": -8
+      },
+      {
+        "x": 8,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -11
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
       {
         "x": 7,
         "y": 6
@@ -158323,20 +169935,18 @@
       {
         "x": 2,
         "y": 0
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 1
       }
     ],
-    "width": -1,
-    "height": 23
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 22,
+    "height": 28
   },
   {
     "id": 3517,
@@ -158462,18 +170072,27 @@
         "x": -8,
         "y": 4
       },
-      "PENUP"
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 1,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": -12
+      },
+      {
+        "x": -6,
+        "y": -10
+      },
+      {
+        "x": -7,
+        "y": -8
+      },
+      {
+        "x": -8,
+        "y": -5
+      },
+      {
+        "x": -8,
+        "y": 1
+      },
       {
         "x": -7,
         "y": 4
@@ -158579,18 +170198,24 @@
       {
         "x": 3,
         "y": -11
-      }
-    ],
-    "width": 9,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 3,
+        "y": -5
+      },
+      {
+        "x": 5,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -4
+      },
       {
         "x": 8,
         "y": -5
@@ -158684,372 +170309,447 @@
         "y": 15
       }
     ],
-    "width": 2,
-    "height": 21
+    "width": 26,
+    "height": 28
   },
   {
     "id": 3518,
     "mappedTo": null,
-    "vertexCount": 108,
-    "leftHandPosition": -12,
-    "rightHandPosition": 12,
+    "vertexCount": 10,
+    "leftHandPosition": -26,
+    "rightHandPosition": -12,
     "vertices": [
       {
-        "x": -10,
+        "x": 12,
         "y": -10
       },
       {
-        "x": -8,
-        "y": -12
-      },
-      {
-        "x": -5,
-        "y": -12
-      },
-      {
-        "x": -3,
-        "y": -11
-      },
-      {
-        "x": -1,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -7,
-        "y": -11
-      },
-      {
-        "x": -4,
-        "y": -11
-      },
-      "PENUP",
-      {
         "x": -10,
-        "y": -10
+        "y": -8
       },
       {
-        "x": -8,
-        "y": -11
-      },
-      {
-        "x": -6,
-        "y": -10
-      },
-      {
-        "x": -3,
-        "y": -10
-      },
-      {
-        "x": -1,
-        "y": -12
-      },
-      "PENUP",
-      {
-        "x": -5,
-        "y": -7
-      },
-      {
-        "x": -6,
-        "y": -6
-      },
-      {
-        "x": -7,
-        "y": -4
-      },
-      {
-        "x": -7,
-        "y": -3
-      },
-      {
-        "x": -9,
-        "y": -3
-      },
-      {
-        "x": -10,
-        "y": -2
-      },
-      {
-        "x": -10,
-        "y": 0
-      },
-      {
-        "x": -9,
-        "y": -1
-      },
-      {
-        "x": -7,
-        "y": -1
-      },
-      {
-        "x": -7,
-        "y": 5
-      },
-      "PENUP",
-      {
-        "x": -6,
+        "x": -12,
         "y": -5
       },
       {
+        "x": -12,
+        "y": -3
+      },
+      {
+        "x": -11,
+        "y": -1
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -7
+      },
+      {
+        "x": -11,
+        "y": -4
+      },
+      {
+        "x": -11,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -10
+      },
+      {
+        "x": -10,
+        "y": -8
+      },
+      {
+        "x": -11,
+        "y": -6
+      },
+      {
+        "x": -10,
+        "y": -3
+      },
+      {
+        "x": -10,
+        "y": -1
+      },
+      {
+        "x": -12,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -5
+      },
+      {
+        "x": -7,
+        "y": -6
+      },
+      {
         "x": -6,
-        "y": 3
-      },
-      "PENUP",
-      {
-        "x": -9,
-        "y": -2
+        "y": -7
       },
       {
-        "x": -6,
-        "y": -2
-      }
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 5,
-    "vertices": [
-      "PENUP",
-      {
-        "x": -8,
-        "y": 9
+        "x": -4,
+        "y": -7
       },
       {
-        "x": -5,
-        "y": 7
+        "x": -3,
+        "y": -9
+      },
+      {
+        "x": -3,
+        "y": -10
       },
       {
         "x": -2,
-        "y": 6
+        "y": -10
       },
-      {
-        "x": 0,
-        "y": 6
-      },
-      {
-        "x": 3,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": -6,
-        "y": 8
-      },
-      {
-        "x": -4,
-        "y": 7
-      },
-      {
-        "x": 0,
-        "y": 7
-      },
-      {
-        "x": 2,
-        "y": 8
-      },
-      "PENUP",
-      {
-        "x": -8,
-        "y": 9
-      },
-      {
-        "x": -4,
-        "y": 8
-      },
-      {
-        "x": -1,
-        "y": 8
-      },
-      {
-        "x": 1,
-        "y": 9
-      },
-      {
-        "x": 3,
-        "y": 7
-      },
-      "PENUP",
       {
         "x": 0,
         "y": -9
       },
-      {
-        "x": -1,
-        "y": -8
-      },
-      {
-        "x": -2,
-        "y": -6
-      },
-      {
-        "x": -2,
-        "y": 3
-      },
-      "PENUP",
       {
         "x": -1,
         "y": -7
       },
       {
         "x": -1,
-        "y": 1
+        "y": -7
       },
-      "PENUP",
+      {
+        "x": 5,
+        "y": -50
+      },
       {
         "x": 0,
-        "y": -9
-      },
-      {
-        "x": 0,
-        "y": 0
-      },
-      {
-        "x": -1,
-        "y": 2
-      },
-      {
-        "x": -2,
-        "y": 3
-      },
-      "PENUP"
-    ],
-    "width": 12,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -9,
-    "vertices": [
-      {
-        "x": 8,
         "y": -6
       },
       {
-        "x": 7,
-        "y": -4
+        "x": -5,
+        "y": -6
       },
       {
-        "x": 6,
-        "y": -3
-      },
-      {
-        "x": 2,
-        "y": -1
+        "x": 3,
+        "y": -50
       },
       {
         "x": 0,
-        "y": 0
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": -11
-      },
-      {
-        "x": 6,
-        "y": -11
-      },
-      {
-        "x": 7,
         "y": -9
       },
       {
-        "x": 7,
+        "x": -2,
+        "y": -6
+      },
+      {
+        "x": -2,
+        "y": -50
+      },
+      {
+        "x": 0,
         "y": -5
       },
       {
-        "x": 6,
-        "y": -4
-      },
-      "PENUP",
-      {
-        "x": 3,
-        "y": -11
-      },
-      {
-        "x": 5,
-        "y": -10
-      },
-      {
-        "x": 6,
-        "y": -8
-      },
-      {
-        "x": 6,
+        "x": -7,
         "y": -5
       },
       {
-        "x": 5,
-        "y": -3
-      },
-      {
         "x": 2,
-        "y": -1
-      },
-      "PENUP",
-      {
-        "x": 2,
-        "y": -1
+        "y": -6
       },
       {
         "x": 4,
-        "y": 0
+        "y": -7
       },
       {
         "x": 5,
-        "y": 1
+        "y": -50
       },
       {
-        "x": 8,
-        "y": 6
+        "x": 0,
+        "y": -8
       },
       {
         "x": 9,
-        "y": 7
-      },
-      {
-        "x": 10,
-        "y": 7
-      },
-      "PENUP",
-      {
-        "x": 5,
-        "y": 2
+        "y": -5
       },
       {
         "x": 7,
-        "y": 6
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 3
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -6
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": 2
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -8
       },
       {
         "x": 9,
-        "y": 8
+        "y": -4
       },
-      "PENUP",
+      {
+        "x": 8,
+        "y": -1
+      },
+      {
+        "x": 8,
+        "y": 1
+      },
+      {
+        "x": 9,
+        "y": 3
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -9,
+        "y": -1
+      },
+      {
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": -6,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": -7,
+        "y": -1
+      },
+      {
+        "x": 1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -9,
+        "y": 0
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
       {
         "x": 2,
-        "y": -1
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 0
+      },
+      {
+        "x": -9,
+        "y": 3
+      },
+      {
+        "x": -11,
+        "y": 5
+      },
+      {
+        "x": -12,
+        "y": 7
+      },
+      {
+        "x": -11,
+        "y": 8
+      },
+      {
+        "x": -9,
+        "y": 8
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 6
+      },
+      {
+        "x": -3,
+        "y": 2
+      },
+      {
+        "x": -1,
+        "y": 0
+      },
+      {
+        "x": 0,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": -11,
+        "y": 6
+      },
+      {
+        "x": -11,
+        "y": 7
+      },
+      {
+        "x": -9,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -11,
+        "y": 5
+      },
+      {
+        "x": -10,
+        "y": 6
+      },
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -5,
+        "y": 5
+      },
+      {
+        "x": -3,
+        "y": 2
+      },
+      {
+        "x": -1,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": 1,
+        "y": 8
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
+      {
+        "x": 7,
+        "y": 10
+      },
+      {
+        "x": 7,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 5
+      },
+      {
+        "x": 2,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 9
+      },
+      {
+        "x": 8,
+        "y": -50
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 7,
+        "y": 8
+      },
+      {
+        "x": 9,
+        "y": 10
       }
     ],
-    "width": -1,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 14,
+    "height": 60
   },
   {
     "id": 3519,
@@ -159172,18 +170872,24 @@
       {
         "x": 8,
         "y": 1
-      }
-    ],
-    "width": 23,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": -10
+      },
+      {
+        "x": -7,
+        "y": -8
+      },
+      {
+        "x": -6,
+        "y": -7
+      },
+      {
+        "x": -3,
+        "y": -6
+      },
       {
         "x": 7,
         "y": -6
@@ -159295,18 +171001,24 @@
       {
         "x": -2,
         "y": 6
-      }
-    ],
-    "width": -3,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": 8
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
       {
         "x": 0,
         "y": 7
@@ -159380,8 +171092,8 @@
         "y": 4
       }
     ],
-    "width": 11,
-    "height": 20
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3520,
@@ -159507,18 +171219,24 @@
       {
         "x": 5,
         "y": 6
-      }
-    ],
-    "width": 24,
-    "height": 17
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -9,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 5
+      },
+      {
+        "x": 9,
+        "y": 3
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": -9
+      },
+      {
+        "x": -9,
+        "y": -11
+      },
       {
         "x": -7,
         "y": -12
@@ -159627,20 +171345,19 @@
       {
         "x": -2,
         "y": 4
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": 5,
+        "y": 6
       }
     ],
-    "width": -2,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3521,
@@ -159760,18 +171477,24 @@
       {
         "x": -7,
         "y": 4
-      }
-    ],
-    "width": 24,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": -8,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": -8
+      },
       {
         "x": -8,
         "y": -4
@@ -159883,18 +171606,24 @@
       {
         "x": 10,
         "y": 7
-      }
-    ],
-    "width": -1,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 8,
+        "y": -10
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
       {
         "x": 7,
         "y": -9
@@ -159948,8 +171677,8 @@
         "y": 0
       }
     ],
-    "width": -4,
-    "height": 18
+    "width": 24,
+    "height": 21
   },
   {
     "id": 3522,
@@ -160066,18 +171795,27 @@
         "x": 3,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 23,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 7,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
       {
         "x": 6,
         "y": 6
@@ -160183,20 +171921,26 @@
         "x": 6,
         "y": -5
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": 2,
+        "y": 0
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 1
+      }
     ],
-    "width": 10,
-    "height": 18
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 23,
+    "height": 21
   },
   {
     "id": 3523,
@@ -160313,18 +172057,27 @@
         "x": -1,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 27,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 7,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -10,
+        "y": 7
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      {
+        "x": -3,
+        "y": 9
+      },
+      {
+        "x": -1,
+        "y": 7
+      },
       {
         "x": 2,
         "y": 6
@@ -160430,18 +172183,24 @@
         "x": 10,
         "y": 6
       },
-      "PENUP"
-    ],
-    "width": 8,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -10,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 8,
+        "y": -11
+      },
+      {
+        "x": 9,
+        "y": -10
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -10
+      },
       {
         "x": 7,
         "y": -10
@@ -160513,8 +172272,8 @@
         "y": 0
       }
     ],
-    "width": -5,
-    "height": 17
+    "width": 27,
+    "height": 21
   },
   {
     "id": 3524,
@@ -160634,18 +172393,24 @@
       {
         "x": 8,
         "y": -10
-      }
-    ],
-    "width": 22,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 9,
-    "rightHandPosition": -10,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -10
+      },
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 9,
+        "y": -10
+      },
       {
         "x": 10,
         "y": -12
@@ -160738,7 +172503,7 @@
         "y": -2
       }
     ],
-    "width": -1,
+    "width": 22,
     "height": 21
   },
   {
@@ -160856,18 +172621,27 @@
         "x": 3,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 23,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 7,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -5,
+        "y": 7
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": 0,
+        "y": 9
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
       {
         "x": 6,
         "y": 6
@@ -160979,18 +172753,24 @@
       {
         "x": 1,
         "y": 14
-      }
-    ],
-    "width": 10,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 14,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 7,
+        "y": 14
+      },
+      {
+        "x": 4,
+        "y": 13
+      },
+      {
+        "x": -2,
+        "y": 13
+      },
+      {
+        "x": -6,
+        "y": 14
+      },
       "PENUP",
       {
         "x": 0,
@@ -161035,8 +172815,8 @@
         "y": 1
       }
     ],
-    "width": 20,
-    "height": 14
+    "width": 23,
+    "height": 28
   },
   {
     "id": 3526,
@@ -161153,18 +172933,24 @@
       {
         "x": 0,
         "y": -9
-      }
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": -11
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": 8
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
       {
         "x": 0,
         "y": 6
@@ -161234,8 +173020,8 @@
         "y": -2
       }
     ],
-    "width": 11,
-    "height": 11
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3601,
@@ -161355,18 +173141,24 @@
         "x": 7,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 17,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -3,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -3,
+        "y": -4
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": -1,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -3
+      },
       {
         "x": 5,
         "y": -3
@@ -161426,7 +173218,7 @@
         "y": 2
       }
     ],
-    "width": -1,
+    "width": 17,
     "height": 14
   },
   {
@@ -161547,18 +173339,24 @@
       {
         "x": 6,
         "y": -3
-      }
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -3
+      },
+      {
+        "x": 5,
+        "y": -2
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -4
+      },
       {
         "x": 4,
         "y": -3
@@ -161585,8 +173383,8 @@
         "y": 7
       }
     ],
-    "width": -2,
-    "height": 10
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3603,
@@ -161703,20 +173501,22 @@
       {
         "x": 0,
         "y": -4
+      },
+      {
+        "x": 2,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": -3
       }
     ],
     "width": 14,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3604,
@@ -161833,18 +173633,27 @@
       {
         "x": -2,
         "y": -9
-      }
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": -10
+      },
+      {
+        "x": -3,
+        "y": -11
+      },
+      {
+        "x": -2,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
       "PENUP",
       {
         "x": -5,
@@ -161859,8 +173668,8 @@
         "y": 7
       }
     ],
-    "width": 10,
-    "height": 17
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3605,
@@ -161983,16 +173792,6 @@
     "height": 14
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3606,
     "mappedTo": null,
     "vertexCount": 41,
@@ -162107,18 +173906,24 @@
       {
         "x": -1,
         "y": -11
-      }
-    ],
-    "width": 13,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": -9
+      },
+      {
+        "x": 3,
+        "y": -9
+      },
+      {
+        "x": 5,
+        "y": -10
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": -5
+      },
       {
         "x": -4,
         "y": -5
@@ -162133,8 +173938,8 @@
         "y": -5
       }
     ],
-    "width": 2,
-    "height": 0
+    "width": 13,
+    "height": 21
   },
   {
     "id": 3607,
@@ -162257,18 +174062,24 @@
       {
         "x": 0,
         "y": 16
-      }
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 15
+      },
+      {
+        "x": -3,
+        "y": 14
+      },
+      {
+        "x": -5,
+        "y": 14
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -4
+      },
       {
         "x": 4,
         "y": -2
@@ -162337,8 +174148,8 @@
         "y": 14
       }
     ],
-    "width": -3,
-    "height": 19
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3608,
@@ -162461,18 +174272,24 @@
       {
         "x": 2,
         "y": 11
-      }
-    ],
-    "width": 18,
-    "height": 23
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 0,
@@ -162511,8 +174328,8 @@
         "y": 14
       }
     ],
-    "width": 12,
-    "height": 19
+    "width": 18,
+    "height": 28
   },
   {
     "id": 3609,
@@ -162632,20 +174449,22 @@
       {
         "x": 1,
         "y": -2
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 7
+      },
+      {
+        "x": 3,
+        "y": 7
       }
     ],
     "width": 10,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3610,
@@ -162765,18 +174584,27 @@
       {
         "x": 1,
         "y": -2
-      }
-    ],
-    "width": 10,
-    "height": 23
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -2,
-    "rightHandPosition": 16,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 11
+      },
+      {
+        "x": 2,
+        "y": 14
+      },
+      {
+        "x": 0,
+        "y": 16
+      },
+      {
+        "x": -2,
+        "y": 16
+      },
       {
         "x": -2,
         "y": 15
@@ -162786,8 +174614,8 @@
         "y": 16
       }
     ],
-    "width": 18,
-    "height": 1
+    "width": 10,
+    "height": 28
   },
   {
     "id": 3611,
@@ -162904,18 +174732,24 @@
       {
         "x": 0,
         "y": -4
-      }
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": 0
+      },
+      {
+        "x": 2,
+        "y": 1
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
       {
         "x": 5,
         "y": 7
@@ -162963,8 +174797,8 @@
         "y": 7
       }
     ],
-    "width": 10,
-    "height": 8
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3612,
@@ -163173,18 +175007,24 @@
       {
         "x": -2,
         "y": -4
-      }
-    ],
-    "width": 26,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": -3
+      },
       {
         "x": -3,
         "y": -3
@@ -163297,7 +175137,7 @@
         "y": 7
       }
     ],
-    "width": 1,
+    "width": 26,
     "height": 14
   },
   {
@@ -163421,18 +175261,24 @@
       {
         "x": 6,
         "y": 7
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
       {
         "x": 5,
         "y": 8
@@ -163463,8 +175309,8 @@
         "y": 7
       }
     ],
-    "width": 11,
-    "height": 12
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3615,
@@ -163581,18 +175427,24 @@
         "x": 5,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -4,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 1,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -4
+      },
       {
         "x": 1,
         "y": -3
@@ -163606,8 +175458,8 @@
         "y": 7
       }
     ],
-    "width": -4,
-    "height": 10
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3616,
@@ -163724,18 +175576,24 @@
       {
         "x": -3,
         "y": 8
-      }
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -3,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": 12
+      },
+      {
+        "x": -2,
+        "y": 14
+      },
+      {
+        "x": -5,
+        "y": 16
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -2
+      },
       {
         "x": 0,
         "y": -3
@@ -163799,8 +175657,8 @@
         "y": 7
       }
     ],
-    "width": 1,
-    "height": 12
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3617,
@@ -163917,18 +175775,27 @@
         "x": 5,
         "y": 16
       },
-      "PENUP"
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": 12,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 1,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": 15
+      },
+      {
+        "x": 3,
+        "y": 14
+      },
+      {
+        "x": 4,
+        "y": 12
+      },
       "PENUP",
       {
         "x": 0,
@@ -163955,8 +175822,8 @@
         "y": 16
       }
     ],
-    "width": 16,
-    "height": 20
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3618,
@@ -164076,25 +175943,31 @@
       {
         "x": 2,
         "y": -3
-      }
-    ],
-    "width": 14,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
       {
         "x": 6,
         "y": -3
       }
     ],
-    "width": 2,
-    "height": 0
+    "width": 14,
+    "height": 14
   },
   {
     "id": 3619,
@@ -164208,18 +176081,24 @@
       {
         "x": -1,
         "y": -4
-      }
-    ],
-    "width": 16,
-    "height": 13
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": -4
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": -4
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
       {
         "x": 4,
         "y": -4
@@ -164297,7 +176176,7 @@
         "y": 9
       }
     ],
-    "width": -1,
+    "width": 16,
     "height": 14
   },
   {
@@ -164525,18 +176404,24 @@
       {
         "x": 5,
         "y": -2
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -4
+      },
       {
         "x": 4,
         "y": -3
@@ -164575,7 +176460,7 @@
         "y": 7
       }
     ],
-    "width": -2,
+    "width": 18,
     "height": 14
   },
   {
@@ -164693,20 +176578,26 @@
         "x": 4,
         "y": 5
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 3,
+        "y": -5
+      },
+      {
+        "x": 1,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": 6
+      }
     ],
     "width": 18,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3623,
@@ -164826,18 +176717,24 @@
       {
         "x": 0,
         "y": 6
-      }
-    ],
-    "width": 26,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": -5
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
       {
         "x": 1,
         "y": -2
@@ -164910,8 +176807,8 @@
         "y": 6
       }
     ],
-    "width": -1,
-    "height": 12
+    "width": 26,
+    "height": 14
   },
   {
     "id": 3624,
@@ -165031,18 +176928,24 @@
       {
         "x": 4,
         "y": -3
-      }
-    ],
-    "width": 19,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 6,
+        "y": -3
+      },
       {
         "x": 7,
         "y": -5
@@ -165117,7 +177020,7 @@
         "y": 2
       }
     ],
-    "width": 3,
+    "width": 19,
     "height": 14
   },
   {
@@ -165238,18 +177141,27 @@
       {
         "x": 5,
         "y": -2
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -1,
-    "rightHandPosition": 15,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 10
+      },
+      {
+        "x": 4,
+        "y": 13
+      },
+      {
+        "x": 2,
+        "y": 15
+      },
+      {
+        "x": 0,
+        "y": 16
+      },
+      {
+        "x": -1,
+        "y": 15
+      },
       {
         "x": -3,
         "y": 14
@@ -165331,8 +177243,8 @@
         "y": 14
       }
     ],
-    "width": 16,
-    "height": 20
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3626,
@@ -165446,25 +177358,31 @@
       {
         "x": -2,
         "y": 8
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 9
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 2
+      },
       {
         "x": 4,
         "y": 2
       }
     ],
-    "width": 6,
-    "height": 0
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3697,
@@ -165608,18 +177526,24 @@
       {
         "x": 8,
         "y": -10
-      }
-    ],
-    "width": 20,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -6,
+        "y": 7
+      },
       {
         "x": -4,
         "y": 8
@@ -165641,8 +177565,8 @@
         "y": 7
       }
     ],
-    "width": 13,
-    "height": 2
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3701,
@@ -165862,18 +177786,27 @@
         "x": -7,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": 7,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -7,
+        "y": 9
+      },
+      {
+        "x": -3,
+        "y": 7
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      {
+        "x": 8,
+        "y": 7
+      },
       "PENUP",
       {
         "x": -4,
@@ -165913,8 +177846,8 @@
         "y": 7
       }
     ],
-    "width": 15,
-    "height": 2
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3703,
@@ -166028,18 +177961,24 @@
       {
         "x": 4,
         "y": 0
-      }
-    ],
-    "width": 20,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": 1
+      },
+      {
+        "x": 5,
+        "y": 6
+      },
       "PENUP",
       {
         "x": 4,
@@ -166109,8 +178048,8 @@
         "y": 7
       }
     ],
-    "width": 11,
-    "height": 9
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3704,
@@ -166224,18 +178163,24 @@
       {
         "x": 4,
         "y": 6
-      }
-    ],
-    "width": 20,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      {
+        "x": 7,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 7
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
       {
         "x": 3,
         "y": 8
@@ -166253,8 +178198,8 @@
         "y": 7
       }
     ],
-    "width": 8,
-    "height": 2
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3705,
@@ -166365,18 +178310,24 @@
       {
         "x": 5,
         "y": -5
-      }
-    ],
-    "width": 20,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -4
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 6,
+        "y": -3
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      "PENUP",
       {
         "x": -7,
         "y": 7
@@ -166436,8 +178387,8 @@
         "y": 7
       }
     ],
-    "width": 50,
-    "height": 3
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3706,
@@ -166551,18 +178502,24 @@
       {
         "x": -3,
         "y": -2
-      }
-    ],
-    "width": 20,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -3,
-    "vertices": [
+      },
+      {
+        "x": 1,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -5
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -3
+      },
       {
         "x": 2,
         "y": -3
@@ -166643,8 +178600,8 @@
         "y": 7
       }
     ],
-    "width": -2,
-    "height": 14
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3707,
@@ -166761,25 +178718,34 @@
         "x": 0,
         "y": 8
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 7,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 3,
+        "y": -5
+      },
+      {
+        "x": 1,
+        "y": -2
+      },
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": 0,
+        "y": 4
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
       {
         "x": -1,
         "y": 9
       }
     ],
-    "width": 8,
-    "height": 0
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3708,
@@ -166890,18 +178856,24 @@
         "x": 6,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 20,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -6,
+        "y": -3
+      },
+      {
+        "x": -4,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 0
+      },
+      "PENUP",
       {
         "x": 6,
         "y": -3
@@ -167004,20 +178976,22 @@
       {
         "x": -3,
         "y": 9
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 6,
+        "y": 7
       }
     ],
-    "width": 50,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3709,
@@ -167131,18 +179105,24 @@
       {
         "x": 8,
         "y": -10
-      }
-    ],
-    "width": 20,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -7,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 6,
+        "y": 7
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": 0
+      },
+      {
+        "x": -7,
+        "y": 0
+      },
       {
         "x": -5,
         "y": 1
@@ -167227,8 +179207,8 @@
         "y": 7
       }
     ],
-    "width": 7,
-    "height": 10
+    "width": 20,
+    "height": 21
   },
   {
     "id": 3710,
@@ -167755,18 +179735,24 @@
       {
         "x": 4,
         "y": -5
-      }
-    ],
-    "width": 18,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 2,
-    "vertices": [
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 1,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 0,
+        "y": 2
+      },
       {
         "x": 1,
         "y": -1
@@ -167818,8 +179804,8 @@
         "y": 7
       }
     ],
-    "width": 2,
-    "height": 10
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3716,
@@ -168056,18 +180042,24 @@
       {
         "x": 6,
         "y": 9
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 8,
+        "y": 9
+      },
+      {
+        "x": 9,
+        "y": 8
+      },
+      {
+        "x": 10,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": 8
+      },
       {
         "x": -9,
         "y": 4
@@ -168154,8 +180146,8 @@
         "y": 6
       }
     ],
-    "width": 14,
-    "height": 19
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3719,
@@ -168275,18 +180267,24 @@
       {
         "x": -5,
         "y": -4
-      }
-    ],
-    "width": 20,
-    "height": 29
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -3,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -1
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 6,
+        "y": 2
+      },
+      "PENUP",
       {
         "x": -5,
         "y": 7
@@ -168377,8 +180375,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 20
+    "width": 20,
+    "height": 29
   },
   {
     "id": 3720,
@@ -168743,18 +180741,24 @@
         "x": -5,
         "y": -3
       },
-      "PENUP"
-    ],
-    "width": 16,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -8,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": -5,
+        "y": -3
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -9
+      },
+      {
+        "x": 5,
+        "y": -8
+      },
       {
         "x": -5,
         "y": -4
@@ -168764,8 +180768,8 @@
         "y": -3
       }
     ],
-    "width": -3,
-    "height": 1
+    "width": 16,
+    "height": 12
   },
   {
     "id": 3724,
@@ -169291,18 +181295,21 @@
       {
         "x": 7,
         "y": 7
-      }
-    ],
-    "width": 26,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -10,
-    "rightHandPosition": -12,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -11
+      },
+      {
+        "x": 8,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": -12
+      },
       {
         "x": -7,
         "y": -11
@@ -169358,7 +181365,7 @@
         "y": 9
       }
     ],
-    "width": -2,
+    "width": 26,
     "height": 21
   },
   {
@@ -169476,18 +181483,24 @@
       {
         "x": 5,
         "y": -6
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -1,
+        "y": 3
+      },
+      {
+        "x": -3,
+        "y": 2
+      },
+      {
+        "x": -4,
+        "y": 0
+      },
+      {
+        "x": -4,
+        "y": -2
+      },
       {
         "x": -3,
         "y": -4
@@ -169595,8 +181608,8 @@
         "y": 8
       }
     ],
-    "width": 2,
-    "height": 15
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3803,
@@ -169722,18 +181735,24 @@
       {
         "x": 8,
         "y": -7
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 6,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -7
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
       {
         "x": 4,
         "y": -11
@@ -169815,8 +181834,8 @@
         "y": 1
       }
     ],
-    "width": -3,
-    "height": 19
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3804,
@@ -169939,18 +181958,24 @@
       {
         "x": -10,
         "y": 4
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": 4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -7
+      },
+      {
+        "x": 9,
+        "y": -4
+      },
+      {
+        "x": 9,
+        "y": 1
+      },
+      {
+        "x": 8,
+        "y": 4
+      },
       "PENUP",
       {
         "x": 4,
@@ -169985,8 +182010,8 @@
         "y": 8
       }
     ],
-    "width": 12,
-    "height": 19
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3805,
@@ -170112,18 +182137,24 @@
       {
         "x": 8,
         "y": -7
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -11,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -5
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 4,
+        "y": -11
+      },
       "PENUP",
       {
         "x": -8,
@@ -170229,18 +182260,24 @@
       {
         "x": -2,
         "y": -2
-      }
-    ],
-    "width": -7,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": -1
+      },
+      {
+        "x": 3,
+        "y": 0
+      },
+      {
+        "x": 5,
+        "y": 0
+      },
+      {
+        "x": 7,
+        "y": -1
+      },
+      "PENUP",
       {
         "x": -5,
         "y": -3
@@ -170291,8 +182328,8 @@
         "y": -5
       }
     ],
-    "width": 50,
-    "height": 7
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3806,
@@ -170409,18 +182446,24 @@
       {
         "x": 8,
         "y": -9
-      }
-    ],
-    "width": 26,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -6,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -7
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -11
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -6
+      },
       {
         "x": 8,
         "y": -3
@@ -170532,20 +182575,14 @@
       {
         "x": 7,
         "y": 8
+      },
+      {
+        "x": 10,
+        "y": 9
       }
     ],
-    "width": 1,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3807,
@@ -170671,18 +182708,24 @@
         "x": 9,
         "y": 7
       },
-      "PENUP"
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -7,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 8,
+        "y": -7
+      },
+      {
+        "x": 7,
+        "y": -8
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -4
+      },
+      {
+        "x": 7,
+        "y": -7
+      },
       {
         "x": 6,
         "y": -9
@@ -170791,18 +182834,24 @@
       {
         "x": -7,
         "y": 2
-      }
-    ],
-    "width": 0,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -5,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 1
+      },
+      "PENUP",
+      {
+        "x": -8,
+        "y": -2
+      },
+      {
+        "x": -7,
+        "y": -4
+      },
+      {
+        "x": -5,
+        "y": -5
+      },
       {
         "x": -3,
         "y": -5
@@ -170866,8 +182915,8 @@
         "y": -2
       }
     ],
-    "width": 0,
-    "height": 4
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3808,
@@ -170984,18 +183033,24 @@
       {
         "x": 8,
         "y": -4
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -7,
-    "vertices": [
+      },
+      {
+        "x": 9,
+        "y": -2
+      },
+      {
+        "x": 9,
+        "y": 1
+      },
+      {
+        "x": 8,
+        "y": 3
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -7
+      },
       {
         "x": 6,
         "y": -6
@@ -171046,8 +183101,8 @@
         "y": 9
       }
     ],
-    "width": -3,
-    "height": 15
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3809,
@@ -171254,18 +183309,21 @@
       {
         "x": 10,
         "y": 2
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -9,
+        "y": 3
+      },
+      {
+        "x": -8,
+        "y": 6
+      },
+      {
+        "x": -7,
+        "y": 7
+      },
+      "PENUP",
       {
         "x": -10,
         "y": 1
@@ -171287,8 +183345,8 @@
         "y": 9
       }
     ],
-    "width": 50,
-    "height": 8
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3811,
@@ -171408,18 +183466,24 @@
       {
         "x": -2,
         "y": 3
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": -6,
-    "vertices": [
+      },
+      {
+        "x": -1,
+        "y": 4
+      },
+      {
+        "x": 0,
+        "y": 3
+      },
+      {
+        "x": -1,
+        "y": 2
+      },
+      "PENUP",
+      {
+        "x": 5,
+        "y": -6
+      },
       {
         "x": 6,
         "y": -5
@@ -171528,20 +183592,18 @@
       {
         "x": -6,
         "y": 8
+      },
+      {
+        "x": -2,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
       }
     ],
-    "width": -1,
-    "height": 16
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3812,
@@ -171655,18 +183717,27 @@
         "x": 10,
         "y": 9
       },
-      "PENUP"
-    ],
-    "width": 26,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 7,
-    "rightHandPosition": -11,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -10,
+        "y": -12
+      },
+      {
+        "x": -8,
+        "y": -11
+      },
+      {
+        "x": -4,
+        "y": -10
+      },
+      {
+        "x": 1,
+        "y": -10
+      },
+      {
+        "x": 7,
+        "y": -11
+      },
       {
         "x": 10,
         "y": -12
@@ -171697,7 +183768,7 @@
         "y": 9
       }
     ],
-    "width": -4,
+    "width": 26,
     "height": 21
   },
   {
@@ -171818,18 +183889,24 @@
       {
         "x": -8,
         "y": 3
-      }
-    ],
-    "width": 26,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -6,
-    "rightHandPosition": 5,
-    "vertices": [
+      },
+      {
+        "x": -9,
+        "y": 0
+      },
+      {
+        "x": -9,
+        "y": -5
+      },
+      {
+        "x": -8,
+        "y": -8
+      },
+      "PENUP",
+      {
+        "x": -6,
+        "y": 5
+      },
       {
         "x": -7,
         "y": 3
@@ -171943,7 +184020,7 @@
         "y": 9
       }
     ],
-    "width": 11,
+    "width": 26,
     "height": 21
   },
   {
@@ -172064,18 +184141,24 @@
       {
         "x": 8,
         "y": 3
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -11
+      },
+      {
+        "x": 6,
+        "y": -9
+      },
+      {
+        "x": 7,
+        "y": -7
+      },
+      {
+        "x": 8,
+        "y": -4
+      },
       {
         "x": 8,
         "y": 0
@@ -172118,8 +184201,8 @@
         "y": 9
       }
     ],
-    "width": 4,
-    "height": 9
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3815,
@@ -172245,18 +184328,27 @@
         "x": -8,
         "y": 4
       },
-      "PENUP"
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 1,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": -11
+      },
+      {
+        "x": -6,
+        "y": -9
+      },
+      {
+        "x": -7,
+        "y": -7
+      },
+      {
+        "x": -8,
+        "y": -4
+      },
+      {
+        "x": -8,
+        "y": 1
+      },
       {
         "x": -7,
         "y": 4
@@ -172320,8 +184412,8 @@
         "y": -11
       }
     ],
-    "width": 9,
-    "height": 19
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3816,
@@ -172444,18 +184536,24 @@
       {
         "x": -6,
         "y": -3
-      }
-    ],
-    "width": 26,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 8,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 8,
+        "y": -8
+      },
+      {
+        "x": 9,
+        "y": -6
+      },
+      {
+        "x": 9,
+        "y": -2
+      },
+      {
+        "x": 8,
+        "y": 0
+      },
       "PENUP",
       {
         "x": 5,
@@ -172507,8 +184605,8 @@
         "y": 9
       }
     ],
-    "width": 8,
-    "height": 20
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3817,
@@ -172634,18 +184732,27 @@
         "x": -8,
         "y": 4
       },
-      "PENUP"
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 1,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -4,
+        "y": -11
+      },
+      {
+        "x": -6,
+        "y": -9
+      },
+      {
+        "x": -7,
+        "y": -7
+      },
+      {
+        "x": -8,
+        "y": -4
+      },
+      {
+        "x": -8,
+        "y": 1
+      },
       {
         "x": -7,
         "y": 4
@@ -172757,25 +184864,31 @@
       {
         "x": 0,
         "y": 5
-      }
-    ],
-    "width": 9,
-    "height": 20
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 6,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": 3
+      },
+      {
+        "x": -4,
+        "y": 5
+      },
+      {
+        "x": -1,
+        "y": 6
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
       {
         "x": 2,
         "y": 5
       }
     ],
-    "width": 7,
-    "height": 0
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3818,
@@ -172892,18 +185005,24 @@
       {
         "x": 5,
         "y": -11
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 7,
+        "y": -9
+      },
+      {
+        "x": 8,
+        "y": -7
+      },
+      {
+        "x": 8,
+        "y": -3
+      },
+      {
+        "x": 7,
+        "y": -1
+      },
+      "PENUP",
       {
         "x": 6,
         "y": 0
@@ -173018,20 +185137,14 @@
       {
         "x": -2,
         "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
       }
     ],
-    "width": 50,
-    "height": 12
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3819,
@@ -173157,18 +185270,24 @@
       {
         "x": 0,
         "y": 2
-      }
-    ],
-    "width": 26,
-    "height": 15
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 2,
+        "y": 1
+      },
+      "PENUP",
+      {
+        "x": -7,
+        "y": -9
+      },
+      {
+        "x": -8,
+        "y": -7
+      },
+      {
+        "x": -8,
+        "y": -4
+      },
       {
         "x": -7,
         "y": -2
@@ -173283,18 +185402,24 @@
         "x": 8,
         "y": 5
       },
-      "PENUP"
-    ],
-    "width": 4,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": -2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": -9,
+        "y": 5
+      },
+      {
+        "x": -8,
+        "y": 7
+      },
+      {
+        "x": -9,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": -2
+      },
       {
         "x": -4,
         "y": -3
@@ -173380,8 +185505,8 @@
         "y": 9
       }
     ],
-    "width": 2,
-    "height": 16
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3820,
@@ -173507,18 +185632,27 @@
       {
         "x": -9,
         "y": 1
-      }
-    ],
-    "width": 26,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 7
+      },
+      {
+        "x": -1,
+        "y": 8
+      },
+      {
+        "x": 2,
+        "y": 8
+      },
       {
         "x": 5,
         "y": 7
@@ -173624,8 +185758,8 @@
         "y": -12
       }
     ],
-    "width": 10,
-    "height": 19
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3821,
@@ -173748,18 +185882,24 @@
       {
         "x": 4,
         "y": -10
-      }
-    ],
-    "width": 26,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
+      {
+        "x": 6,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
+      "PENUP",
       {
         "x": 7,
         "y": -10
@@ -173811,7 +185951,7 @@
         "y": -12
       }
     ],
-    "width": 50,
+    "width": 26,
     "height": 21
   },
   {
@@ -174051,18 +186191,24 @@
       {
         "x": -8,
         "y": -3
-      }
-    ],
-    "width": 26,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -8,
+        "y": 0
+      },
+      {
+        "x": -7,
+        "y": 4
+      },
+      {
+        "x": -6,
+        "y": 6
+      },
+      {
+        "x": -4,
+        "y": 8
+      },
+      "PENUP",
       {
         "x": 7,
         "y": 5
@@ -174169,7 +186315,7 @@
         "y": -12
       }
     ],
-    "width": 50,
+    "width": 26,
     "height": 21
   },
   {
@@ -174281,18 +186427,24 @@
       {
         "x": 2,
         "y": -9
-      }
-    ],
-    "width": 26,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -8,
-    "rightHandPosition": 8,
-    "vertices": [
+      },
+      {
+        "x": 6,
+        "y": -10
+      },
+      {
+        "x": 10,
+        "y": -12
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": 9
+      },
+      {
+        "x": -8,
+        "y": 8
+      },
       {
         "x": -4,
         "y": 7
@@ -174310,8 +186462,8 @@
         "y": 9
       }
     ],
-    "width": 16,
-    "height": 2
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3825,
@@ -174428,18 +186580,24 @@
       {
         "x": 4,
         "y": 4
-      }
-    ],
-    "width": 26,
-    "height": 19
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -10,
+        "y": -12
+      },
+      {
+        "x": -6,
+        "y": -10
+      },
+      {
+        "x": -2,
+        "y": -9
+      },
+      {
+        "x": 2,
+        "y": -9
+      },
       {
         "x": 6,
         "y": -10
@@ -174478,7 +186636,7 @@
         "y": 6
       }
     ],
-    "width": -7,
+    "width": 26,
     "height": 21
   },
   {
@@ -174599,18 +186757,24 @@
       {
         "x": 2,
         "y": -7
-      }
-    ],
-    "width": 26,
-    "height": 9
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -6
+      },
+      {
+        "x": 5,
+        "y": -5
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      "PENUP",
       {
         "x": 7,
         "y": -5
@@ -174728,20 +186892,30 @@
       {
         "x": 6,
         "y": -4
+      },
+      {
+        "x": 7,
+        "y": -3
+      },
+      {
+        "x": 8,
+        "y": -1
+      },
+      {
+        "x": 8,
+        "y": 3
+      },
+      {
+        "x": 7,
+        "y": 6
+      },
+      {
+        "x": 5,
+        "y": 8
       }
     ],
-    "width": 50,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 8,
-    "vertices": [],
-    "width": 13,
-    "height": null
+    "width": 26,
+    "height": 21
   },
   {
     "id": 3901,
@@ -174858,18 +187032,24 @@
       {
         "x": 3,
         "y": 7
-      }
-    ],
-    "width": 17,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      "PENUP",
+      {
+        "x": 1,
+        "y": -4
+      },
       {
         "x": 3,
         "y": -2
@@ -174891,8 +187071,8 @@
         "y": 7
       }
     ],
-    "width": -3,
-    "height": 11
+    "width": 17,
+    "height": 14
   },
   {
     "id": 3902,
@@ -175218,16 +187398,6 @@
     "height": 21
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3905,
     "mappedTo": null,
     "vertexCount": 25,
@@ -175437,16 +187607,6 @@
     "height": 21
   },
   {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
     "id": 3907,
     "mappedTo": null,
     "vertexCount": 41,
@@ -175564,18 +187724,21 @@
       {
         "x": 3,
         "y": 13
-      }
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -4,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 15
+      },
+      {
+        "x": -4,
+        "y": 15
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -4
+      },
       {
         "x": 3,
         "y": -1
@@ -175593,8 +187756,8 @@
         "y": 15
       }
     ],
-    "width": -4,
-    "height": 16
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3908,
@@ -175717,18 +187880,24 @@
       {
         "x": 2,
         "y": 14
-      }
-    ],
-    "width": 18,
-    "height": 28
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": 9,
-    "vertices": [
+      },
+      "PENUP",
+      {
+        "x": 2,
+        "y": -4
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 4,
+        "y": 7
+      },
+      {
+        "x": 3,
+        "y": 9
+      },
       "PENUP",
       {
         "x": 0,
@@ -175747,8 +187916,8 @@
         "y": 11
       }
     ],
-    "width": 12,
-    "height": 15
+    "width": 18,
+    "height": 28
   },
   {
     "id": 3909,
@@ -175868,20 +188037,30 @@
       {
         "x": 0,
         "y": -5
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      {
+        "x": 1,
+        "y": -2
+      },
+      {
+        "x": 1,
+        "y": 6
+      },
+      {
+        "x": 2,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 9
       }
     ],
     "width": 10,
     "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 9,
-    "vertices": [],
-    "width": 9,
-    "height": null
   },
   {
     "id": 3910,
@@ -176001,20 +188180,30 @@
       {
         "x": 2,
         "y": 11
+      },
+      {
+        "x": 2,
+        "y": 14
+      },
+      {
+        "x": 0,
+        "y": 16
+      },
+      {
+        "x": -2,
+        "y": 15
+      },
+      {
+        "x": -2,
+        "y": 16
+      },
+      {
+        "x": 0,
+        "y": 16
       }
     ],
     "width": 10,
-    "height": 23
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": 16,
-    "vertices": [],
-    "width": 16,
-    "height": null
+    "height": 28
   },
   {
     "id": 3911,
@@ -176131,18 +188320,24 @@
         "x": 3,
         "y": -2
       },
-      "PENUP"
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -1
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": 1
+      },
+      {
+        "x": 1,
+        "y": 2
+      },
       {
         "x": 2,
         "y": 7
@@ -176194,8 +188389,8 @@
         "y": 7
       }
     ],
-    "width": 3,
-    "height": 9
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3912,
@@ -176400,18 +188595,27 @@
       {
         "x": -2,
         "y": -4
-      }
-    ],
-    "width": 26,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 1,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": -3
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": -1,
+        "y": 7
+      },
+      {
+        "x": 0,
+        "y": 8
+      },
+      {
+        "x": 1,
+        "y": 7
+      },
       {
         "x": 0,
         "y": 6
@@ -176517,7 +188721,7 @@
         "y": 9
       }
     ],
-    "width": 8,
+    "width": 26,
     "height": 14
   },
   {
@@ -176638,18 +188842,27 @@
       {
         "x": 2,
         "y": -4
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 5,
-    "rightHandPosition": 7,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": 6
+      },
+      {
+        "x": 3,
+        "y": 7
+      },
+      {
+        "x": 4,
+        "y": 8
+      },
+      {
+        "x": 5,
+        "y": 7
+      },
       {
         "x": 4,
         "y": 6
@@ -176676,8 +188889,8 @@
         "y": 9
       }
     ],
-    "width": 12,
-    "height": 13
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3915,
@@ -176898,18 +189111,24 @@
       {
         "x": -2,
         "y": 16
-      }
-    ],
-    "width": 17,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 2,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": -4,
+        "y": 14
+      },
+      "PENUP",
+      {
+        "x": -3,
+        "y": -3
+      },
+      {
+        "x": 0,
+        "y": -4
+      },
+      {
+        "x": 2,
+        "y": -5
+      },
       {
         "x": 5,
         "y": -2
@@ -176945,8 +189164,8 @@
         "y": 7
       }
     ],
-    "width": -3,
-    "height": 11
+    "width": 17,
+    "height": 21
   },
   {
     "id": 3917,
@@ -177545,18 +189764,24 @@
       {
         "x": 4,
         "y": 7
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 3,
-    "rightHandPosition": -2,
-    "vertices": [
+      },
+      {
+        "x": 5,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 4,
+        "y": -5
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -2
+      },
       {
         "x": 3,
         "y": 7
@@ -177570,8 +189795,8 @@
         "y": 7
       }
     ],
-    "width": 1,
-    "height": 2
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3922,
@@ -177688,20 +189913,26 @@
         "x": 4,
         "y": 5
       },
-      "PENUP"
+      "PENUP",
+      {
+        "x": 4,
+        "y": -5
+      },
+      {
+        "x": 2,
+        "y": -3
+      },
+      {
+        "x": 3,
+        "y": -2
+      },
+      {
+        "x": 3,
+        "y": 6
+      }
     ],
     "width": 18,
     "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
   },
   {
     "id": 3923,
@@ -177821,18 +190052,24 @@
       {
         "x": -1,
         "y": -3
-      }
-    ],
-    "width": 26,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 0,
-    "rightHandPosition": -5,
-    "vertices": [
+      },
+      {
+        "x": 0,
+        "y": -2
+      },
+      {
+        "x": 0,
+        "y": 6
+      },
+      {
+        "x": 3,
+        "y": 8
+      },
+      "PENUP",
+      {
+        "x": 0,
+        "y": -5
+      },
       {
         "x": 2,
         "y": -3
@@ -177913,8 +190150,8 @@
         "y": 6
       }
     ],
-    "width": -5,
-    "height": 12
+    "width": 26,
+    "height": 14
   },
   {
     "id": 3924,
@@ -178034,18 +190271,21 @@
       {
         "x": -6,
         "y": 7
-      }
-    ],
-    "width": 18,
-    "height": 14
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -50,
-    "rightHandPosition": 0,
-    "vertices": [
+      },
+      {
+        "x": -6,
+        "y": 9
+      },
+      "PENUP",
+      {
+        "x": -4,
+        "y": 2
+      },
+      {
+        "x": -1,
+        "y": 2
+      },
+      "PENUP",
       {
         "x": 1,
         "y": 2
@@ -178055,8 +190295,8 @@
         "y": 2
       }
     ],
-    "width": 50,
-    "height": 0
+    "width": 18,
+    "height": 14
   },
   {
     "id": 3925,
@@ -178176,18 +190416,27 @@
         "x": -1,
         "y": 15
       },
-      "PENUP"
-    ],
-    "width": 18,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": 4,
-    "rightHandPosition": -2,
-    "vertices": [
+      "PENUP",
+      {
+        "x": 4,
+        "y": -2
+      },
+      {
+        "x": 5,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": -4
+      },
+      {
+        "x": 3,
+        "y": -3
+      },
+      {
+        "x": 4,
+        "y": -2
+      },
       {
         "x": 4,
         "y": 12
@@ -178231,8 +190480,8 @@
         "y": 15
       }
     ],
-    "width": 2,
-    "height": 20
+    "width": 18,
+    "height": 21
   },
   {
     "id": 3926,
@@ -178352,18 +190601,24 @@
       {
         "x": 4,
         "y": 5
-      }
-    ],
-    "width": 15,
-    "height": 21
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": -4,
-    "rightHandPosition": 15,
-    "vertices": [
+      },
+      {
+        "x": 4,
+        "y": 12
+      },
+      {
+        "x": 3,
+        "y": 13
+      },
+      "PENUP",
+      {
+        "x": -2,
+        "y": 15
+      },
+      {
+        "x": -4,
+        "y": 15
+      },
       "PENUP",
       {
         "x": 2,
@@ -178386,27 +190641,165 @@
         "y": 15
       }
     ],
-    "width": 19,
-    "height": 11
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
-  },
-  {
-    "id": null,
-    "mappedTo": null,
-    "vertexCount": null,
-    "leftHandPosition": null,
-    "rightHandPosition": null,
-    "vertices": [],
-    "width": null,
-    "height": null
+    "width": 15,
+    "height": 21
   }
 ]
+},{}],8:[function(require,module,exports){
+var _ = require('lodash');
+var clone = require('clone');
+var glyphs = require('./glyphs.json');
+
+function generatePenUpArray (length) {
+  // Return array of "PENUP" with length length
+  memo = [];
+  while (memo.length < length) {
+    memo.push("PENUP");
+  }
+  return memo;
+}
+
+debugger;
+
+var hershey = {
+  glyphs: glyphs,
+  interleaveWithPenUp: function (glyphArray) {
+    // Given a 2d array of vertices for glyphs, interleave with "PENUP"
+    var interleaved = _.chain(glyphArray)
+      .zip(generatePenUpArray(glyphArray.length - 1))
+      .flatten()
+      .value();
+    interleaved.pop();
+    return interleaved;
+  },
+  shiftVerticesForGlyph: function(glyph, shiftX) {
+    // Return a new glyph with the vertices shifted
+    newGlyph = clone(glyph);
+    newGlyph.vertices = _.map(glyph.vertices,
+                              function(vertex) {
+                                if (vertex === "PENUP") {
+                                  return "PENUP";
+                                } else {
+                                  return {
+                                    "x": vertex.x + shiftX,
+                                    "y": vertex.y
+                                  };
+                                }
+                              }, this);
+    return newGlyph;
+  },
+  shiftVerticesForGlyphs: function(glyphs) {
+    var kerning = 1; // Space between chars
+    var offsetX = 0;
+
+    return _.map(glyphs, function(glyph) {
+      newGlyph = this.shiftVerticesForGlyph(glyph, offsetX)
+      offsetX += glyph.width;
+      return newGlyph;
+    }, this);
+  },
+  // DATA
+  _data: require("./glyphs.json"),
+  _rawSetData: require("./rawSetData.json"),
+  // Glyph Getters
+  glyphById: function(id) {
+    return _.find(this._data,
+                  function(glyph) {
+                    return glyph["id"] == id;
+                  });
+  },
+  glyph: function(name) {
+    return clone(_.find(this._data,
+                        function(glyph) {
+                          return glyph["mappedTo"] == name;
+                        }));
+  },
+
+  // String to vertex methods
+  stringData: function(string) {
+    var options = arguments.length > 1 ? arguments[1] : null;
+    string = string.toUpperCase();
+
+    var glyphs = _.chain(string).map(function(item) {
+      return this.glyph(item);
+    }, this).flatten().value();
+
+    glyphs = this.shiftVerticesForGlyphs(glyphs);
+
+    var stringWidth = _.reduce(glyphs,
+                               function(memo, x) { return memo + x.width },
+                               0) + glyphs.length - 1;
+
+    var reducedToVertices = _.chain(glyphs).map(function(glyph) {
+      return glyph === "PENUP" ? "PENUP" : glyph.vertices;
+    }).value();
+
+    var interleaved = this.interleaveWithPenUp(reducedToVertices);
+    return { "vertices": interleaved,
+             "width": stringWidth
+           };
+  }
+};
+
+module.exports = hershey;
+
+},{"./glyphs.json":7,"./rawSetData.json":9,"clone":5,"lodash":6}],9:[function(require,module,exports){
+module.exports=[{"name":"cyrilc","data":[2199,2214,2213,2275,2274,2271,2272,2251,2221,2222,2219,2232,2211,2231,2210,2220,"2200",2201,2202,2203,2204,2205,2206,2207,2208,2209,2212,2213,2241,2238,2242,2215,2273,"2801",2802,2803,2804,2805,2806,2807,2808,2809,2810,2811,2812,2813,2814,2815,2816,2817,2818,2819,2820,2821,2822,2823,2824,2825,2826,2223,804,2224,2262,999,2252,"2901",2902,2903,2904,2905,2906,2907,2908,2909,2910,2911,2912,2913,2914,2915,2916,2917,2918,2919,2920,2921,2922,2923,2924,2925,2926,2225,2229,2226,2246,2218]},{"name":"gothgbt","data":[3699,3714,3728,2275,3719,2271,3718,3717,3721,3722,3723,3725,3711,3724,3710,3720,"3700",3701,3702,3703,3704,3705,3706,3707,3708,3709,3712,3713,2241,3726,2242,3715,2273,"3501",3502,3503,3504,3505,3506,3507,3508,3509,3510,3511,3512,3513,3514,3515,3516,3517,3518,3519,3520,3521,3522,3523,3524,3525,3526,2223,804,2224,2262,999,3716,"3601",3602,3603,3604,3605,3606,3607,3608,3609,3610,3611,3612,3613,3614,3615,3616,3617,3618,3619,3620,3621,3622,3623,3624,3625,3626,2225,2229,2226,2246,3729]},{"name":"gothgrt","data":[3699,3714,3728,2275,3719,2271,3718,3717,3721,3722,3723,3725,3711,3724,3710,3720,"3700",3701,3702,3703,3704,3705,3706,3707,3708,3709,3712,3713,2241,3726,2242,3715,2273,"3301",3302,3303,3304,3305,3306,3307,3308,3309,3310,3311,3312,3313,3314,3315,3316,3317,3318,3319,3320,3321,3322,3323,3324,3325,3326,2223,804,2224,2262,999,3716,"3401",3402,3403,3404,3405,3406,3407,3408,3409,3410,3411,3412,3413,3414,3415,3416,3417,3418,3419,3420,3421,3422,3423,3424,3425,3426,2225,2229,2226,2246,3729]},{"name":"gothitt","data":[3699,3714,3728,2275,3719,2271,3718,3717,3721,3722,3723,3725,3711,3724,3710,3720,"3700",3701,3702,3703,3704,3705,3706,3707,3708,3709,3712,3713,2241,3726,2242,3715,2273,"3801",3802,3803,3804,3805,3806,3807,3808,3809,3810,3811,3812,3813,3814,3815,3816,3817,3818,3819,3820,3821,3822,3823,3824,3825,3826,2223,804,2224,2262,999,3716,"3901",3902,3903,3904,3905,3906,3907,3908,3909,3910,3911,3912,3913,3914,3915,3916,3917,3918,3919,3920,3921,3922,3923,3924,3925,3926,2225,2229,2226,2246,3729]},{"name":"greekc","data":[2199,2214,2213,2275,2274,2271,2272,2251,2221,2222,2219,2232,2211,2231,2210,2220,"2200",2201,2202,2203,2204,2205,2206,2207,2208,2209,2212,2213,2241,2238,2242,2215,2273,"2027",2028,2029,2030,2031,2032,2033,2034,2035,2036,2037,2038,2039,2040,2041,2042,2043,2044,2045,2046,2047,2048,2049,2050,2199,2199,2223,804,2224,2262,999,2252,"2127",2128,2129,2130,2131,2132,2133,2134,2135,2136,2137,2138,2139,2140,2141,2142,2143,2144,2145,2146,2147,2148,2149,2150,2199,2199,2225,2229,2226,2246,2218]},{"name":"greekcs","data":[1199,1214,1213,1275,1274,1271,1272,1251,1221,1222,1219,1232,1211,1231,1210,1220,"1200",1201,1202,1203,1204,1205,1206,1207,1208,1209,1212,1213,1241,1238,1242,1215,1273,"1027",1028,1029,1030,1031,1032,1033,1034,1035,1036,1037,1038,1039,1040,1041,1042,1043,1044,1045,1046,1047,1048,1049,1050,1199,1199,1223,804,1224,1262,998,1252,"1127",1128,1129,1130,1131,1132,1133,1134,1135,1136,1137,1138,1139,1140,1141,1142,1143,1144,1145,1146,1147,1148,1149,1150,1199,1199,1225,1229,1226,1246,1218]},{"name":"greekp","data":[199,214,217,233,219,1271,234,231,221,222,1219,225,211,224,210,220,"200",201,202,203,204,205,206,207,208,209,212,213,1241,226,1242,215,1273,"27",28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,199,199,1223,809,1224,1262,997,230,"27",28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,199,199,1225,223,1226,1246,218]},{"name":"greeks","data":[699,714,717,733,719,2271,734,731,721,722,2219,725,711,724,710,720,"700",701,702,703,704,705,706,707,708,709,712,713,2241,726,2242,715,2273,"527",528,529,530,531,532,533,534,535,536,537,538,539,540,541,542,543,544,545,546,547,548,549,550,699,699,2223,804,2224,2262,999,730,"627",628,629,630,631,632,633,634,635,636,637,638,639,640,641,642,643,644,645,646,647,648,649,650,699,699,2225,723,2226,2246,718]},{"name":"italicc","data":[2749,2764,2778,2275,2769,2271,2768,2767,2771,2772,2773,2775,2761,2774,2760,2770,"2750",2751,2752,2753,2754,2755,2756,2757,2758,2759,2762,2763,2241,2776,2242,2765,2273,"2051",2052,2053,2054,2055,2056,2057,2058,2059,2060,2061,2062,2063,2064,2065,2066,2067,2068,2069,2070,2071,2072,2073,2074,2075,2076,2223,804,2224,2262,999,2766,"2151",2152,2153,2154,2155,2156,2157,2158,2159,2160,2161,2162,2163,2164,2165,2166,2167,2168,2169,2170,2171,2172,2173,2174,2175,2176,2225,2229,2226,2246,2779]},{"name":"italiccs","data":[1199,1214,1213,1275,1274,1271,1272,1251,1221,1222,1219,1232,1211,1231,1210,802,"1200",1201,1202,1203,1204,1205,1206,1207,1208,1209,1212,1213,1241,1238,1242,1215,1273,"1051",1052,1053,1054,1055,1056,1057,1058,1059,1060,1061,1062,1063,1064,1065,1066,1067,1068,1069,1070,1071,1072,1073,1074,1075,1076,1223,804,1224,1262,998,1252,"1151",1152,1153,1154,1155,1156,1157,1158,1159,1160,1161,1162,1163,1164,1165,1166,1167,1168,1169,1170,1171,1172,1173,1174,1175,1176,1225,1229,1226,1246,1218]},{"name":"italict","data":[3249,3264,3278,2275,3269,2271,3268,3267,3271,3272,3273,3275,3261,3274,3260,3270,"3250",3251,3252,3253,3254,3255,3256,3257,3258,3259,3262,3263,2241,3276,2242,3265,2273,"3051",3052,3053,3054,3055,3056,3057,3058,3059,3060,3061,3062,3063,3064,3065,3066,3067,3068,3069,3070,3071,3072,3073,3074,3075,3076,2223,804,2224,2262,999,3266,"3151",3152,3153,3154,3155,3156,3157,3158,3159,3160,3161,3162,3163,3164,3165,3166,3167,3168,3169,3170,3171,3172,3173,3174,3175,3176,2225,2229,2226,2246,3279]},{"name":"romanc","data":[2199,2214,2213,2275,2274,2271,2272,2251,2221,2222,2219,2232,2211,2231,2210,2220,"2200",2201,2202,2203,2204,2205,2206,2207,2208,2209,2212,2213,2241,2238,2242,2215,2273,"2001",2002,2003,2004,2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025,2026,2223,804,2224,2262,999,2252,"2101",2102,2103,2104,2105,2106,2107,2108,2109,2110,2111,2112,2113,2114,2115,2116,2117,2118,2119,2120,2121,2122,2123,2124,2125,2126,2225,2229,2226,2246,2218]},{"name":"romancs","data":[1199,1214,1213,1275,1274,1271,1272,1251,1221,1222,1219,1232,1211,1231,1210,1220,"1200",1201,1202,1203,1204,1205,1206,1207,1208,1209,1212,1213,1241,1238,1242,1215,1273,"1001",1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,1015,1016,1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1223,804,1224,1262,998,1252,"1101",1102,1103,1104,1105,1106,1107,1108,1109,1110,1111,1112,1113,1114,1115,1116,1117,1118,1119,1120,1121,1122,1123,1124,1125,1126,1225,1229,1226,1246,1218]},{"name":"romand","data":[2699,2714,2728,2275,2719,2271,2718,2717,2721,2722,2723,2725,2711,2724,2710,2720,"2700",2701,2702,2703,2704,2705,2706,2707,2708,2709,2712,2713,2241,2726,2242,2715,2273,"2501",2502,2503,2504,2505,2506,2507,2508,2509,2510,2511,2512,2513,2514,2515,2516,2517,2518,2519,2520,2521,2522,2523,2524,2525,2526,2223,804,2224,2262,999,2716,"2601",2602,2603,2604,2605,2606,2607,2608,2609,2610,2611,2612,2613,2614,2615,2616,2617,2618,2619,2620,2621,2622,2623,2624,2625,2626,2225,2229,2226,2246,2729]},{"name":"romanp","data":[199,214,217,233,219,1271,234,231,221,222,1219,225,211,224,210,220,"200",201,202,203,204,205,206,207,208,209,212,213,1241,226,1242,215,1273,"1",2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,1223,809,1224,1262,997,230,"1",2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,1225,223,1226,1246,218]},{"name":"romans","data":[699,714,717,733,719,2271,734,731,721,722,2219,725,711,724,710,720,"700",701,702,703,704,705,706,707,708,709,712,713,2241,726,2242,715,2273,"501",502,503,504,505,506,507,508,509,510,511,512,513,514,515,516,517,518,519,520,521,522,523,524,525,526,2223,804,2224,2262,999,730,"601",602,603,604,605,606,607,608,609,610,611,612,613,614,615,616,617,618,619,620,621,622,623,624,625,626,2225,723,2226,2246,718]},{"name":"romant","data":[3199,3214,3228,2275,3219,2271,3218,3217,3221,3222,3223,3225,3211,3224,3210,3220,"3200",3201,3202,3203,3204,3205,3206,3207,3208,3209,3212,3213,2241,3226,2242,3215,2273,"3001",3002,3003,3004,3005,3006,3007,3008,3009,3010,3011,3012,3013,3014,3015,3016,3017,3018,3019,3020,3021,3022,3023,3024,3025,3026,2223,804,2224,2262,999,3216,"3101",3102,3103,3104,3105,3106,3107,3108,3109,3110,3111,3112,3113,3114,3115,3116,3117,3118,3119,3120,3121,3122,3123,3124,3125,3126,2225,2229,2226,2246,3229]},{"name":"scriptc","data":[2749,2764,2778,2275,2769,2271,2768,2767,2771,2772,2773,2775,2761,2774,2760,2770,"2750",2751,2752,2753,2754,2755,2756,2757,2758,2759,2762,2763,2241,2776,2242,2765,2273,"2551",2552,2553,2554,2555,2556,2557,2558,2559,2560,2561,2562,2563,2564,2565,2566,2567,2568,2569,2570,2571,2572,2573,2574,2575,2576,2223,804,2224,2262,999,2766,"2651",2652,2653,2654,2655,2656,2657,2658,2659,2660,2661,2662,2663,2664,2665,2666,2667,2668,2669,2670,2671,2672,2673,2674,2675,2676,2225,2229,2226,2246,2779]},{"name":"scripts","data":[699,2764,2778,733,2769,2271,2768,2767,2771,2772,2773,725,2761,724,710,2770,"2750",2751,2752,2753,2754,2755,2756,2757,2758,2759,2762,2763,2241,726,2242,2765,2273,"551",552,553,554,555,556,557,558,559,560,561,562,563,564,565,566,567,568,569,570,571,572,573,574,575,576,2223,804,2224,2262,999,2766,"651",652,653,654,655,656,657,658,659,660,661,662,663,664,665,666,667,668,669,670,671,672,673,674,675,676,2225,723,2226,2246,718]}]
+},{}],10:[function(require,module,exports){
+var hershey = require('./src/hershey');
+
+debugger;
+
+var scale = 5;
+var offset = 30;
+var penUp = false;
+
+var canvas = document.getElementById('glyph-canvas');
+var ctx = canvas.getContext("2d");
+
+var glyph = hershey.glyphById(3926);
+
+ctx.strokeStyle = "blue";
+ctx.moveTo(0, 0);
+
+var moveRelative = function (vertex) {
+  transformedX = offset + vertex["x"] * scale;
+  transformedY = offset + vertex["y"] * scale;
+  console.log("Penup: " + transformedX + " " + transformedY);
+  ctx.moveTo(offset + vertex["x"] * scale,
+             offset + vertex["y"] * scale);
+};
+
+var lineRelative = function (vertex) {
+  transformedX = offset + vertex["x"] * scale;
+  transformedY = offset + vertex["y"] * scale;
+  console.log("Line: " + transformedX + " " + transformedY);
+  ctx.lineTo(transformedX, transformedY);
+};
+
+var drawGlyph = function() {
+  ctx.beginPath()
+  for (var i=0; i < glyph.vertices.length; i+=1) {
+    if (glyph.vertices[i] === "PENUP") {
+      penUp = true;
+    } else {
+      if (penUp == true) {
+        moveRelative(glyph.vertices[i]);
+        penUp = false;
+      } else {
+        lineRelative(glyph.vertices[i]);
+      }
+    }
+  }
+  ctx.closePath();
+  ctx.stroke();
+};
+
+drawGlyph();
+// ctx.beginPath();
+// ctx.moveTo(0, 0);
+// ctx.lineTo(100, 100);
+// ctx.closePath();
+// ctx.stroke();
+
+},{"./src/hershey":8}]},{},[10]);

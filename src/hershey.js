@@ -1,5 +1,6 @@
 var _ = require('lodash');
 var clone = require('clone');
+var glyphs = require('./glyphs.json');
 
 function generatePenUpArray (length) {
   // Return array of "PENUP" with length length
@@ -10,7 +11,10 @@ function generatePenUpArray (length) {
   return memo;
 }
 
-module.exports = {
+debugger;
+
+var hershey = {
+  glyphs: glyphs,
   interleaveWithPenUp: function (glyphArray) {
     // Given a 2d array of vertices for glyphs, interleave with "PENUP"
     var interleaved = _.chain(glyphArray)
@@ -88,3 +92,5 @@ module.exports = {
            };
   }
 };
+
+module.exports = hershey;

@@ -19,13 +19,16 @@ gulp.task('default', ['buildGlyphs', 'compile', 'test:unit'], function(
 gulp.task('buildGlyphs', function() {
   shell("node ./src/genChars.js");
 
-  gulp.src(['./src/glyphs.json', './src/rawSetData.json'])
-    .pipe(gulp.dest('./dist'));
+  // gulp.src(['./src/glyphs.json', './src/rawSetData.json'])
+  //   .pipe(gulp.dest('./dist'));
 });
 
 gulp.task('compile', function() {
   // Compile non-vendor JS
   gulp.src("./src/hershey.js")
+    .pipe(browserify({
+      insertGlobals: true
+    }))
     .pipe(gulp.dest(buildPath));
 });
 
