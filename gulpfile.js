@@ -7,9 +7,7 @@ var gutil      = require('gulp-util');
 var bower      = require('gulp-bower-files');
 var jasmine    = require('gulp-jasmine');
 var nodemon    = require('gulp-nodemon');
-var sass       = require('gulp-sass');
 var rename     = require('gulp-rename');
-var jade       = require('gulp-jade');
 var shell      = require('gulp-shell');
 
 buildPath     = "./dist";

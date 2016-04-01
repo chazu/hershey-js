@@ -31,16 +31,10 @@ Right and left-hand positions indicate the horizontal boundaries of the glyph re
 
 ## TODO
 
-
-- Add all char sets to genChars
-- Expand mapping csv
-- Allow loading of specific character sets
-
-- Improve test coverage
-
-- Write gulp task to run genChars for you. Too lazy at the moment.
-- Write script to build modules for all glyphs/specific sets
-
-- Write script to convert svg files into glyphs in JSON format
-- Write script to convert original dataset into form more suitable for use with C++/OpenGL (???)
-
+- Clean up data dir - move char set maps into subdir, vertex data into another
+- Class for glyph
+- Class for charset
+- Refactor the ever-loving %$#!@ out of genChars
+- Add paper.js viewer for character sets...
+- Implement SVG to hershey script
+- Implement export to .h or other formats using a template

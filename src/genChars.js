@@ -10,10 +10,10 @@ var mappingData = fs.readFileSync("./data/charMapping.csv", {
   "encoding": "ascii"});
 
 var parsedMapping = new CSV(mappingData, { header: true }).parse();
+
 var lines = fileData.split("\n");
 
 var result = [];
-console.log(lines.length + " glyphs converted.");
 
 _.chain(lines).each(function(line) {
 
@@ -24,6 +24,7 @@ _.chain(lines).each(function(line) {
   var vertexString = line.substring(10, line.length).replace(/(\r\n|\n|\r)/gm,""); // remove \r\n
   var vertexStrings = util.splitVertices(vertexString);
   var vertices = util.calcVertices(vertexStrings).slice(0,vertexStrings.length - 2);
+
   // Get mapped identity if present
   var mapped = _.find(parsedMapping, function(item) {
     return item["id"] == id;
@@ -106,5 +107,3 @@ hmpFiles = _.map(hmpFiles, function(x) {
 console.log(hmpFiles);
 
 fs.writeFileSync('./src/rawSetData.json', JSON.stringify(hmpFiles));
-
-

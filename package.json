@@ -13,7 +13,7 @@
   "author": "Chazu",
   "license": "MIT",
   "devDependencies": {
-    "comma-separated-values": "^3.1.2",
+    "comma-separated-values": "^3.6.4",
     "csv-parse": "0.0.3",
     "express": "^4.3.0",
     "gulp-bower-files": "^0.2.3",
@@ -22,7 +22,6 @@
     "gulp-jasmine": "^0.2.0",
     "gulp-nodemon": "^1.0.3",
     "gulp-rename": "^1.2.0",
-    "gulp-sass": "^0.7.1",
     "gulp-shell": "^0.2.5",
     "gulp-uglify": "^0.3.0",
     "gulp-util": "^2.2.14",
