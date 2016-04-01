@@ -10,7 +10,7 @@ var util = {};
 String.prototype.slice2Chars = function() {
   var currentStr = this;
   var res = [];
-  var times = this.length / 2 + 2;
+  var times = Math.floor(this.length / 2 + 2);
 
   _.times(times, function(ch) {
     res.push(currentStr.slice(0,2));
@@ -33,10 +33,13 @@ util.calcVertices = function(vertices) {
       return "PENUP";
     } else {
       if (x) {
-      return {
-        "x": x[0].hersheyAtChar(0),
-        "y": x[1].hersheyAtChar(0)
-      };
+        if (x.length < 2) {
+          x = x.concat(" "); // TODO Wat?
+        }
+        return {
+          "x": x[0].hersheyAtChar(0),
+          "y": x[1].hersheyAtChar(0)
+        };
       }
     }
   });

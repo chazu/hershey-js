@@ -62,6 +62,7 @@ module.exports = {
                           return glyph["mappedTo"] == name;
                         }));
   },
+
   // String to vertex methods
   stringData: function(string) {
     var options = arguments.length > 1 ? arguments[1] : null;
