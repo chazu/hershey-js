@@ -1,4 +1,4 @@
-var hershey = require('./src/hershey');
+var hershey = require('./../dist/hershey');
 
 debugger;
 
