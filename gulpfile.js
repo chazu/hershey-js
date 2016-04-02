@@ -11,8 +11,6 @@ var rename     = require('gulp-rename');
 var shell      = require('gulp-shell');
 
 var buildPath       = "./dist/";
-var moduleBuildPath = buildPath + "hershey.js";
-var viewerBuildPath = buildPath + "viewer.js";
 
 gulp.task('default', ['buildGlyphs', 'compile', 'test:unit'], function(
 ) {});
@@ -29,7 +27,7 @@ gulp.task('compile:viewer', function() {
     .pipe(browserify({
       insertGlobals: true
     }))
-    .pipe(gulp.dest(viewerBuildPath));
+    .pipe(gulp.dest(buildPath));
 });
 
 gulp.task('compile:module', function() {

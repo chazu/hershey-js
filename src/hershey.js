@@ -18,9 +18,9 @@ var hershey = {
   interleaveWithPenUp: function (glyphArray) {
     // Given a 2d array of vertices for glyphs, interleave with "PENUP"
     var interleaved = _.chain(glyphArray)
-      .zip(generatePenUpArray(glyphArray.length - 1))
-      .flatten()
-      .value();
+          .zip(generatePenUpArray(glyphArray.length - 1))
+          .flatten()
+          .value();
     interleaved.pop();
     return interleaved;
   },
