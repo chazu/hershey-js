@@ -30,11 +30,12 @@ This should build the project into the dist/ directory.
 Right and left-hand positions indicate the horizontal boundaries of the glyph relative to it's local coordinate system, and are specified in the original data set.
 
 ## TODO
-
-- Clean up data dir - move char set maps into subdir, vertex data into another
-- Class for glyph
-- Class for charset
-- Refactor the ever-loving %$#!@ out of genChars
+- Clean up bundled, compiled module
 - Add paper.js viewer for character sets...
+
 - Implement SVG to hershey script
 - Implement export to .h or other formats using a template
+
+# DONE
+- Clean up data dir - move char set maps into subdir, vertex data into another
+- Refactor the ever-loving %$#!@ out of genChars

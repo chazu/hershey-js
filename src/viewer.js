@@ -9,7 +9,8 @@ var penUp = false;
 var canvas = document.getElementById('glyph-canvas');
 var ctx = canvas.getContext("2d");
 
-var glyph = hershey.glyphById(3926);
+var glyph = hershey.glyphById(3903);
+
 
 ctx.strokeStyle = "blue";
 ctx.moveTo(0, 0);
