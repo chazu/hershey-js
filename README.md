@@ -31,11 +31,16 @@ Right and left-hand positions indicate the horizontal boundaries of the glyph re
 
 ## TODO
 - Clean up bundled, compiled module
-- Add paper.js viewer for character sets...
-
+- Fix weird artifacts in some glyphs (manual process, most likely)
+- Fancy 3d viewer for kicks?
+- Add on-screen instructions to viewer(s)
+- Specify starting glyph in query string in viewer
+- Look into codepoint mapping instead of string mapping
+- Convenience methods
+  - Selectable character sets/fonts
 - Implement SVG to hershey script
 - Implement export to .h or other formats using a template
-
+- Track down japanese glyph data
 # DONE
 - Clean up data dir - move char set maps into subdir, vertex data into another
 - Refactor the ever-loving %$#!@ out of genChars
