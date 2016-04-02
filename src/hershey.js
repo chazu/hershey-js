@@ -11,8 +11,6 @@ function generatePenUpArray (length) {
   return memo;
 }
 
-debugger;
-
 var hershey = {
   glyphs: glyphs,
   interleaveWithPenUp: function (glyphArray) {

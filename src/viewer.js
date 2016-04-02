@@ -1,16 +1,16 @@
 var hershey = require('./hershey');
+var hotkeys = require('hotkeys-js');
 
-debugger;
+var currentGlyphIndex = 0;
 
-var scale = 5;
-var offset = 30;
+var scale = 4;
+var offset = 50;
 var penUp = false;
 
 var canvas = document.getElementById('glyph-canvas');
 var ctx = canvas.getContext("2d");
 
-var glyph = hershey.glyphById(3903);
-
+var glyph;
 
 ctx.strokeStyle = "blue";
 ctx.moveTo(0, 0);
@@ -18,7 +18,6 @@ ctx.moveTo(0, 0);
 var moveRelative = function (vertex) {
   transformedX = offset + vertex["x"] * scale;
   transformedY = offset + vertex["y"] * scale;
-  console.log("Penup: " + transformedX + " " + transformedY);
   ctx.moveTo(offset + vertex["x"] * scale,
              offset + vertex["y"] * scale);
 };
@@ -26,12 +25,13 @@ var moveRelative = function (vertex) {
 var lineRelative = function (vertex) {
   transformedX = offset + vertex["x"] * scale;
   transformedY = offset + vertex["y"] * scale;
-  console.log("Line: " + transformedX + " " + transformedY);
   ctx.lineTo(transformedX, transformedY);
 };
 
 var drawGlyph = function() {
-  ctx.beginPath()
+  glyph = hershey.glyphs[currentGlyphIndex];
+  console.log(currentGlyphIndex);
+  ctx.beginPath();
   for (var i=0; i < glyph.vertices.length; i+=1) {
     if (glyph.vertices[i] === "PENUP") {
       penUp = true;
@@ -48,9 +48,20 @@ var drawGlyph = function() {
   ctx.stroke();
 };
 
+function clearGlyph() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
 drawGlyph();
-// ctx.beginPath();
-// ctx.moveTo(0, 0);
-// ctx.lineTo(100, 100);
-// ctx.closePath();
-// ctx.stroke();
+
+hotkeys('left', function() {
+  currentGlyphIndex -= 1;
+  clearGlyph();
+  drawGlyph();
+});
+
+hotkeys('right', function() {
+  currentGlyphIndex += 1;
+  clearGlyph();
+  drawGlyph();
+});

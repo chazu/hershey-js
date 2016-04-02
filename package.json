@@ -25,6 +25,7 @@
     "gulp-shell": "^0.2.5",
     "gulp-uglify": "^0.3.0",
     "gulp-util": "^2.2.14",
+    "hotkeys-js": "^1.0.4",
     "lodash": "^2.4.1"
   },
   "dependencies": {

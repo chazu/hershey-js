@@ -1544,6 +1544,286 @@ process.chdir = function (dir) {
 }).call(this,require("1YiZ5S"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer,arguments[3],arguments[4],arguments[5],arguments[6],"/../node_modules/gulp-browserify/node_modules/browserify/node_modules/process/browser.js","/../node_modules/gulp-browserify/node_modules/browserify/node_modules/process")
 },{"1YiZ5S":5,"buffer":2}],6:[function(require,module,exports){
 (function (process,global,Buffer,__argument0,__argument1,__argument2,__argument3,__filename,__dirname){
+//IE对indexOf方法的支持
+if(!Array.indexOf){
+    Array.prototype.indexOf = function(obj){              
+        for(var i=0; i<this.length; i++) if(this[i]===obj) return i;
+        return -1;
+    };
+}
+
+;(function(root, factory) {
+    var hotkeys = factory(root);
+    if (typeof define === 'function' && define.amd) {
+        // AMD
+        define('hotkeys', function() { return hotkeys; });
+    } else if (typeof exports === 'object') {
+        // Node.js
+        module.exports = hotkeys;
+    } else {
+        // Browser globals
+        // previousKey存储先前定义的关键字
+        var previousKey = root.hotkeys;
+        hotkeys.noConflict = function() {
+            var k = root.hotkeys;
+            root.hotkeys = previousKey;
+            return k;
+        };
+        root.hotkeys = hotkeys;
+    }
+}(this, function(root, undefined) {
+    var _api,//对外API
+    _keyMap = {//特殊键
+        backspace: 8, tab: 9, clear: 12,
+        enter: 13, 'return': 13,
+        esc: 27, escape: 27, space: 32,
+        left: 37, up: 38, right: 39, down: 40,
+        del: 46, 'delete': 46,
+        home: 36, end: 35,
+        pageup: 33, pagedown: 34,
+        ',': 188, '.': 190, '/': 191,
+        '`': 192, '-': 189, '=': 187,
+        ';': 186, '\'': 222,
+        '[': 219, ']': 221, '\\': 220
+    },
+    _scope = 'all',//默认热键范围
+    _modifier = {//修饰键
+        '⇧': 16, shift: 16,
+        '⌥': 18, alt: 18, option: 18,
+        '⌃': 17, ctrl: 17, control: 17,
+        '⌘': 91, command: 91
+    },
+    _downKeys=[],//记录摁下的绑定键
+    modifierMap = {
+        16:'shiftKey',
+        18:'altKey',
+        17:'ctrlKey',
+        91:'metaKey'
+    },
+    _mods = { 16: false, 18: false, 17: false, 91: false },
+    //返回键码
+    code = function(x){ 
+        console.log();
+      return _keyMap[x] || x.toUpperCase().charCodeAt(0);
+    },
+    _handlers={};
+    // F1~F12 特殊键
+    for(k=1;k<20;k++) {
+        _keyMap['f'+k] = 111+k;
+    }
+
+    //设置获取当前范围（默认为'所有'）
+    function setScope(scope){ _scope = scope || 'all';}
+    function getScope(){ return _scope || 'all';}
+    //绑定事件
+    function addEvent(object, event, method) {
+        if (object.addEventListener){
+            object.addEventListener(event, method, false);
+        }else if(object.attachEvent){
+            object.attachEvent('on'+event, function(){ method(window.event); });
+        }
+    }
+    //判断摁下的键是否为某个键，返回true或者false
+    function isPressed(keyCode) {
+        if(typeof(keyCode) === 'string'){
+            keyCode = code(keyCode);//转换成键码
+        }
+        return _downKeys.indexOf(keyCode) !==-1;
+    }
+    //获取摁下绑定键的键值
+    function getPressedKeyCodes (argument) { return _downKeys.slice(0);}
+    //处理keydown事件
+    function dispatch (event) {
+        var key = event.keyCode,scope,asterisk = _handlers['*'];
+
+        //搜集绑定的键
+        if(_downKeys.indexOf(key)===-1) _downKeys.push(key);
+        //Gecko(Friefox)的command键值224，在Webkit(Chrome)中保持一致
+        //Webkit左右command键值不一样
+        if(key === 93 || key === 224) key = 91;
+        if(key in _mods) {
+            _mods[key] = true;
+            // 将特殊字符的key注册到 hotkeys 上
+            for(var k in _modifier)if(_modifier[k] === key) hotkeys[k] = true; 
+            if(!asterisk) return;
+        }
+        //将modifierMap里面的修饰键绑定到event中
+        for(var e in _mods) _mods[e] = event[modifierMap[e]];
+
+        //表单控件控件过滤 默认表单控件不触发快捷键
+        if(!hotkeys.filter.call(this,event)) return;
+        //获取范围 默认为all
+        scope = getScope();
+
+        //对任何按键做处理
+        if(asterisk) for (i = 0; i < asterisk.length; i++) {
+            if(asterisk[i].scope === scope) eventHandler(event,asterisk[i],scope);
+        }
+
+        // key 不在_handlers中返回
+        if (!(key in _handlers)) return;
+
+        for (i = 0; i < _handlers[key].length; i++) {
+            //找到处理内容
+            eventHandler(event,_handlers[key][i],scope);
+        }
+    }
+
+    function eventHandler(event,handler,scope){
+        var modifiersMatch;
+        //看它是否在当前范围
+        if(handler.scope === scope || handler.scope === 'all'){
+            //检查是否匹配修饰符（如果有返回true）
+            modifiersMatch = handler.mods.length > 0;
+            for(var y in _mods){
+                if((!_mods[y] && handler.mods.indexOf(+y) > -1) ||
+                    (_mods[y] && handler.mods.indexOf(+y) === -1)) modifiersMatch = false;
+            }
+            // 调用处理程序，如果是修饰键不做处理
+            if((handler.mods.length === 0 && !_mods[16] && !_mods[18] && !_mods[17] && !_mods[91]) || modifiersMatch || handler.shortcut === '*'){
+                if(handler.method(event, handler)===false){
+                    if(event.preventDefault) event.preventDefault();
+                    else event.returnValue = false;
+                    if(event.stopPropagation) event.stopPropagation();
+                    if(event.cancelBubble) event.cancelBubble = true;
+                }
+            }
+        }
+    }
+
+    //解除绑定某个范围的快捷键
+    function unbind (key,scope) {
+        var multipleKeys = getKeys(key),keys,mods = [],obj;
+        for (var i = 0; i < multipleKeys.length; i++) {
+            
+            //将组合快捷键拆分为数组
+            keys =multipleKeys[i].split('+');
+            
+            //记录每个组合键中的修饰键的键码 返回数组
+            if(keys.length > 1) mods=getMods(keys);
+            
+            //获取除修饰键外的键值key
+            key = keys[keys.length - 1];
+            key = code(key);
+
+            //判断是否传入范围，没有就获取范围
+            if(scope === undefined) scope = getScope();
+
+            //如何key不在 _handlers 中返回不做处理
+            if (!_handlers[key]) return;
+
+            //清空 handlers 中数据，
+            //让触发快捷键键之后没有事件执行到达解除快捷键绑定的目的
+            for (var r = 0; r < _handlers[key].length; r++) {
+                obj = _handlers[key][r];
+                //判断是否在范围内并且键值相同
+                if (obj.scope === scope && compareArray(obj.mods, mods)) {
+                  _handlers[key][r] = {};
+                }
+            }
+        }
+    }
+    //循环删除handlers中的所有 scope(范围)
+    function deleteScope(scope){
+        var key, handlers, i;
+        for (key in _handlers) {
+            handlers = _handlers[key];
+            for (i = 0; i < handlers.length; ) {
+                if (handlers[i].scope === scope) handlers.splice(i, 1);
+                else i++;
+            }
+        }
+    }
+    //比较修饰键的数组
+    function compareArray(a1, a2) {
+        if (a1.length !== a2.length) return false;
+        for (var i = 0; i < a1.length; i++) {
+            if (a1[i] !== a2[i]) return false;
+        }
+        return true;
+    }
+    //表单控件控件判断 返回 Boolean
+    function filter(event){
+        var tagName = (event.target || event.srcElement).tagName;
+        //忽略这些标签情况下快捷键无效
+        return !(tagName === 'INPUT' || tagName === 'SELECT' || tagName === 'TEXTAREA');
+    }
+    //修饰键转换成对应的键码
+    function getMods (key) {
+        var mods = key.slice(0, key.length - 1);
+        for (var i = 0; i < mods.length; i++) mods[i] = _modifier[mods[i]];
+        return mods;
+    }
+    //处理传的key字符串转换成数组
+    function getKeys(key) {
+        var keys;
+        key = key.replace(/\s/g, '');//匹配任何空白字符,包括空格、制表符、换页符等等
+        keys = key.split(',');
+        if ((keys[keys.length - 1]) === '') keys[keys.length - 2] += ',';
+        return keys;
+    }
+
+    //在全局document上设置快捷键
+    addEvent(document, 'keydown', function(event) {
+        dispatch(event);
+    });
+    addEvent(document, 'keyup',function(event){
+        clearModifier(event);
+    });
+    //清除修饰键
+    function clearModifier(event){
+        var key = event.keyCode,
+            i = _downKeys.indexOf(key);
+
+        if(i>=0) _downKeys.splice(i,1);
+
+        //修饰键 shiftKey altKey ctrlKey (command||metaKey) 清除
+        if(key === 93 || key === 224) key = 91;
+        if(key in _mods) {
+            _mods[key] = false;
+            for(var k in _modifier) if(_modifier[k] === key) hotkeys[k] = false;
+        }
+    }
+    //主体hotkeys函数
+    function hotkeys(key,scope,method){
+        var keys = getKeys(key), mods=[],i=0;
+        //对为设定范围的判断
+        if (method === undefined) {
+            method = scope;
+            scope = 'all';
+        }
+        //对于每个快捷键处理
+        for(;i < keys.length; i++){
+            key = keys[i].split('+');
+            mods = [];
+            //如果是组合快捷键取得组合快捷键
+            if (key.length > 1){
+                mods = getMods(key);
+                key = [key[key.length-1]];
+            }
+            //转换成键码
+            key = key[0];
+            key = key === '*' ? '*' : code(key);
+            //判断key是否在_handlers中，不在就赋一个空数组
+            if (!(key in _handlers)) _handlers[key] = [];
+            _handlers[key].push({shortcut: keys[i], scope: scope, method: method, key: keys[i], mods: mods});
+        }
+    }
+    _api = {
+        setScope:setScope,
+        getScope:getScope,
+        deleteScope:deleteScope,
+        getPressedKeyCodes:getPressedKeyCodes,
+        isPressed:isPressed,
+        filter:filter,
+        unbind:unbind
+    };
+    for (var a in _api) hotkeys[a] = _api[a];
+    return hotkeys;
+}));
+}).call(this,require("1YiZ5S"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer,arguments[3],arguments[4],arguments[5],arguments[6],"/../node_modules/hotkeys-js/src/hotkeys.js","/../node_modules/hotkeys-js/src")
+},{"1YiZ5S":5,"buffer":2}],7:[function(require,module,exports){
+(function (process,global,Buffer,__argument0,__argument1,__argument2,__argument3,__filename,__dirname){
 /**
  * @license
  * Lo-Dash 2.4.2 (Custom Build) <https://lodash.com/>
@@ -8332,21 +8612,21 @@ process.chdir = function (dir) {
 }.call(this));
 
 }).call(this,require("1YiZ5S"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer,arguments[3],arguments[4],arguments[5],arguments[6],"/../node_modules/lodash/dist/lodash.js","/../node_modules/lodash/dist")
-},{"1YiZ5S":5,"buffer":2}],7:[function(require,module,exports){
+},{"1YiZ5S":5,"buffer":2}],8:[function(require,module,exports){
 (function (process,global,Buffer,__argument0,__argument1,__argument2,__argument3,__filename,__dirname){
 var hershey = require('./hershey');
+var hotkeys = require('hotkeys-js');
 
-debugger;
+var currentGlyphIndex = 0;
 
-var scale = 5;
-var offset = 30;
+var scale = 4;
+var offset = 50;
 var penUp = false;
 
 var canvas = document.getElementById('glyph-canvas');
 var ctx = canvas.getContext("2d");
 
-var glyph = hershey.glyphById(3903);
-
+var glyph;
 
 ctx.strokeStyle = "blue";
 ctx.moveTo(0, 0);
@@ -8354,7 +8634,6 @@ ctx.moveTo(0, 0);
 var moveRelative = function (vertex) {
   transformedX = offset + vertex["x"] * scale;
   transformedY = offset + vertex["y"] * scale;
-  console.log("Penup: " + transformedX + " " + transformedY);
   ctx.moveTo(offset + vertex["x"] * scale,
              offset + vertex["y"] * scale);
 };
@@ -8362,12 +8641,13 @@ var moveRelative = function (vertex) {
 var lineRelative = function (vertex) {
   transformedX = offset + vertex["x"] * scale;
   transformedY = offset + vertex["y"] * scale;
-  console.log("Line: " + transformedX + " " + transformedY);
   ctx.lineTo(transformedX, transformedY);
 };
 
 var drawGlyph = function() {
-  ctx.beginPath()
+  glyph = hershey.glyphs[currentGlyphIndex];
+  console.log(currentGlyphIndex);
+  ctx.beginPath();
   for (var i=0; i < glyph.vertices.length; i+=1) {
     if (glyph.vertices[i] === "PENUP") {
       penUp = true;
@@ -8384,15 +8664,26 @@ var drawGlyph = function() {
   ctx.stroke();
 };
 
-drawGlyph();
-// ctx.beginPath();
-// ctx.moveTo(0, 0);
-// ctx.lineTo(100, 100);
-// ctx.closePath();
-// ctx.stroke();
+function clearGlyph() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
 
-}).call(this,require("1YiZ5S"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer,arguments[3],arguments[4],arguments[5],arguments[6],"/fake_1a9de5d3.js","/")
-},{"./hershey":9,"1YiZ5S":5,"buffer":2}],8:[function(require,module,exports){
+drawGlyph();
+
+hotkeys('left', function() {
+  currentGlyphIndex -= 1;
+  clearGlyph();
+  drawGlyph();
+});
+
+hotkeys('right', function() {
+  currentGlyphIndex += 1;
+  clearGlyph();
+  drawGlyph();
+});
+
+}).call(this,require("1YiZ5S"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer,arguments[3],arguments[4],arguments[5],arguments[6],"/fake_cacc2661.js","/")
+},{"./hershey":10,"1YiZ5S":5,"buffer":2,"hotkeys-js":6}],9:[function(require,module,exports){
 module.exports=[
   {
     "id": 1,
@@ -190430,7 +190721,7 @@ module.exports=[
     "height": 21
   }
 ]
-},{}],9:[function(require,module,exports){
+},{}],10:[function(require,module,exports){
 (function (process,global,Buffer,__argument0,__argument1,__argument2,__argument3,__filename,__dirname){
 var _ = require('lodash');
 var clone = require('clone');
@@ -190444,8 +190735,6 @@ function generatePenUpArray (length) {
   }
   return memo;
 }
-
-debugger;
 
 var hershey = {
   glyphs: glyphs,
@@ -190530,6 +190819,6 @@ var hershey = {
 module.exports = hershey;
 
 }).call(this,require("1YiZ5S"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer,arguments[3],arguments[4],arguments[5],arguments[6],"/hershey.js","/")
-},{"./glyphs.json":8,"./rawSetData.json":10,"1YiZ5S":5,"buffer":2,"clone":1,"lodash":6}],10:[function(require,module,exports){
+},{"./glyphs.json":9,"./rawSetData.json":11,"1YiZ5S":5,"buffer":2,"clone":1,"lodash":7}],11:[function(require,module,exports){
 module.exports=[{"name":"cyrilc","data":[2199,2214,2213,2275,2274,2271,2272,2251,2221,2222,2219,2232,2211,2231,2210,2220,"2200",2201,2202,2203,2204,2205,2206,2207,2208,2209,2212,2213,2241,2238,2242,2215,2273,"2801",2802,2803,2804,2805,2806,2807,2808,2809,2810,2811,2812,2813,2814,2815,2816,2817,2818,2819,2820,2821,2822,2823,2824,2825,2826,2223,804,2224,2262,999,2252,"2901",2902,2903,2904,2905,2906,2907,2908,2909,2910,2911,2912,2913,2914,2915,2916,2917,2918,2919,2920,2921,2922,2923,2924,2925,2926,2225,2229,2226,2246,2218]},{"name":"gothgbt","data":[3699,3714,3728,2275,3719,2271,3718,3717,3721,3722,3723,3725,3711,3724,3710,3720,"3700",3701,3702,3703,3704,3705,3706,3707,3708,3709,3712,3713,2241,3726,2242,3715,2273,"3501",3502,3503,3504,3505,3506,3507,3508,3509,3510,3511,3512,3513,3514,3515,3516,3517,3518,3519,3520,3521,3522,3523,3524,3525,3526,2223,804,2224,2262,999,3716,"3601",3602,3603,3604,3605,3606,3607,3608,3609,3610,3611,3612,3613,3614,3615,3616,3617,3618,3619,3620,3621,3622,3623,3624,3625,3626,2225,2229,2226,2246,3729]},{"name":"gothgrt","data":[3699,3714,3728,2275,3719,2271,3718,3717,3721,3722,3723,3725,3711,3724,3710,3720,"3700",3701,3702,3703,3704,3705,3706,3707,3708,3709,3712,3713,2241,3726,2242,3715,2273,"3301",3302,3303,3304,3305,3306,3307,3308,3309,3310,3311,3312,3313,3314,3315,3316,3317,3318,3319,3320,3321,3322,3323,3324,3325,3326,2223,804,2224,2262,999,3716,"3401",3402,3403,3404,3405,3406,3407,3408,3409,3410,3411,3412,3413,3414,3415,3416,3417,3418,3419,3420,3421,3422,3423,3424,3425,3426,2225,2229,2226,2246,3729]},{"name":"gothitt","data":[3699,3714,3728,2275,3719,2271,3718,3717,3721,3722,3723,3725,3711,3724,3710,3720,"3700",3701,3702,3703,3704,3705,3706,3707,3708,3709,3712,3713,2241,3726,2242,3715,2273,"3801",3802,3803,3804,3805,3806,3807,3808,3809,3810,3811,3812,3813,3814,3815,3816,3817,3818,3819,3820,3821,3822,3823,3824,3825,3826,2223,804,2224,2262,999,3716,"3901",3902,3903,3904,3905,3906,3907,3908,3909,3910,3911,3912,3913,3914,3915,3916,3917,3918,3919,3920,3921,3922,3923,3924,3925,3926,2225,2229,2226,2246,3729]},{"name":"greekc","data":[2199,2214,2213,2275,2274,2271,2272,2251,2221,2222,2219,2232,2211,2231,2210,2220,"2200",2201,2202,2203,2204,2205,2206,2207,2208,2209,2212,2213,2241,2238,2242,2215,2273,"2027",2028,2029,2030,2031,2032,2033,2034,2035,2036,2037,2038,2039,2040,2041,2042,2043,2044,2045,2046,2047,2048,2049,2050,2199,2199,2223,804,2224,2262,999,2252,"2127",2128,2129,2130,2131,2132,2133,2134,2135,2136,2137,2138,2139,2140,2141,2142,2143,2144,2145,2146,2147,2148,2149,2150,2199,2199,2225,2229,2226,2246,2218]},{"name":"greekcs","data":[1199,1214,1213,1275,1274,1271,1272,1251,1221,1222,1219,1232,1211,1231,1210,1220,"1200",1201,1202,1203,1204,1205,1206,1207,1208,1209,1212,1213,1241,1238,1242,1215,1273,"1027",1028,1029,1030,1031,1032,1033,1034,1035,1036,1037,1038,1039,1040,1041,1042,1043,1044,1045,1046,1047,1048,1049,1050,1199,1199,1223,804,1224,1262,998,1252,"1127",1128,1129,1130,1131,1132,1133,1134,1135,1136,1137,1138,1139,1140,1141,1142,1143,1144,1145,1146,1147,1148,1149,1150,1199,1199,1225,1229,1226,1246,1218]},{"name":"greekp","data":[199,214,217,233,219,1271,234,231,221,222,1219,225,211,224,210,220,"200",201,202,203,204,205,206,207,208,209,212,213,1241,226,1242,215,1273,"27",28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,199,199,1223,809,1224,1262,997,230,"27",28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,199,199,1225,223,1226,1246,218]},{"name":"greeks","data":[699,714,717,733,719,2271,734,731,721,722,2219,725,711,724,710,720,"700",701,702,703,704,705,706,707,708,709,712,713,2241,726,2242,715,2273,"527",528,529,530,531,532,533,534,535,536,537,538,539,540,541,542,543,544,545,546,547,548,549,550,699,699,2223,804,2224,2262,999,730,"627",628,629,630,631,632,633,634,635,636,637,638,639,640,641,642,643,644,645,646,647,648,649,650,699,699,2225,723,2226,2246,718]},{"name":"italicc","data":[2749,2764,2778,2275,2769,2271,2768,2767,2771,2772,2773,2775,2761,2774,2760,2770,"2750",2751,2752,2753,2754,2755,2756,2757,2758,2759,2762,2763,2241,2776,2242,2765,2273,"2051",2052,2053,2054,2055,2056,2057,2058,2059,2060,2061,2062,2063,2064,2065,2066,2067,2068,2069,2070,2071,2072,2073,2074,2075,2076,2223,804,2224,2262,999,2766,"2151",2152,2153,2154,2155,2156,2157,2158,2159,2160,2161,2162,2163,2164,2165,2166,2167,2168,2169,2170,2171,2172,2173,2174,2175,2176,2225,2229,2226,2246,2779]},{"name":"italiccs","data":[1199,1214,1213,1275,1274,1271,1272,1251,1221,1222,1219,1232,1211,1231,1210,802,"1200",1201,1202,1203,1204,1205,1206,1207,1208,1209,1212,1213,1241,1238,1242,1215,1273,"1051",1052,1053,1054,1055,1056,1057,1058,1059,1060,1061,1062,1063,1064,1065,1066,1067,1068,1069,1070,1071,1072,1073,1074,1075,1076,1223,804,1224,1262,998,1252,"1151",1152,1153,1154,1155,1156,1157,1158,1159,1160,1161,1162,1163,1164,1165,1166,1167,1168,1169,1170,1171,1172,1173,1174,1175,1176,1225,1229,1226,1246,1218]},{"name":"italict","data":[3249,3264,3278,2275,3269,2271,3268,3267,3271,3272,3273,3275,3261,3274,3260,3270,"3250",3251,3252,3253,3254,3255,3256,3257,3258,3259,3262,3263,2241,3276,2242,3265,2273,"3051",3052,3053,3054,3055,3056,3057,3058,3059,3060,3061,3062,3063,3064,3065,3066,3067,3068,3069,3070,3071,3072,3073,3074,3075,3076,2223,804,2224,2262,999,3266,"3151",3152,3153,3154,3155,3156,3157,3158,3159,3160,3161,3162,3163,3164,3165,3166,3167,3168,3169,3170,3171,3172,3173,3174,3175,3176,2225,2229,2226,2246,3279]},{"name":"romanc","data":[2199,2214,2213,2275,2274,2271,2272,2251,2221,2222,2219,2232,2211,2231,2210,2220,"2200",2201,2202,2203,2204,2205,2206,2207,2208,2209,2212,2213,2241,2238,2242,2215,2273,"2001",2002,2003,2004,2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025,2026,2223,804,2224,2262,999,2252,"2101",2102,2103,2104,2105,2106,2107,2108,2109,2110,2111,2112,2113,2114,2115,2116,2117,2118,2119,2120,2121,2122,2123,2124,2125,2126,2225,2229,2226,2246,2218]},{"name":"romancs","data":[1199,1214,1213,1275,1274,1271,1272,1251,1221,1222,1219,1232,1211,1231,1210,1220,"1200",1201,1202,1203,1204,1205,1206,1207,1208,1209,1212,1213,1241,1238,1242,1215,1273,"1001",1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,1015,1016,1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1223,804,1224,1262,998,1252,"1101",1102,1103,1104,1105,1106,1107,1108,1109,1110,1111,1112,1113,1114,1115,1116,1117,1118,1119,1120,1121,1122,1123,1124,1125,1126,1225,1229,1226,1246,1218]},{"name":"romand","data":[2699,2714,2728,2275,2719,2271,2718,2717,2721,2722,2723,2725,2711,2724,2710,2720,"2700",2701,2702,2703,2704,2705,2706,2707,2708,2709,2712,2713,2241,2726,2242,2715,2273,"2501",2502,2503,2504,2505,2506,2507,2508,2509,2510,2511,2512,2513,2514,2515,2516,2517,2518,2519,2520,2521,2522,2523,2524,2525,2526,2223,804,2224,2262,999,2716,"2601",2602,2603,2604,2605,2606,2607,2608,2609,2610,2611,2612,2613,2614,2615,2616,2617,2618,2619,2620,2621,2622,2623,2624,2625,2626,2225,2229,2226,2246,2729]},{"name":"romanp","data":[199,214,217,233,219,1271,234,231,221,222,1219,225,211,224,210,220,"200",201,202,203,204,205,206,207,208,209,212,213,1241,226,1242,215,1273,"1",2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,1223,809,1224,1262,997,230,"1",2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,1225,223,1226,1246,218]},{"name":"romans","data":[699,714,717,733,719,2271,734,731,721,722,2219,725,711,724,710,720,"700",701,702,703,704,705,706,707,708,709,712,713,2241,726,2242,715,2273,"501",502,503,504,505,506,507,508,509,510,511,512,513,514,515,516,517,518,519,520,521,522,523,524,525,526,2223,804,2224,2262,999,730,"601",602,603,604,605,606,607,608,609,610,611,612,613,614,615,616,617,618,619,620,621,622,623,624,625,626,2225,723,2226,2246,718]},{"name":"romant","data":[3199,3214,3228,2275,3219,2271,3218,3217,3221,3222,3223,3225,3211,3224,3210,3220,"3200",3201,3202,3203,3204,3205,3206,3207,3208,3209,3212,3213,2241,3226,2242,3215,2273,"3001",3002,3003,3004,3005,3006,3007,3008,3009,3010,3011,3012,3013,3014,3015,3016,3017,3018,3019,3020,3021,3022,3023,3024,3025,3026,2223,804,2224,2262,999,3216,"3101",3102,3103,3104,3105,3106,3107,3108,3109,3110,3111,3112,3113,3114,3115,3116,3117,3118,3119,3120,3121,3122,3123,3124,3125,3126,2225,2229,2226,2246,3229]},{"name":"scriptc","data":[2749,2764,2778,2275,2769,2271,2768,2767,2771,2772,2773,2775,2761,2774,2760,2770,"2750",2751,2752,2753,2754,2755,2756,2757,2758,2759,2762,2763,2241,2776,2242,2765,2273,"2551",2552,2553,2554,2555,2556,2557,2558,2559,2560,2561,2562,2563,2564,2565,2566,2567,2568,2569,2570,2571,2572,2573,2574,2575,2576,2223,804,2224,2262,999,2766,"2651",2652,2653,2654,2655,2656,2657,2658,2659,2660,2661,2662,2663,2664,2665,2666,2667,2668,2669,2670,2671,2672,2673,2674,2675,2676,2225,2229,2226,2246,2779]},{"name":"scripts","data":[699,2764,2778,733,2769,2271,2768,2767,2771,2772,2773,725,2761,724,710,2770,"2750",2751,2752,2753,2754,2755,2756,2757,2758,2759,2762,2763,2241,726,2242,2765,2273,"551",552,553,554,555,556,557,558,559,560,561,562,563,564,565,566,567,568,569,570,571,572,573,574,575,576,2223,804,2224,2262,999,2766,"651",652,653,654,655,656,657,658,659,660,661,662,663,664,665,666,667,668,669,670,671,672,673,674,675,676,2225,723,2226,2246,718]}]
-},{}]},{},[7])
+},{}]},{},[8])
